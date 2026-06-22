@@ -39,11 +39,12 @@ def tonemap_aces(x: vec3f32) vec3f32 =
 def gamma(x: vec3f32) vec3f32 =
   @[x.x ** (1.0 / 2.2), x.y ** (1.0 / 2.2), x.z ** (1.0 / 2.2)]
 
--- Cyan brush-radius ring on the ground (mirrors mountains.wyn's cursor).
--- `held` brightens the ring while the mouse button is down.
+-- Cyan brush-radius ring on the ground. An anti-aliased band at `radius`, plus
+-- a faint fill inside, brighter while the mouse button is held.
 def cursor_ring(color: vec3f32, ground_xz: vec2f32, cursor_xz: vec2f32,
                 radius: f32, held: f32) vec3f32 =
   let d = distance(ground_xz, cursor_xz) in
-  let line = 1.0 - clamp01(f32.min(8.0 * f32.abs(d - radius * 0.15),
-                                    0.5 + 8.0 * f32.abs(d - radius))) in
-  mix(color, CURSOR_COLOR, line * (0.5 + 0.5 * held))
+  let ring = smoothstep(0.40, 0.0, f32.abs(d - radius)) in
+  let fill = smoothstep(radius, radius - 0.5, d) * 0.12 in
+  let inten = clamp01(ring * (0.6 + 0.4 * held) + fill) in
+  mix(color, CURSOR_COLOR, inten)

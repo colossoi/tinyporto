@@ -7,7 +7,9 @@
 def DIST: f32 = 120.0
 def FOV: f32 = 20.0
 def AZIMUTH: f32 = 0.6
-def ELEVATION: f32 = 0.7
+-- Negative elevation puts the eye ABOVE the y=0 ground (the rotation's
+-- z-column contributes -sin(elevation) to eye.y).
+def ELEVATION: f32 = 0.0 - 0.7
 def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]
 
 -- Pinhole ray through a pixel, camera-space (-z forward).
