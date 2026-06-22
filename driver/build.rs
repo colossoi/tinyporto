@@ -31,8 +31,9 @@ fn main() {
     for (key, rel) in ROOTS {
         let src = repo.join(rel);
         let spv = out_dir.join(format!("{key}.spv"));
+        // Compile the Wyn root to SPIR-V (+ a .json descriptor) in OUT_DIR.
         let status = Command::new("wyn")
-            .args(["compile", "--single-stage"])
+            .args(["compile"])
             .arg(&src)
             .arg("-o")
             .arg(&spv)

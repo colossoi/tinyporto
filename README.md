@@ -8,23 +8,10 @@ a generic GPU host that knows nothing about the game.**
 
 ## Layout
 
-```
-wyn/        the application — all shaders AND game/sim logic (Wyn -> SPIR-V)
-  main.wyn    root: compute (gen) + vertex/fragment entry points
-  camera.wyn  orbit camera + ray gen + view-projection } library modules
-  shade.wyn   sky / lighting / tonemap / cursor          }
-  mesh.wyn    static geometry (box, ground quad)          }
-  math.wyn    shared scalar/vector helpers                }
-driver/     generic wgpu host (NO domain types — no Ground/Building/etc.)
-  build.rs      compiles each Wyn root (`wyn compile`) + embeds the SPIR-V
-  src/graph.rs  generic frame-graph schema (mirrors the wyn descriptor)
-  src/app.rs    the tiny-porto graph as plain `const` data
-  src/wync.rs   load embedded SPIR-V into wgpu
-  src/gfx.rs    wgpu context
-  src/main.rs   clap args + winit loop + the generic executor
-shaders/    scratch dir for manual `wyn compile` inspection (gitignored);
-            the build embeds SPIR-V from OUT_DIR, not from here
-```
+- **`wyn/`** — the application: all shaders *and* all game/sim logic, compiled to
+  SPIR-V. This is where the work happens.
+- **`driver/`** — a generic wgpu host that runs the compiled pipelines. No game
+  concepts live here (no Ground/Building/etc.); all meaning is in `wyn/`.
 
 ## Build & run
 
