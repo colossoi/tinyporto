@@ -1,0 +1,21 @@
+-- math: shared scalar/vector helpers used across the tiny-porto shaders.
+--
+-- PROJECT MODULE IDIOM (until the compiler supports `module m = import "x"`):
+--   * Library modules do NOT `open f32` (an `open` re-exports, and a second
+--     `open f32` at the import site currently trips a false "ambiguous
+--     reference" error). Instead they qualify scalar math as `f32.sin` etc.
+--   * The root module (`main.wyn`) does `open f32` and pulls libraries in with
+--     bare `import "math"`, calling exports unqualified (`clamp01`, `v3`, ...).
+--   * Project export names are therefore globally unique.
+-- Globals available WITHOUT any open: normalize, dot, cross, distance, reflect,
+-- mix (scalar+vec), the `**` operator, and the `vec.*` module.
+
+def clamp01(x: f32) f32 = f32.clamp(x, 0.0, 1.0)
+def sq(x: f32) f32 = x * x
+
+-- Scalar -> vector broadcasts (Wyn arithmetic does not auto-broadcast).
+def v2(s: f32) vec2f32 = @[s, s]
+def v3(s: f32) vec3f32 = @[s, s, s]
+
+-- Smooth 0..1 ramp on a value already in [0,1].
+def smoothbump(x: f32) f32 = x * x * (3.0 - 2.0 * x)

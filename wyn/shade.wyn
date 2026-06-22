@@ -1,0 +1,45 @@
+-- shade: sky, sun lighting, tonemapping, and the brush cursor ring.
+-- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+
+import "math"   -- bare import: brings clamp01 etc. into scope unqualified
+
+def SUN_DIR: vec3f32 = @[0.0 - 0.5, 0.7, 0.35]
+def SUN_COLOR: vec3f32 = @[2.0, 1.95, 1.85]
+def SKY_TOP: vec3f32 = @[0.30, 0.50, 0.78]
+def SKY_HORIZON: vec3f32 = @[0.74, 0.80, 0.86]
+def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
+
+def SAND_COLOR: vec3f32 = @[0.80, 0.71, 0.55]
+def CURSOR_COLOR: vec3f32 = @[0.0, 1.0, 1.0]
+
+def sun: vec3f32 = normalize(SUN_DIR)
+
+-- Gradient sky based on the ray's vertical component.
+def sky(rd: vec3f32) vec3f32 =
+  let t = clamp01(rd.y * 0.5 + 0.5) in
+  mix(SKY_HORIZON, SKY_TOP, t)
+
+-- Lambert + sky ambient for an opaque surface.
+def lit(albedo: vec3f32, n: vec3f32) vec3f32 =
+  let ndl = clamp01(dot(n, sun)) in
+  albedo * (AMBIENT + SUN_COLOR * v3(ndl))
+
+def tonemap_aces(x: vec3f32) vec3f32 =
+  let a = 2.51 in
+  let b = 0.03 in
+  let c = 2.43 in
+  let d = 0.59 in
+  let e = 0.14 in
+  (x * (a * x + v3(b))) / (x * (c * x + v3(d)) + v3(e))
+
+def gamma(x: vec3f32) vec3f32 =
+  @[x.x ** (1.0 / 2.2), x.y ** (1.0 / 2.2), x.z ** (1.0 / 2.2)]
+
+-- Cyan brush-radius ring on the ground (mirrors mountains.wyn's cursor).
+-- `held` brightens the ring while the mouse button is down.
+def cursor_ring(color: vec3f32, ground_xz: vec2f32, cursor_xz: vec2f32,
+                radius: f32, held: f32) vec3f32 =
+  let d = distance(ground_xz, cursor_xz) in
+  let line = 1.0 - clamp01(f32.min(8.0 * f32.abs(d - radius * 0.15),
+                                    0.5 + 8.0 * f32.abs(d - radius))) in
+  mix(color, CURSOR_COLOR, line * (0.5 + 0.5 * held))

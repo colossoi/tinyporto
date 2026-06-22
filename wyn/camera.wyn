@@ -1,0 +1,40 @@
+-- camera: orbit camera ray generation for the tilted-diorama view.
+-- Ported/adapted from mountains.wyn, in world meters with ground at y = 0.
+-- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+
+-- View tuning. Telephoto FOV gives the "tiny diorama" compression; DIST is the
+-- orbit radius in meters, picked so a ~40 m ground patch frames nicely.
+def DIST: f32 = 120.0
+def FOV: f32 = 20.0
+def AZIMUTH: f32 = 0.6
+def ELEVATION: f32 = 0.7
+def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]
+
+-- Pinhole ray through a pixel, camera-space (-z forward).
+def ray_dir(fov: f32, size: vec2f32, pos: vec2f32) vec3f32 =
+  let xy = pos - size * 0.5 in
+  let cot_half = f32.tan(f32.radians(90.0 - fov * 0.5)) in
+  let z = size.y * 0.5 * cot_half in
+  normalize(@[xy.x, xy.y, 0.0 - z])
+
+-- Column-major rotation (outer arrays = columns at SPIR-V emission), matching
+-- mountains.wyn. angle = (elevation, azimuth).
+def rotation(angle: vec2f32) mat3f32 =
+  let c = @[f32.cos(angle.x), f32.cos(angle.y)] in
+  let s = @[f32.sin(angle.x), f32.sin(angle.y)] in
+  @[[c.y,       0.0,       0.0 - s.y],
+    [s.y * s.x, c.x,       c.y * s.x],
+    [s.y * c.x, 0.0 - s.x, c.y * c.x]]
+
+-- Primary ray for a fragment. Returns (ro, rd) in world space.
+def get_ray(resolution: vec3f32, fragCoord: vec2f32) (vec3f32, vec3f32) =
+  let rot = rotation(@[ELEVATION, AZIMUTH]) in
+  let rd0 = ray_dir(FOV, resolution.xy, fragCoord) in
+  let rd = rot * rd0 in
+  let ro = LOOKAT + rot * @[0.0, 0.0, DIST] in
+  (ro, rd)
+
+-- Intersect a ray with the y = 0 ground plane. Returns t (<0 if pointing away).
+def ground_t(ro: vec3f32, rd: vec3f32) f32 =
+  if f32.abs(rd.y) < 1e-6 then 0.0 - 1.0
+  else 0.0 - ro.y / rd.y

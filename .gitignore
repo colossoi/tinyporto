@@ -1,0 +1,15 @@
+# --- Reference material (kept locally, not tracked) ---
+particles.json
+SPECIFICATION.md
+mountains.wyn
+rendering-tiny-glade.md
+Rendering Tiny Glades With Entirely Too Much Ray Marching - transcript.txt
+
+# --- Build artifacts ---
+/shaders/
+driver/target/
+**/*.rs.bk
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
