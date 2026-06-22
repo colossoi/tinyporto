@@ -11,6 +11,8 @@ def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
 
 def SAND_COLOR: vec3f32 = @[0.80, 0.71, 0.55]
 def CURSOR_COLOR: vec3f32 = @[0.0, 1.0, 1.0]
+-- 1950s Venetian render / ochre plaster for the flat-roofed buildings.
+def BUILDING_COLOR: vec3f32 = @[0.78, 0.42, 0.30]
 
 def sun: vec3f32 = normalize(SUN_DIR)
 

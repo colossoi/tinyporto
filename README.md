@@ -34,8 +34,10 @@ cargo run -- --no-compile # use existing shaders/*.spv
 cargo run -- --frames 5   # render N frames then exit (headless smoke test)
 ```
 
-You should see a sand ground tile under a tilted-diorama orbit camera, a faint
-1 m grid, and a cyan brush ring tracking the mouse.
+You should see a sand ground under a tilted-diorama orbit camera with a field of
+ochre flat-roofed building boxes — the boxes are drawn via `draw_indirect`, with
+their instance data and the draw-args (instance count) produced GPU-side by the
+`gen` compute pass (no CPU readback).
 
 ## Architecture notes
 
@@ -63,4 +65,5 @@ Until the compiler supports qualified imports (`module m = import "x"`):
 - Globals needing no `open`: `normalize`, `dot`, `cross`, `distance`, `reflect`,
   `mix` (scalar+vec), the `**` operator, and the `vec.*` module.
 
-See the project plan for milestones (M0 done; M1 indirect-draw skeleton next).
+See the project plan for milestones (M0 + M1 done; M2 ground grid + Voronoi +
+water painter next).

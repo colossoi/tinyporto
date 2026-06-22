@@ -38,3 +38,36 @@ def get_ray(resolution: vec3f32, fragCoord: vec2f32) (vec3f32, vec3f32) =
 def ground_t(ro: vec3f32, rd: vec3f32) f32 =
   if f32.abs(rd.y) < 1e-6 then 0.0 - 1.0
   else 0.0 - ro.y / rd.y
+
+------------------------------------------------------------
+-- View-projection for rasterizing geometry (M1+).
+-- Matrices are column-major (outer arrays = columns), matching mountains.wyn's
+-- mat3 convention and the SPIR-V emission. RH view, z in [0,1] (wgpu/Vulkan).
+------------------------------------------------------------
+
+def perspective(fovy_deg: f32, aspect: f32, near: f32, far: f32) mat4f32 =
+  let f = 1.0 / f32.tan(f32.radians(fovy_deg) * 0.5) in
+  let nf = 1.0 / (near - far) in
+  @[[f / aspect, 0.0, 0.0,         0.0],
+    [0.0,        f,   0.0,         0.0],
+    [0.0,        0.0, far * nf,    0.0 - 1.0],
+    [0.0,        0.0, far * near * nf, 0.0]]
+
+def look_at(eye: vec3f32, center: vec3f32, up: vec3f32) mat4f32 =
+  let f = normalize(center - eye) in
+  let s = normalize(cross(f, up)) in
+  let u = cross(s, f) in
+  @[[s.x,             u.x,             0.0 - f.x,     0.0],
+    [s.y,             u.y,             0.0 - f.y,     0.0],
+    [s.z,             u.z,             0.0 - f.z,     0.0],
+    [0.0 - dot(s, eye), 0.0 - dot(u, eye), dot(f, eye), 1.0]]
+
+-- World position -> clip space. Applies view then projection (no mat*mat).
+def world_to_clip(p: vec3f32, resolution: vec3f32) vec4f32 =
+  let aspect = resolution.x / resolution.y in
+  -- Inlined eye (a global const that references other globals trips the
+  -- SPIR-V backend; the same exprs are fine inside a function body).
+  let eye = LOOKAT + rotation(@[ELEVATION, AZIMUTH]) * @[0.0, 0.0, DIST] in
+  let view = look_at(eye, LOOKAT, @[0.0, 1.0, 0.0]) in
+  let proj = perspective(FOV, aspect, 0.1, 1000.0) in
+  proj * (view * @[p.x, p.y, p.z, 1.0])

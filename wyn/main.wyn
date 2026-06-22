@@ -1,80 +1,104 @@
--- tiny porto — root shader module (M0).
+-- tiny porto — root shader module (M1: indirect-draw skeleton).
 --
--- Project idiom: the root does `open f32` for ergonomic numerics, and pulls in
--- library modules with bare `import` (unqualified call sites). Library modules
--- keep their own `f32.`-qualified style. Export names are globally unique.
--- (When the compiler supports `module m = import "x"` we can switch call sites
--- to a qualified `camera.get_ray` form — see math.wyn.)
+-- Proves the GPU-driven path: a compute entry (`gen`) generates an instance
+-- buffer AND a draw_indirect args buffer (instance_count = filtered length, so
+-- the count stays GPU-resident — the CPU never learns it). The driver then
+-- issues a single draw_indirect of flat-roofed building boxes.
 --
--- M0 scope: prove the wyn -> SPIR-V -> custom wgpu driver pipeline. Renders a
--- flat sand ground tile under the tilted-diorama orbit camera, a faint 1 m grid
--- (foreshadowing the real grid), and the cyan brush cursor tracking the mouse.
+-- Idiom: root does `open f32`; library modules pulled in via bare `import`.
 
 open f32
 import "math"
 import "camera"
 import "shade"
+import "mesh"
+
+-- Indirect (non-indexed) draw arguments, named. Matches wgpu's draw_indirect
+-- layout: vertex_count, instance_count, first_vertex, first_instance. The
+-- compute pass fills instance_count with a GPU-resident count (no CPU readback).
+type draw_args = { vertex_count: u32, instance_count: u32,
+                   first_vertex: u32, first_instance: u32 }
 
 ------------------------------------------------------------
--- Vertex: full-screen triangle
+-- Instance generation (compute)
 ------------------------------------------------------------
 
-def verts: [3]vec4f32 =
-  [@[0.0 - 1.0, 0.0 - 1.0, 0.0, 1.0],
-   @[3.0,       0.0 - 1.0, 0.0, 1.0],
-   @[0.0 - 1.0, 3.0,       0.0, 1.0]]
+def GRID: i32 = 24          -- GRID*GRID candidate sites (must match seed length)
+def SPACING: f32 = 1.6      -- meters between candidate sites
+def KEEP_RADIUS: f32 = 14.0 -- keep sites within this radius of origin
+def FOOT: f32 = 0.8         -- building footprint (meters)
+
+-- Cheap hash in [0,1).
+def hash1(i: i32) f32 = fract(sin(f32.i32(i) * 12.9898) * 43758.5453)
+
+-- Candidate building at site i: (centerX, centerZ, height, keep).
+def candidate(i: i32) vec4f32 =
+  let gx = i % GRID in
+  let gz = i / GRID in
+  let x = (f32.i32(gx) - f32.i32(GRID) * 0.5 + 0.5) * SPACING in
+  let z = (f32.i32(gz) - f32.i32(GRID) * 0.5 + 0.5) * SPACING in
+  let r = sqrt(x * x + z * z) in
+  let keep = if r < KEEP_RADIUS && hash1(i) > 0.35 then 1.0 else 0.0 in
+  let height = 2.0 + 4.0 * hash1(i * 7 + 1) in
+  @[x, z, height, keep]
+
+-- Returns (instances, draw_indirect args).
+-- args = [vertex_count, instance_count, first_vertex, first_instance].
+-- `seed` is an iota buffer (0,1,2,... — filled generically by the driver); each
+-- value is a candidate site index. A single `map` produces one instance per
+-- site; culled sites carry keep=0 in .w and are degenerated in box_vertex.
+--
+-- M1 uses map-only (one compute kernel) on purpose: `filter`/`scan` compaction
+-- lowers to multiple chained kernels whose intermediates the descriptor doesn't
+-- fully wire — that's an M4/Nine concern. instance_count is still GPU-written.
+#[compute]
+entry gen(seed: []u32) ([]vec4f32, draw_args) =
+  let insts = map(|s| candidate(i32.u32(s)), seed) in
+  -- dot-form conversion: under `open f32` the constructor `u32(...)` mis-resolves
+  -- (compiler bug). `length` returns i32.
+  (insts, { vertex_count = 36u32, instance_count = u32.i32(length(seed)),
+            first_vertex = 0u32, first_instance = 0u32 })
+
+------------------------------------------------------------
+-- Ground (direct draw of one quad)
+------------------------------------------------------------
+
+def GROUND_HALF: f32 = 20.0
 
 #[vertex]
-entry vertex_main(#[builtin(vertex_index)] vid: i32) #[builtin(position)] vec4f32 =
-  verts[vid]
-
-------------------------------------------------------------
--- Ground helpers
-------------------------------------------------------------
-
-def GROUND_HALF: f32 = 20.0     -- diorama tile half-extent in meters
-def BRUSH_RADIUS: f32 = 3.0
-
--- Faint grid lines at 1 m spacing: lighten near integer coordinates.
-def grid_tint(p_xz: vec2f32) f32 =
-  let g = vec.abs(vec.fract(p_xz + @[0.5, 0.5]) - @[0.5, 0.5]) in
-  let line = min(g.x, g.y) in
-  0.85 + 0.15 * clamp01(line * 12.0)
-
-------------------------------------------------------------
--- Fragment: composite the scene
-------------------------------------------------------------
+entry ground_vertex(#[builtin(vertex_index)] vid: i32,
+                    #[uniform(set=1, binding=0)] iResolution: vec3f32)
+  (#[builtin(position)] vec4f32, #[location(0)] vec3f32) =
+  let q = quad_pos[vid] in
+  let world = @[q.x * GROUND_HALF, 0.0, q.z * GROUND_HALF] in
+  (world_to_clip(world, iResolution), @[0.0, 1.0, 0.0])
 
 #[fragment]
-entry fragment_main(#[builtin(position)] pos_in: vec4f32,
-                    #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                    #[uniform(set=1, binding=1)] iTime: f32,
-                    #[uniform(set=1, binding=2)] iMouse: vec4f32)
-  #[location(0)] vec4f32 =
-  -- Vulkan framebuffer coords are y-down; flip to bottom-up for the camera.
-  let fragCoord = @[pos_in.x, iResolution.y - pos_in.y] in
-  let (ro, rd) = get_ray(iResolution, fragCoord) in
+entry ground_fragment(#[location(0)] normal: vec3f32) #[location(0)] vec4f32 =
+  let c = lit(SAND_COLOR, normalize(normal)) in
+  let m = tonemap_aces(c) in
+  @[m.x, m.y, m.z, 1.0]
 
-  -- Mouse ray -> ground plane gives the world-space cursor position.
-  let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y] in
-  let (mro, mrd) = get_ray(iResolution, mouseCoord) in
-  let mt = ground_t(mro, mrd) in
-  let cursor_xz = (mro + mrd * v3(mt)).xz in
-  let held = if iMouse.z > 0.0 then 1.0 else 0.0 in
+------------------------------------------------------------
+-- Buildings (indirect instanced draw)
+------------------------------------------------------------
 
-  let t = ground_t(ro, rd) in
-  let pos = ro + rd * v3(t) in
-  let on_tile = t > 0.0 && abs(pos.x) < GROUND_HALF && abs(pos.z) < GROUND_HALF in
+#[vertex]
+entry box_vertex(#[builtin(vertex_index)] vid: i32,
+                 #[builtin(instance_index)] iid: i32,
+                 #[storage(set=1, binding=0, access=read)] instances: []vec4f32,
+                 #[uniform(set=1, binding=1)] iResolution: vec3f32)
+  (#[builtin(position)] vec4f32, #[location(0)] vec3f32) =
+  let inst = instances[iid] in   -- (centerX, centerZ, height, keep)
+  let k = inst.w in               -- 0 -> collapse to a point (degenerate, culled)
+  let local = box_pos[vid] in
+  let world = @[inst.x + local.x * FOOT * k,
+                local.y * inst.z * k,
+                inst.y + local.z * FOOT * k] in
+  (world_to_clip(world, iResolution), box_nrm[vid])
 
-  let color =
-    if on_tile then
-      let albedo = SAND_COLOR * v3(grid_tint(pos.xz)) in
-      let surf = lit(albedo, @[0.0, 1.0, 0.0]) in
-      cursor_ring(surf, pos.xz, cursor_xz, BRUSH_RADIUS, held)
-    else
-      sky(rd) in
-
-  -- Output linear color; the sRGB surface does the final encode (so no manual
-  -- gamma here — `shade.gamma` stays available for future non-sRGB targets).
-  let mapped = tonemap_aces(color) in
-  @[mapped.x, mapped.y, mapped.z, 1.0]
+#[fragment]
+entry box_fragment(#[location(0)] normal: vec3f32) #[location(0)] vec4f32 =
+  let c = lit(BUILDING_COLOR, normalize(normal)) in
+  let m = tonemap_aces(c) in
+  @[m.x, m.y, m.z, 1.0]
