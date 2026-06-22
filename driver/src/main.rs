@@ -46,15 +46,17 @@ struct Input {
 
 // ---- built (concrete GPU) passes ----
 
+// `sets` is indexed by frame parity (len 1 if the pass has no ping-pong
+// binding, else 2). Each entry is the (set, bind group) list for that parity.
 struct BuiltCompute {
     pipeline: wgpu::ComputePipeline,
-    sets: Vec<(u32, wgpu::BindGroup)>,
+    sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
     groups: u32,
 }
 
 struct BuiltItem {
     pipeline: wgpu::RenderPipeline,
-    sets: Vec<(u32, wgpu::BindGroup)>,
+    sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
     draw: Draw,
 }
 
@@ -90,6 +92,7 @@ impl Renderer {
 
         // Resources.
         let mut buffers: HashMap<&'static str, wgpu::Buffer> = HashMap::new();
+        let mut pingpong: HashMap<&'static str, [wgpu::Buffer; 2]> = HashMap::new();
         let mut sys: Vec<(&'static str, SysUniform)> = Vec::new();
         let mut depth_name: Option<&'static str> = None;
         for res in graph.resources {
@@ -100,6 +103,11 @@ impl Renderer {
                 }
                 Resource::Buffer(def) => {
                     buffers.insert(def.name, make_storage(device, &gfx.queue, def));
+                }
+                Resource::PingPong { name, size } => {
+                    let a = make_storage_raw(device, &format!("{name}#0"), size, false);
+                    let b = make_storage_raw(device, &format!("{name}#1"), size, false);
+                    pingpong.insert(name, [a, b]);
                 }
                 Resource::Depth { name } => depth_name = Some(name),
             }
@@ -112,13 +120,13 @@ impl Renderer {
             match pass {
                 Pass::Compute(cp) => {
                     let module = modules.get(cp.module).expect("module");
-                    passes.push(BuiltPass::Compute(build_compute(device, module, cp, &buffers, graph)));
+                    passes.push(BuiltPass::Compute(build_compute(device, module, cp, &buffers, &pingpong, graph)));
                 }
                 Pass::Render(rp) => {
                     let mut items = Vec::new();
                     for it in rp.items {
                         let module = modules.get(it.module).expect("module");
-                        items.push(build_item(device, gfx.config.format, rp.depth.is_some(), module, it, &buffers));
+                        items.push(build_item(device, gfx.config.format, rp.depth.is_some(), module, it, &buffers, &pingpong));
                     }
                     passes.push(BuiltPass::Render(BuiltRender { depth: rp.depth, clear: rp.clear, items }));
                 }
@@ -168,6 +176,7 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
+        let parity = (self.frame & 1) as usize;
         for pass in &self.passes {
             match pass {
                 BuiltPass::Compute(c) => {
@@ -176,7 +185,7 @@ impl Renderer {
                         timestamp_writes: None,
                     });
                     cp.set_pipeline(&c.pipeline);
-                    for (set, bg) in &c.sets {
+                    for (set, bg) in &c.sets[parity % c.sets.len()] {
                         cp.set_bind_group(*set, bg, &[]);
                     }
                     cp.dispatch_workgroups(c.groups, 1, 1);
@@ -208,7 +217,7 @@ impl Renderer {
                     });
                     for it in &r.items {
                         rp.set_pipeline(&it.pipeline);
-                        for (set, bg) in &it.sets {
+                        for (set, bg) in &it.sets[parity % it.sets.len()] {
                             rp.set_bind_group(*set, bg, &[]);
                         }
                         match it.draw {
@@ -238,17 +247,16 @@ fn make_uniform(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
     })
 }
 
-fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, def: BufferDef) -> wgpu::Buffer {
+fn make_storage_raw(device: &wgpu::Device, label: &str, size: u64, indirect: bool) -> wgpu::Buffer {
     let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-    if def.indirect {
+    if indirect {
         usage |= wgpu::BufferUsages::INDIRECT;
     }
-    let buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(def.name),
-        size: def.size,
-        usage,
-        mapped_at_creation: false,
-    });
+    device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
+}
+
+fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, def: BufferDef) -> wgpu::Buffer {
+    let buf = make_storage_raw(device, def.name, def.size, def.indirect);
     if let BufInit::Iota = def.init {
         let count = (def.size / 4) as u32;
         let data: Vec<u32> = (0..count).collect();
@@ -286,12 +294,33 @@ fn buffer_size(graph: &Graph, name: &str) -> u64 {
 
 /// Build per-set bind-group layouts (0..=max, empty where unused) and bind
 /// groups, from the graph's binding data.
+fn variant_count(bindings: &[Binding]) -> usize {
+    if bindings.iter().any(|b| b.role != Role::Plain) { 2 } else { 1 }
+}
+
+/// Resolve a binding to its physical buffer for `parity`. Ping-pong: this
+/// frame's buffer is index `parity` (Next); last frame's is `1 - parity` (Prev).
+fn resolve<'a>(
+    b: &Binding,
+    parity: usize,
+    buffers: &'a HashMap<&'static str, wgpu::Buffer>,
+    pp: &'a HashMap<&'static str, [wgpu::Buffer; 2]>,
+) -> &'a wgpu::Buffer {
+    match b.role {
+        Role::Plain => buffers.get(b.resource).unwrap_or_else(|| panic!("no resource '{}'", b.resource)),
+        Role::Next => &pp.get(b.resource).unwrap_or_else(|| panic!("no ping-pong '{}'", b.resource))[parity],
+        Role::Prev => &pp.get(b.resource).unwrap_or_else(|| panic!("no ping-pong '{}'", b.resource))[1 - parity],
+    }
+}
+
 fn build_sets(
     device: &wgpu::Device,
     label: &str,
     bindings: &[Binding],
     visibility: wgpu::ShaderStages,
     buffers: &HashMap<&'static str, wgpu::Buffer>,
+    pp: &HashMap<&'static str, [wgpu::Buffer; 2]>,
+    parity: usize,
 ) -> (Vec<wgpu::BindGroupLayout>, Vec<(u32, wgpu::BindGroup)>) {
     let max_set = bindings.iter().map(|b| b.set).max().unwrap_or(0);
     let mut layouts = Vec::new();
@@ -329,9 +358,9 @@ fn build_sets(
         });
         let bg_entries: Vec<wgpu::BindGroupEntry> = in_set
             .iter()
-            .map(|b| wgpu::BindGroupEntry {
+            .map(|&b| wgpu::BindGroupEntry {
                 binding: b.binding,
-                resource: buffers.get(b.resource).expect("resource").as_entire_binding(),
+                resource: resolve(b, parity, buffers, pp).as_entire_binding(),
             })
             .collect();
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -350,9 +379,11 @@ fn build_compute(
     module: &wgpu::ShaderModule,
     cp: &ComputePass,
     buffers: &HashMap<&'static str, wgpu::Buffer>,
+    pp: &HashMap<&'static str, [wgpu::Buffer; 2]>,
     graph: &Graph,
 ) -> BuiltCompute {
-    let (layouts, sets) = build_sets(device, cp.label, cp.bindings, wgpu::ShaderStages::COMPUTE, buffers);
+    let (layouts, sets0) =
+        build_sets(device, cp.label, cp.bindings, wgpu::ShaderStages::COMPUTE, buffers, pp, 0);
     let layout_refs: Vec<&wgpu::BindGroupLayout> = layouts.iter().collect();
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(cp.label),
@@ -366,6 +397,10 @@ fn build_compute(
         entry_point: cp.entry,
         compilation_options: wgpu::PipelineCompilationOptions::default(),
     });
+    let mut sets = vec![sets0];
+    for p in 1..variant_count(cp.bindings) {
+        sets.push(build_sets(device, cp.label, cp.bindings, wgpu::ShaderStages::COMPUTE, buffers, pp, p).1);
+    }
     let groups = match cp.dispatch {
         Dispatch::FromBufferElems { buffer, elem_bytes, workgroup } => {
             let elems = (buffer_size(graph, buffer) / elem_bytes as u64) as u32;
@@ -382,8 +417,10 @@ fn build_item(
     module: &wgpu::ShaderModule,
     it: &RenderItem,
     buffers: &HashMap<&'static str, wgpu::Buffer>,
+    pp: &HashMap<&'static str, [wgpu::Buffer; 2]>,
 ) -> BuiltItem {
-    let (layouts, sets) = build_sets(device, it.label, it.bindings, wgpu::ShaderStages::VERTEX_FRAGMENT, buffers);
+    let (layouts, sets0) =
+        build_sets(device, it.label, it.bindings, wgpu::ShaderStages::VERTEX_FRAGMENT, buffers, pp, 0);
     let layout_refs: Vec<&wgpu::BindGroupLayout> = layouts.iter().collect();
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(it.label),
@@ -425,6 +462,10 @@ fn build_item(
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });
+    let mut sets = vec![sets0];
+    for p in 1..variant_count(it.bindings) {
+        sets.push(build_sets(device, it.label, it.bindings, wgpu::ShaderStages::VERTEX_FRAGMENT, buffers, pp, p).1);
+    }
     BuiltItem { pipeline, sets, draw: it.draw }
 }
 

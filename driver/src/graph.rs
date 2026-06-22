@@ -49,8 +49,23 @@ pub enum Resource {
     SysUniform { name: &'static str, kind: SysUniform },
     /// A storage buffer (compute I/O, instance data, indirect args, …).
     Buffer(BufferDef),
+    /// Two storage buffers swapped each frame (persistent state). Referenced by
+    /// `Binding`s with `Role::Prev` (last frame) / `Role::Next` (this frame).
+    /// Zero-initialized.
+    PingPong { name: &'static str, size: u64 },
     /// A window-sized depth texture (recreated on resize).
     Depth { name: &'static str },
+}
+
+/// How a binding resolves a ping-pong resource for the current frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Role {
+    /// A plain (non-ping-pong) resource, looked up by name.
+    Plain,
+    /// The ping-pong buffer written last frame (read source for `edit`).
+    Prev,
+    /// The ping-pong buffer written this frame (edit's output; the render's read).
+    Next,
 }
 
 /// How a (set, binding) slot is typed in the shader.
@@ -63,13 +78,15 @@ pub enum BindingKind {
     StorageReadWrite,
 }
 
-/// Wires one shader binding slot to a named resource.
+/// Wires one shader binding slot to a named resource. For ping-pong resources,
+/// `resource` is the pair name and `role` selects which physical buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct Binding {
     pub set: u32,
     pub binding: u32,
     pub resource: &'static str,
     pub kind: BindingKind,
+    pub role: Role,
 }
 
 /// How a compute pass's dispatch size is computed.

@@ -1,0 +1,60 @@
+-- grid: the 1 m ground grid and its Voronoi control points.
+-- Library module (no `open`; f32.* qualified). Shared by the `edit` paint pass
+-- and the ground fragment so both agree on control-point positions/indices.
+--
+-- Each cell holds CP_PER_CELL jittered control points. A separate `material`
+-- storage buffer (one f32 per control point, 0=sand 1=water) holds the painted
+-- state; positions are derived analytically from the index, so only material
+-- needs to persist.
+
+def GW: i32 = 40           -- cells in x
+def GH: i32 = 40           -- cells in z
+def CELL: f32 = 1.0        -- meters per cell
+def CP_PER_CELL: i32 = 4
+def BRUSH: f32 = 3.0       -- water-brush radius (meters)
+
+-- Total control points = GW*GH*CP_PER_CELL (must equal seed/material length).
+def CP_COUNT: i32 = GW * GH * CP_PER_CELL
+
+def hashf(p: vec2f32) f32 =
+  f32.fract(f32.sin(dot(p, @[12.9898, 78.233])) * 43758.5453)
+
+-- World-space (x,z) of control point k in cell (cx,cz). Jittered within the cell.
+def cp_world(cx: i32, cz: i32, k: i32) vec2f32 =
+  let fcx = f32.i32(cx) in
+  let fcz = f32.i32(cz) in
+  let fk = f32.i32(k) in
+  let jx = hashf(@[fcx + fk * 0.37, fcz + fk * 0.71]) in
+  let jz = hashf(@[fcz + fk * 0.53 + 5.2, fcx + fk * 0.19 + 1.7]) in
+  @[(fcx - f32.i32(GW) * 0.5 + jx) * CELL,
+    (fcz - f32.i32(GH) * 0.5 + jz) * CELL]
+
+-- Global control-point index for cell (cx,cz), sub k.
+def cp_index(cx: i32, cz: i32, k: i32) i32 = (cz * GW + cx) * CP_PER_CELL + k
+
+-- Cell containing a world (x,z).
+def cell_of(world: vec2f32) (i32, i32) =
+  let cx = i32.f32(f32.floor(world.x / CELL + f32.i32(GW) * 0.5)) in
+  let cz = i32.f32(f32.floor(world.y / CELL + f32.i32(GH) * 0.5)) in
+  (cx, cz)
+
+-- Voronoi over the 3x3 neighborhood. Returns (nearest_material, f1, f2):
+-- nearest control point's material, nearest distance, second-nearest distance.
+def voronoi(world: vec2f32, material: []f32) (f32, f32, f32) =
+  let (cx, cz) = cell_of(world) in
+  let (_, f1, f2, mat1) =
+    loop (i, f1, f2, mat1) = (0, 1e9, 1e9, 0.0) while i < 36 do
+      let cell = i / 4 in
+      let k = i % 4 in
+      let ncx = cx + (cell % 3 - 1) in
+      let ncz = cz + (cell / 3 - 1) in
+      if ncx >= 0 && ncx < GW && ncz >= 0 && ncz < GH then
+        let cpw = cp_world(ncx, ncz, k) in
+        let d = distance(world, cpw) in
+        let m = material[cp_index(ncx, ncz, k)] in
+        if d < f1 then (i + 1, d, f1, m)
+        else if d < f2 then (i + 1, f1, d, mat1)
+        else (i + 1, f1, f2, mat1)
+      else (i + 1, f1, f2, mat1)
+  in
+  (mat1, f1, f2)

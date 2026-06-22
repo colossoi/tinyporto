@@ -1,9 +1,4 @@
--- tiny porto — root shader module (M1: indirect-draw skeleton).
---
--- Proves the GPU-driven path: a compute entry (`gen`) generates an instance
--- buffer AND a draw_indirect args buffer (instance_count = filtered length, so
--- the count stays GPU-resident — the CPU never learns it). The driver then
--- issues a single draw_indirect of flat-roofed building boxes.
+-- tiny porto — root shader module (M2: ground grid + Voronoi + water painter).
 --
 -- Idiom: root does `open f32`; library modules pulled in via bare `import`.
 
@@ -12,76 +7,103 @@ import "math"
 import "camera"
 import "shade"
 import "mesh"
+import "grid"
 
 -- Indirect (non-indexed) draw arguments, named. Matches wgpu's draw_indirect
--- layout: vertex_count, instance_count, first_vertex, first_instance. The
--- compute pass fills instance_count with a GPU-resident count (no CPU readback).
+-- layout: vertex_count, instance_count, first_vertex, first_instance.
 type draw_args = { vertex_count: u32, instance_count: u32,
                    first_vertex: u32, first_instance: u32 }
 
 ------------------------------------------------------------
--- Instance generation (compute)
+-- Water painting (compute, ping-pong over the material buffer)
 ------------------------------------------------------------
 
-def GRID: i32 = 24          -- GRID*GRID candidate sites (must match seed length)
-def SPACING: f32 = 1.6      -- meters between candidate sites
-def KEEP_RADIUS: f32 = 14.0 -- keep sites within this radius of origin
-def FOOT: f32 = 0.8         -- building footprint (meters)
-
--- Cheap hash in [0,1).
-def hash1(i: i32) f32 = fract(sin(f32.i32(i) * 12.9898) * 43758.5453)
-
--- Candidate building at site i: (centerX, centerZ, height, keep).
-def candidate(i: i32) vec4f32 =
-  let gx = i % GRID in
-  let gz = i / GRID in
-  let x = (f32.i32(gx) - f32.i32(GRID) * 0.5 + 0.5) * SPACING in
-  let z = (f32.i32(gz) - f32.i32(GRID) * 0.5 + 0.5) * SPACING in
-  let r = sqrt(x * x + z * z) in
-  let keep = if r < KEEP_RADIUS && hash1(i) > 0.35 then 1.0 else 0.0 in
-  let height = 2.0 + 4.0 * hash1(i * 7 + 1) in
-  @[x, z, height, keep]
-
--- Returns (instances, draw_indirect args).
--- args = [vertex_count, instance_count, first_vertex, first_instance].
--- `seed` is an iota buffer (0,1,2,... — filled generically by the driver); each
--- value is a candidate site index. A single `map` produces one instance per
--- site; culled sites carry keep=0 in .w and are degenerated in box_vertex.
---
--- M1 uses map-only (one compute kernel) on purpose: `filter`/`scan` compaction
--- lowers to multiple chained kernels whose intermediates the descriptor doesn't
--- fully wire — that's an M4/Nine concern. instance_count is still GPU-written.
+-- Reads the previous per-control-point material, writes the next. The driver
+-- swaps the two physical buffers each frame. Painting sets material->water (1)
+-- for control points within the brush of the mouse-ground cursor.
 #[compute]
-entry gen(seed: []u32) ([]vec4f32, draw_args) =
-  let insts = map(|s| candidate(i32.u32(s)), seed) in
-  -- dot-form conversion: under `open f32` the constructor `u32(...)` mis-resolves
-  -- (compiler bug). `length` returns i32.
-  (insts, { vertex_count = 36u32, instance_count = u32.i32(length(seed)),
-            first_vertex = 0u32, first_instance = 0u32 })
+entry edit(seed: []u32, material_in: []f32,
+           #[uniform(set=1, binding=0)] iResolution: vec3f32,
+           #[uniform(set=1, binding=1)] iMouse: vec4f32) []f32 =
+  let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y] in
+  let (mro, mrd) = get_ray(iResolution, mouseCoord) in
+  let mt = ground_t(mro, mrd) in
+  let cursor = (mro + mrd * v3(mt)).xz in
+  let painting = iMouse.z > 0.0 in
+  map(|s|
+        let i = i32.u32(s) in
+        let cell = i / 4 in
+        let cx = cell % GW in
+        let cz = cell / GW in
+        let k = i % 4 in
+        let cpw = cp_world(cx, cz, k) in
+        let old = material_in[i] in
+        if painting && distance(cpw, cursor) < BRUSH then 1.0 else old
+      , seed)
 
 ------------------------------------------------------------
--- Ground (direct draw of one quad)
+-- Ground (one quad over the whole grid; Voronoi resolved per fragment)
 ------------------------------------------------------------
-
-def GROUND_HALF: f32 = 20.0
 
 #[vertex]
 entry ground_vertex(#[builtin(vertex_index)] vid: i32,
                     #[uniform(set=1, binding=0)] iResolution: vec3f32)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32) =
+  let half = f32.i32(GW) * CELL * 0.5 in
   let q = quad_pos[vid] in
-  let world = @[q.x * GROUND_HALF, 0.0, q.z * GROUND_HALF] in
-  (world_to_clip(world, iResolution), @[0.0, 1.0, 0.0])
+  let world = @[q.x * half, 0.0, q.z * half] in
+  (world_to_clip(world, iResolution), @[world.x, world.z, 0.0])
 
 #[fragment]
-entry ground_fragment(#[location(0)] normal: vec3f32) #[location(0)] vec4f32 =
-  let c = lit(SAND_COLOR, normalize(normal)) in
-  let m = tonemap_aces(c) in
+entry ground_fragment(#[location(0)] w: vec3f32,
+                      #[uniform(set=1, binding=0)] iResolution: vec3f32,
+                      #[uniform(set=1, binding=1)] iMouse: vec4f32,
+                      #[storage(set=1, binding=2, access=read)] material: []f32)
+  #[location(0)] vec4f32 =
+  let wxz = @[w.x, w.y] in
+  let (mat, f1, f2) = voronoi(wxz, material) in
+  -- Canal bank: darken near the Voronoi boundary (small f2-f1).
+  let bank = 1.0 - smoothstep(0.0, 0.12, f2 - f1) in
+  let surf =
+    if mat > 0.5 then mix(WATER_COLOR, WATER_DEEP, bank)
+    else SAND_COLOR * (1.0 - 0.25 * bank) in
+  let col = lit(surf, @[0.0, 1.0, 0.0]) in
+  -- Cyan brush cursor on the ground.
+  let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y] in
+  let (mro, mrd) = get_ray(iResolution, mouseCoord) in
+  let mt = ground_t(mro, mrd) in
+  let cursor = (mro + mrd * v3(mt)).xz in
+  let held = if iMouse.z > 0.0 then 1.0 else 0.0 in
+  let withcur = cursor_ring(col, wxz, cursor, BRUSH, held) in
+  let m = tonemap_aces(withcur) in
   @[m.x, m.y, m.z, 1.0]
 
 ------------------------------------------------------------
--- Buildings (indirect instanced draw)
+-- Buildings (indirect instanced draw) — from M1
 ------------------------------------------------------------
+
+def BGRID: i32 = 24         -- building-site grid (distinct from the ground grid)
+def BSPACING: f32 = 1.6
+def KEEP_RADIUS: f32 = 14.0
+def FOOT: f32 = 0.8
+
+def hash1(i: i32) f32 = fract(sin(f32.i32(i) * 12.9898) * 43758.5453)
+
+def candidate(i: i32) vec4f32 =
+  let gx = i % BGRID in
+  let gz = i / BGRID in
+  let x = (f32.i32(gx) - f32.i32(BGRID) * 0.5 + 0.5) * BSPACING in
+  let z = (f32.i32(gz) - f32.i32(BGRID) * 0.5 + 0.5) * BSPACING in
+  let r = sqrt(x * x + z * z) in
+  let keep = if r < KEEP_RADIUS && hash1(i) > 0.35 then 1.0 else 0.0 in
+  let height = 2.0 + 4.0 * hash1(i * 7 + 1) in
+  @[x, z, height, keep]
+
+#[compute]
+entry gen(seed: []u32) ([]vec4f32, draw_args) =
+  let insts = map(|s| candidate(i32.u32(s)), seed) in
+  (insts, { vertex_count = 36u32, instance_count = u32.i32(length(seed)),
+            first_vertex = 0u32, first_instance = 0u32 })
 
 #[vertex]
 entry box_vertex(#[builtin(vertex_index)] vid: i32,
@@ -89,8 +111,8 @@ entry box_vertex(#[builtin(vertex_index)] vid: i32,
                  #[storage(set=1, binding=0, access=read)] instances: []vec4f32,
                  #[uniform(set=1, binding=1)] iResolution: vec3f32)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32) =
-  let inst = instances[iid] in   -- (centerX, centerZ, height, keep)
-  let k = inst.w in               -- 0 -> collapse to a point (degenerate, culled)
+  let inst = instances[iid] in
+  let k = inst.w in
   let local = box_pos[vid] in
   let world = @[inst.x + local.x * FOOT * k,
                 local.y * inst.z * k,

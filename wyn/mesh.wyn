@@ -41,6 +41,7 @@ def box_nrm: [36]vec3f32 =
    @[0.0, 0.0, 0.0 - 1.0], @[0.0, 0.0, 0.0 - 1.0], @[0.0, 0.0, 0.0 - 1.0]]
 
 -- Ground quad in [-1,1] x,z at y=0 (scaled by the caller). 2 tris, 6 verts.
+-- One quad covers the whole grid; the fragment shader resolves Voronoi per pixel.
 def quad_pos: [6]vec3f32 =
   [@[0.0 - 1.0, 0.0, 0.0 - 1.0], @[0.0 - 1.0, 0.0, 1.0], @[1.0, 0.0, 1.0],
    @[0.0 - 1.0, 0.0, 0.0 - 1.0], @[1.0, 0.0, 1.0], @[1.0, 0.0, 0.0 - 1.0]]
