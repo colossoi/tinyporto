@@ -10,17 +10,20 @@ a generic GPU host that knows nothing about the game.**
 
 ```
 wyn/        the application — all shaders AND game/sim logic (Wyn -> SPIR-V)
-  main.wyn    root: entry points (vertex/fragment, later compute)
-  camera.wyn  orbit camera + ray gen          } library modules
-  shade.wyn   sky / lighting / tonemap / cursor }
-  math.wyn    shared scalar/vector helpers      }
+  main.wyn    root: compute (gen) + vertex/fragment entry points
+  camera.wyn  orbit camera + ray gen + view-projection } library modules
+  shade.wyn   sky / lighting / tonemap / cursor          }
+  mesh.wyn    static geometry (box, ground quad)          }
+  math.wyn    shared scalar/vector helpers                }
 driver/     generic wgpu host (NO domain types — no Ground/Building/etc.)
+  build.rs      compiles each Wyn root (`wyn compile`) + embeds the SPIR-V
   src/graph.rs  generic frame-graph schema (mirrors the wyn descriptor)
   src/app.rs    the tiny-porto graph as plain `const` data
-  src/wync.rs   `wyn compile` + load SPIR-V into wgpu
+  src/wync.rs   load embedded SPIR-V into wgpu
   src/gfx.rs    wgpu context
   src/main.rs   clap args + winit loop + the generic executor
-shaders/    build artifacts: *.spv + *.json descriptor (gitignored)
+shaders/    scratch dir for manual `wyn compile` inspection (gitignored);
+            the build embeds SPIR-V from OUT_DIR, not from here
 ```
 
 ## Build & run
@@ -29,10 +32,13 @@ Requires the `wyn` compiler on `PATH`.
 
 ```sh
 cd driver
-cargo run                 # compiles wyn/main.wyn -> SPIR-V, then opens a window
-cargo run -- --no-compile # use existing shaders/*.spv
+cargo run                 # build.rs compiles+embeds the Wyn shaders, then opens a window
 cargo run -- --frames 5   # render N frames then exit (headless smoke test)
 ```
+
+Shaders are compiled at **build time** (`build.rs` → `wyn compile`) and embedded
+into the binary via `include_bytes!`, so the driver does no shader I/O at runtime
+and never shells out to `wyn`. Editing any `wyn/*.wyn` triggers a rebuild.
 
 You should see a sand ground under a tilted-diorama orbit camera with a field of
 ochre flat-roofed building boxes — the boxes are drawn via `draw_indirect`, with
@@ -42,13 +48,13 @@ their instance data and the draw-args (instance count) produced GPU-side by the
 ## Architecture notes
 
 - **Backend: SPIR-V.** `wyn compile` emits `<name>.spv` + a `<name>.json`
-  pipeline descriptor in one step. The driver loads the `.spv` via wgpu's
-  `ShaderSource::SpirV` (naga frontend → cross-backend). SPIR-V `OpEntryPoint`
-  names equal the Wyn source entry names (no mangling).
+  pipeline descriptor in one step. `build.rs` runs it and embeds the `.spv`; the
+  driver loads it via wgpu's `ShaderSource::SpirV` (naga frontend → cross-backend).
+  SPIR-V `OpEntryPoint` names equal the Wyn source entry names (no mangling).
 - **The driver never reads the descriptor at runtime.** The frame-graph is the
-  `const GRAPH` in `src/app.rs`, compiled into the binary. A future `build.rs`
-  will diff that graph against the emitted `.json` and fail on drift
-  (`driver/build.rs` is a stub today).
+  `const GRAPH` in `src/app.rs`, compiled into the binary. The `.json` descriptor
+  is a build-time artifact only; a future `build.rs` step will diff `GRAPH`
+  against it and fail on drift (that validation is the remaining stub).
 - **Generic host.** `graph.rs`/the executor have no game concepts; `app.rs`
   names resources but is still just generic graph data. All meaning lives in
   `wyn/`.

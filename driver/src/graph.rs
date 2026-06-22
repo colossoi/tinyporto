@@ -129,11 +129,11 @@ pub enum Pass {
     Render(RenderPass),
 }
 
-/// The whole application as data.
+/// The whole application as data. Shader modules are compiled+embedded by
+/// `build.rs` (see the generated `SHADER_MODULES`); passes reference them by the
+/// same key, so the graph itself carries no module paths.
 #[derive(Clone, Copy, Debug)]
 pub struct Graph {
-    /// (key, path-to-.spv) — each compiled Wyn module.
-    pub modules: &'static [(&'static str, &'static str)],
     pub resources: &'static [Resource],
     pub passes: &'static [Pass],
 }

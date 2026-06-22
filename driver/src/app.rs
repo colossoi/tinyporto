@@ -11,8 +11,6 @@ use crate::graph::*;
 const N: u64 = 24 * 24;
 
 pub const GRAPH: Graph = Graph {
-    modules: &[("main", "shaders/main.spv")],
-
     resources: &[
         Resource::SysUniform { name: "iResolution", kind: SysUniform::Resolution },
         // Compute I/O. `seed` is an iota index buffer; `gen` maps it to
