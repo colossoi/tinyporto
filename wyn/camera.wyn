@@ -12,7 +12,7 @@ def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]
 -- steep (top-down); zoomed in is near + flat (toward the horizon). Negative
 -- elevation keeps the eye above the y=0 ground.
 def DIST_FAR:  f32 = 170.0
-def DIST_NEAR: f32 = 35.0
+def DIST_NEAR: f32 = 16.0
 def ELEV_FAR:  f32 = 0.0 - 0.95
 def ELEV_NEAR: f32 = 0.0 - 0.20
 def cam_dist(zoom: f32) f32 = mix(DIST_FAR, DIST_NEAR, zoom)
@@ -71,6 +71,10 @@ def look_at(eye: vec3f32, center: vec3f32, up: vec3f32) mat4f32 =
     [0.0 - dot(s, eye), 0.0 - dot(u, eye), dot(f, eye), 1.0]]
 
 -- World position -> clip space. Applies view then projection (no mat*mat).
+-- Camera eye (world) for a given zoom — used by per-pixel ray marching.
+def cam_eye(zoom: f32) vec3f32 =
+  LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)]
+
 def world_to_clip(p: vec3f32, resolution: vec3f32, zoom: f32) vec4f32 =
   let aspect = resolution.x / resolution.y in
   let eye = LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)] in

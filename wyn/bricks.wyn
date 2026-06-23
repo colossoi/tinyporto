@@ -40,6 +40,14 @@ def round_normal(p: vec3f32, b: vec3f32, r: f32) vec3f32 =
               f32.sign(p.y) * qy,
               f32.sign(p.z) * qz])
 
+-- Exterior signed distance to a rounded box (half-extents b, radius r). The
+-- interior term is omitted — we only ever sphere-trace it from outside.
+def sd_round_box(p: vec3f32, b: vec3f32, r: f32) f32 =
+  let qx = f32.max(f32.abs(p.x) - b.x, 0.0) in
+  let qy = f32.max(f32.abs(p.y) - b.y, 0.0) in
+  let qz = f32.max(f32.abs(p.z) - b.z, 0.0) in
+  magnitude(@[qx, qy, qz]) - r
+
 -- Per-sett deterministic value in [0,1) for color variation.
 def brick_hash(i: i32) f32 =
   f32.fract(f32.sin(f32.i32(i) * 91.37) * 47453.31)

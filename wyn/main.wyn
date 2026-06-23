@@ -185,23 +185,47 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
                    #[storage(set=1, binding=0, access=read)] instances: []vec4f32,
                    #[uniform(set=1, binding=1)] iResolution: vec3f32,
                    #[uniform(set=1, binding=2)] iCam: vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] f32) =
+  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec3f32,
+   #[location(2)] f32) =
   let inst = instances[iid] in   -- (cx, cz, keep, variation)
   let keep = inst.z in
   let local = box_pos[vid] in     -- x,z in [-0.5,0.5], y in [0,1]
-  -- centered local position (meters) for the rounded-box normal
-  let p = @[local.x * BRICK_W, (local.y - 0.5) * BRICK_H, local.z * BRICK_L] in
   let world = @[inst.x + local.x * BRICK_W * keep,
                 local.y * BRICK_H * keep,
                 inst.y + local.z * BRICK_L * keep] in
-  (world_to_clip(world, iResolution, iCam.x), p, inst.w)
+  let center = @[inst.x, BRICK_H * 0.5, inst.y] in
+  (world_to_clip(world, iResolution, iCam.x), world, center, inst.w)
 
+-- Per-pixel rounded-box ray march (Tiny Glade trick): the proxy box just
+-- triggers the fragment; we sphere-trace the rounded box from the camera ray so
+-- the SILHOUETTE rounds too. A miss writes frag_depth 1.0 -> fails the depth
+-- test -> effectively discarded (Wyn has no `discard`).
 #[fragment]
-entry brick_fragment(#[location(0)] p: vec3f32, #[location(1)] var: f32)
-  #[location(0)] vec4f32 =
-  let b = @[BRICK_W * 0.5, BRICK_H * 0.5, BRICK_L * 0.5] in
-  let n = round_normal(p, b, ROUND) in
-  let base = COBBLE_BASE * v3(0.8 + 0.4 * var) in
-  let col = lit(base, n) in
-  let m = tonemap_aces(col) in
-  @[m.x, m.y, m.z, 1.0]
+entry brick_fragment(#[location(0)] worldPos: vec3f32,
+                     #[location(1)] center: vec3f32,
+                     #[location(2)] var: f32,
+                     #[uniform(set=1, binding=1)] iResolution: vec3f32,
+                     #[uniform(set=1, binding=2)] iCam: vec4f32)
+  (#[location(0)] vec4f32, #[builtin(frag_depth)] f32) =
+  let eye = cam_eye(iCam.x) in
+  let rd = normalize(worldPos - eye) in
+  let bb = @[BRICK_W * 0.5, BRICK_H * 0.5, BRICK_L * 0.5] in
+  let bi = bb - v3(ROUND) in
+  let t0 = distance(eye, worldPos) in
+  let (_, t, hit) =
+    loop (i, t, hit) = (0, t0, false) while i < 24 && !hit do
+      let p = eye + rd * v3(t) - center in
+      let d = sd_round_box(p, bi, ROUND) in
+      if d < 0.0008 then (i + 1, t, true)
+      else if t > t0 + 0.5 then (24, t, false)
+      else (i + 1, t + d, false)
+  in
+  if hit then
+    let hw = eye + rd * v3(t) in
+    let n = round_normal(hw - center, bb, ROUND) in
+    let base = COBBLE_BASE * v3(0.8 + 0.4 * var) in
+    let m = tonemap_aces(lit(base, n)) in
+    let clip = world_to_clip(hw, iResolution, iCam.x) in
+    (@[m.x, m.y, m.z, 1.0], clip.z / clip.w)
+  else
+    (@[0.0, 0.0, 0.0, 1.0], 1.0)
