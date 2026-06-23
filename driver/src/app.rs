@@ -11,6 +11,8 @@ use crate::graph::*;
 const BN: u64 = 24 * 24;
 // Ground control points (GW*GH*CP_PER_CELL in wyn/grid.wyn = 40*40*4).
 const CPN: u64 = 40 * 40 * 4;
+// Cobble setts (BCOLS*BROWS in wyn/bricks.wyn = 168*220).
+const BRICKN: u64 = 168 * 220;
 
 // Shorthand for a plain binding.
 const fn b(set: u32, binding: u32, resource: &'static str, kind: BindingKind) -> Binding {
@@ -22,6 +24,7 @@ pub const GRAPH: Graph = Graph {
         Resource::SysUniform { name: "iResolution", kind: SysUniform::Resolution },
         Resource::SysUniform { name: "iMouse", kind: SysUniform::Mouse },
         Resource::SysUniform { name: "iKeys", kind: SysUniform::Keys },
+        Resource::SysUniform { name: "iCam", kind: SysUniform::Cam },
         // UI state [tool, lines_on], ping-ponged; advanced by the `ui` pass.
         Resource::PingPong { name: "uistate", size: 8 },
         // Building generation I/O.
@@ -31,6 +34,10 @@ pub const GRAPH: Graph = Graph {
         // Ground grid: per-control-point iota + ping-pong material (0=sand).
         Resource::Buffer(BufferDef { name: "seed_g", size: CPN * 4, indirect: false, init: BufInit::Iota }),
         Resource::PingPong { name: "material", size: CPN * 4 },
+        // Cobble setts: one indirect-drawn proxy box per running-bond cell.
+        Resource::Buffer(BufferDef { name: "brick_seed", size: BRICKN * 4, indirect: false, init: BufInit::Iota }),
+        Resource::Buffer(BufferDef { name: "brick_instances", size: BRICKN * 16, indirect: false, init: BufInit::Zeroed }),
+        Resource::Buffer(BufferDef { name: "brick_args", size: 16, indirect: true, init: BufInit::Zeroed }),
         Resource::Depth { name: "depth" },
     ],
 
@@ -42,7 +49,7 @@ pub const GRAPH: Graph = Graph {
             entry: "ui",
             bindings: &[
                 Binding { set: 0, binding: 0, resource: "uistate", kind: BindingKind::StorageRead, role: Role::Prev },
-                Binding { set: 0, binding: 4, resource: "uistate", kind: BindingKind::StorageWrite, role: Role::Next },
+                Binding { set: 0, binding: 6, resource: "uistate", kind: BindingKind::StorageWrite, role: Role::Next },
                 b(1, 0, "iKeys", BindingKind::Uniform),
             ],
             dispatch: Dispatch::Fixed { x: 1 },
@@ -57,8 +64,8 @@ pub const GRAPH: Graph = Graph {
             // entries in one module). seed shares b0 (per-pipeline bind group).
             bindings: &[
                 b(0, 3, "seed_b", BindingKind::StorageRead),
-                b(0, 6, "instances", BindingKind::StorageWrite),
-                b(0, 7, "args", BindingKind::StorageWrite),
+                b(0, 8, "instances", BindingKind::StorageWrite),
+                b(0, 9, "args", BindingKind::StorageWrite),
             ],
             dispatch: Dispatch::FromBufferElems { buffer: "seed_b", elem_bytes: 4, workgroup: 64 },
         }),
@@ -70,14 +77,28 @@ pub const GRAPH: Graph = Graph {
             bindings: &[
                 b(0, 1, "seed_g", BindingKind::StorageRead),
                 Binding { set: 0, binding: 2, resource: "material", kind: BindingKind::StorageRead, role: Role::Prev },
-                Binding { set: 0, binding: 5, resource: "material", kind: BindingKind::StorageWrite, role: Role::Next },
+                Binding { set: 0, binding: 7, resource: "material", kind: BindingKind::StorageWrite, role: Role::Next },
                 b(1, 0, "iResolution", BindingKind::Uniform),
                 b(1, 1, "iMouse", BindingKind::Uniform),
                 Binding { set: 1, binding: 2, resource: "uistate", kind: BindingKind::StorageRead, role: Role::Next },
+                b(1, 3, "iCam", BindingKind::Uniform),
             ],
             dispatch: Dispatch::FromBufferElems { buffer: "seed_g", elem_bytes: 4, workgroup: 64 },
         }),
-        // Scene: Voronoi ground (this frame's material) + buildings.
+        // Cobble setts: generate instances (cobble-gated) + indirect args.
+        Pass::Compute(ComputePass {
+            label: "brick_gen",
+            module: "main",
+            entry: "brick_gen",
+            bindings: &[
+                b(0, 4, "brick_seed", BindingKind::StorageRead),
+                Binding { set: 0, binding: 5, resource: "material", kind: BindingKind::StorageRead, role: Role::Next },
+                b(0, 10, "brick_instances", BindingKind::StorageWrite),
+                b(0, 11, "brick_args", BindingKind::StorageWrite),
+            ],
+            dispatch: Dispatch::FromBufferElems { buffer: "brick_seed", elem_bytes: 4, workgroup: 64 },
+        }),
+        // Scene: Voronoi ground (this frame's material) + buildings + setts.
         Pass::Render(RenderPass {
             label: "scene",
             depth: Some("depth"),
@@ -93,6 +114,7 @@ pub const GRAPH: Graph = Graph {
                         b(1, 1, "iMouse", BindingKind::Uniform),
                         Binding { set: 1, binding: 2, resource: "material", kind: BindingKind::StorageRead, role: Role::Next },
                         Binding { set: 1, binding: 3, resource: "uistate", kind: BindingKind::StorageRead, role: Role::Next },
+                        b(1, 4, "iCam", BindingKind::Uniform),
                     ],
                     draw: Draw::Direct { vertices: 6, instances: 1 },
                     depth_write: true,
@@ -105,8 +127,22 @@ pub const GRAPH: Graph = Graph {
                     bindings: &[
                         b(1, 0, "instances", BindingKind::StorageRead),
                         b(1, 1, "iResolution", BindingKind::Uniform),
+                        b(1, 2, "iCam", BindingKind::Uniform),
                     ],
                     draw: Draw::Indirect { args: "args" },
+                    depth_write: true,
+                },
+                RenderItem {
+                    label: "bricks",
+                    module: "main",
+                    vs: "brick_vertex",
+                    fs: "brick_fragment",
+                    bindings: &[
+                        b(1, 0, "brick_instances", BindingKind::StorageRead),
+                        b(1, 1, "iResolution", BindingKind::Uniform),
+                        b(1, 2, "iCam", BindingKind::Uniform),
+                    ],
+                    draw: Draw::Indirect { args: "brick_args" },
                     depth_write: true,
                 },
             ],

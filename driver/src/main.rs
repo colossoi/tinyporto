@@ -13,7 +13,7 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Event, MouseButton, WindowEvent};
+use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowBuilder;
@@ -38,7 +38,7 @@ struct Args {
     frames: u32,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Input {
     mouse_x: f32,
     mouse_y: f32,
@@ -46,6 +46,14 @@ struct Input {
     /// One-frame key pulses (set on keydown edge, cleared after each frame).
     tab_pulse: bool,
     line_pulse: bool,
+    /// Accumulated scroll zoom in [0,1] (0 = far/top-down, 1 = near/flat).
+    zoom: f32,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self { mouse_x: 0.0, mouse_y: 0.0, held: false, tab_pulse: false, line_pulse: false, zoom: 0.4 }
+    }
 }
 
 // ---- built (concrete GPU) passes ----
@@ -168,6 +176,7 @@ impl Renderer {
                             [input.mouse_x, input.mouse_y, if input.held { 1.0 } else { 0.0 }, 0.0]
                         }
                         SysUniform::Frame => [f32::from_bits(self.frame), 0.0, 0.0, 0.0],
+                        SysUniform::Cam => [input.zoom, 0.0, 0.0, 0.0],
                         SysUniform::Keys => unreachable!(),
                     };
                     q.write_buffer(buf, 0, bytemuck::cast_slice(&data));
@@ -513,6 +522,13 @@ fn main() -> Result<()> {
                 }
                 WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                     input.held = state == ElementState::Pressed;
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
+                    };
+                    input.zoom = (input.zoom + dy * 0.08).clamp(0.0, 1.0);
                 }
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
                     // Edge-detect keydown (ignore auto-repeat); set a one-frame pulse.

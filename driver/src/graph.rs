@@ -22,6 +22,8 @@ pub enum SysUniform {
     Frame,
     /// `vec4u32` one-frame key pulses: (x = Tab pressed, y = toggle pressed, …).
     Keys,
+    /// `vec4f32` view state: (zoom in [0,1], panX, panZ, 0).
+    Cam,
 }
 
 /// How a storage buffer's initial contents are set.

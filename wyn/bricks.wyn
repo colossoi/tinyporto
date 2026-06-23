@@ -1,0 +1,45 @@
+-- bricks: cobblestone setts laid in a running-bond grid over cobble ground.
+-- Library module (no `open`; f32.* / vec.* qualified).
+--
+-- Each sett is a real protruding proxy box (instanced, drawn indirect). The
+-- rounded corners come from an analytic rounded-box normal in the fragment
+-- (see round_normal); a later pass upgrades to a per-pixel rounded-box ray
+-- march so the silhouette rounds too (the Tiny Glade trick).
+
+-- Sett dimensions (meters), from a 10"x7"x4" cobble reference.
+def BRICK_W: f32 = 0.25     -- x footprint
+def BRICK_L: f32 = 0.18     -- z footprint
+def BRICK_H: f32 = 0.04     -- protrusion above ground
+def MORTAR:  f32 = 0.015    -- joint width
+def ROUND:   f32 = 0.015    -- corner radius
+
+def CELLX: f32 = 0.265      -- BRICK_W + MORTAR
+def CELLZ: f32 = 0.195      -- BRICK_L + MORTAR
+
+-- Running-bond grid covering the ~40 m ground (centered on origin).
+def BCOLS: i32 = 168
+def BROWS: i32 = 220
+def BRICK_COUNT: i32 = 36960   -- BCOLS * BROWS (must match the brick seed length)
+
+-- World-space (x,z) center of sett i. Odd rows shift half a cell (running bond).
+def brick_center(i: i32) vec2f32 =
+  let col = i % BCOLS in
+  let row = i / BCOLS in
+  let offx = if row % 2 == 1 then CELLX * 0.5 else 0.0 in
+  let x = (f32.i32(col) - f32.i32(BCOLS) * 0.5 + 0.5) * CELLX + offx in
+  let z = (f32.i32(row) - f32.i32(BROWS) * 0.5 + 0.5) * CELLZ in
+  @[x, z]
+
+-- Gradient of the rounded-box SDF at surface point p (box half-extents b,
+-- corner radius r): the smoothly-rounded normal at edges/corners.
+def round_normal(p: vec3f32, b: vec3f32, r: f32) vec3f32 =
+  let qx = f32.max(f32.abs(p.x) - (b.x - r), 0.0) in
+  let qy = f32.max(f32.abs(p.y) - (b.y - r), 0.0) in
+  let qz = f32.max(f32.abs(p.z) - (b.z - r), 0.0) in
+  normalize(@[f32.sign(p.x) * qx + 1e-6 * p.x,
+              f32.sign(p.y) * qy,
+              f32.sign(p.z) * qz])
+
+-- Per-sett deterministic value in [0,1) for color variation.
+def brick_hash(i: i32) f32 =
+  f32.fract(f32.sin(f32.i32(i) * 91.37) * 47453.31)
