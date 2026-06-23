@@ -21,6 +21,9 @@ pub const GRAPH: Graph = Graph {
     resources: &[
         Resource::SysUniform { name: "iResolution", kind: SysUniform::Resolution },
         Resource::SysUniform { name: "iMouse", kind: SysUniform::Mouse },
+        Resource::SysUniform { name: "iKeys", kind: SysUniform::Keys },
+        // UI state [tool, lines_on], ping-ponged; advanced by the `ui` pass.
+        Resource::PingPong { name: "uistate", size: 8 },
         // Building generation I/O.
         Resource::Buffer(BufferDef { name: "seed_b", size: BN * 4, indirect: false, init: BufInit::Iota }),
         Resource::Buffer(BufferDef { name: "instances", size: BN * 16, indirect: false, init: BufInit::Zeroed }),
@@ -32,6 +35,18 @@ pub const GRAPH: Graph = Graph {
     ],
 
     passes: &[
+        // UI state machine: advance [tool, lines_on] from key pulses (Wyn-owned).
+        Pass::Compute(ComputePass {
+            label: "ui",
+            module: "main",
+            entry: "ui",
+            bindings: &[
+                Binding { set: 0, binding: 0, resource: "uistate", kind: BindingKind::StorageRead, role: Role::Prev },
+                Binding { set: 0, binding: 4, resource: "uistate", kind: BindingKind::StorageWrite, role: Role::Next },
+                b(1, 0, "iKeys", BindingKind::Uniform),
+            ],
+            dispatch: Dispatch::Fixed { x: 1 },
+        }),
         // Buildings: generate instances + indirect args.
         Pass::Compute(ComputePass {
             label: "gen",
@@ -41,9 +56,9 @@ pub const GRAPH: Graph = Graph {
             // (b1/b2 belong to `edit` — the compiler keeps them distinct across
             // entries in one module). seed shares b0 (per-pipeline bind group).
             bindings: &[
-                b(0, 0, "seed_b", BindingKind::StorageRead),
-                b(0, 3, "instances", BindingKind::StorageWrite),
-                b(0, 4, "args", BindingKind::StorageWrite),
+                b(0, 3, "seed_b", BindingKind::StorageRead),
+                b(0, 6, "instances", BindingKind::StorageWrite),
+                b(0, 7, "args", BindingKind::StorageWrite),
             ],
             dispatch: Dispatch::FromBufferElems { buffer: "seed_b", elem_bytes: 4, workgroup: 64 },
         }),
@@ -53,11 +68,12 @@ pub const GRAPH: Graph = Graph {
             module: "main",
             entry: "edit",
             bindings: &[
-                b(0, 0, "seed_g", BindingKind::StorageRead),
-                Binding { set: 0, binding: 1, resource: "material", kind: BindingKind::StorageRead, role: Role::Prev },
-                Binding { set: 0, binding: 2, resource: "material", kind: BindingKind::StorageWrite, role: Role::Next },
+                b(0, 1, "seed_g", BindingKind::StorageRead),
+                Binding { set: 0, binding: 2, resource: "material", kind: BindingKind::StorageRead, role: Role::Prev },
+                Binding { set: 0, binding: 5, resource: "material", kind: BindingKind::StorageWrite, role: Role::Next },
                 b(1, 0, "iResolution", BindingKind::Uniform),
                 b(1, 1, "iMouse", BindingKind::Uniform),
+                Binding { set: 1, binding: 2, resource: "uistate", kind: BindingKind::StorageRead, role: Role::Next },
             ],
             dispatch: Dispatch::FromBufferElems { buffer: "seed_g", elem_bytes: 4, workgroup: 64 },
         }),
@@ -76,6 +92,7 @@ pub const GRAPH: Graph = Graph {
                         b(1, 0, "iResolution", BindingKind::Uniform),
                         b(1, 1, "iMouse", BindingKind::Uniform),
                         Binding { set: 1, binding: 2, resource: "material", kind: BindingKind::StorageRead, role: Role::Next },
+                        Binding { set: 1, binding: 3, resource: "uistate", kind: BindingKind::StorageRead, role: Role::Next },
                     ],
                     draw: Draw::Direct { vertices: 6, instances: 1 },
                     depth_write: true,

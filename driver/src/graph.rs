@@ -20,6 +20,8 @@ pub enum SysUniform {
     /// `u32` frame counter.
     #[allow(dead_code)]
     Frame,
+    /// `vec4u32` one-frame key pulses: (x = Tab pressed, y = toggle pressed, …).
+    Keys,
 }
 
 /// How a storage buffer's initial contents are set.
@@ -94,6 +96,8 @@ pub struct Binding {
 pub enum Dispatch {
     /// ceil(buffer_size / elem_bytes / workgroup) workgroups in x.
     FromBufferElems { buffer: &'static str, elem_bytes: u32, workgroup: u32 },
+    /// A fixed number of workgroups in x (e.g. a 1-thread state pass).
+    Fixed { x: u32 },
 }
 
 /// A compute pass: one entry, its set-0 bindings, and a dispatch rule.

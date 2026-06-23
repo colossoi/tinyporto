@@ -15,6 +15,23 @@ type draw_args = { vertex_count: u32, instance_count: u32,
                    first_vertex: u32, first_instance: u32 }
 
 ------------------------------------------------------------
+-- UI state (Wyn-owned). Persistent [tool, lines_on], ping-ponged each frame.
+-- The driver feeds generic one-frame key pulses in iKeys (x = Tab pressed,
+-- y = line-toggle pressed); this advances the state. The driver never knows
+-- what the keys mean.
+------------------------------------------------------------
+
+#[compute]
+entry ui(state_in: []f32,
+         #[uniform(set=1, binding=0)] iKeys: vec4u32) []f32 =
+  let tool0 = state_in[0] in
+  let lines0 = state_in[1] in
+  -- on a Tab pulse, cycle the tool 0 -> 1 -> 2 -> 0
+  let tool1 = if iKeys.x != 0u32 then f32.i32((i32.f32(tool0) + 1) % 3) else tool0 in
+  let lines1 = if iKeys.y != 0u32 then 1.0 - lines0 else lines0 in
+  [tool1, lines1]
+
+------------------------------------------------------------
 -- Water painting (compute, ping-pong over the material buffer)
 ------------------------------------------------------------
 
@@ -24,12 +41,14 @@ type draw_args = { vertex_count: u32, instance_count: u32,
 #[compute]
 entry edit(seed: []u32, material_in: []f32,
            #[uniform(set=1, binding=0)] iResolution: vec3f32,
-           #[uniform(set=1, binding=1)] iMouse: vec4f32) []f32 =
+           #[uniform(set=1, binding=1)] iMouse: vec4f32,
+           #[storage(set=1, binding=2, access=read)] uistate: []f32) []f32 =
   let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y] in
   let (mro, mrd) = get_ray(iResolution, mouseCoord) in
   let mt = ground_t(mro, mrd) in
   let cursor = (mro + mrd * v3(mt)).xz in
   let painting = iMouse.z > 0.0 in
+  let tool = uistate[0] in   -- selected material: 0 empty, 1 water, 2 cobble
   map(|s|
         let i = i32.u32(s) in
         let cell = i / 4 in
@@ -38,7 +57,7 @@ entry edit(seed: []u32, material_in: []f32,
         let k = i % 4 in
         let cpw = cp_world(cx, cz, k) in
         let old = material_in[i] in
-        if painting && distance(cpw, cursor) < BRUSH then 1.0 else old
+        if painting && distance(cpw, cursor) < BRUSH then tool else old
       , seed)
 
 ------------------------------------------------------------
@@ -58,15 +77,20 @@ entry ground_vertex(#[builtin(vertex_index)] vid: i32,
 entry ground_fragment(#[location(0)] w: vec3f32,
                       #[uniform(set=1, binding=0)] iResolution: vec3f32,
                       #[uniform(set=1, binding=1)] iMouse: vec4f32,
-                      #[storage(set=1, binding=2, access=read)] material: []f32)
+                      #[storage(set=1, binding=2, access=read)] material: []f32,
+                      #[storage(set=1, binding=3, access=read)] uistate: []f32)
   #[location(0)] vec4f32 =
   let wxz = @[w.x, w.y] in
   let (mat, f1, f2) = voronoi(wxz, material) in
-  -- Canal bank: darken near the Voronoi boundary (small f2-f1).
-  let bank = 1.0 - smoothstep(0.0, 0.12, f2 - f1) in
+  -- Voronoi cell-boundary lines, toggled by the UI state (off by default).
+  let lines_on = uistate[1] > 0.5 in
+  let bankraw = 1.0 - smoothstep(0.0, 0.12, f2 - f1) in
+  let bank = if lines_on then bankraw else 0.0 in
+  -- Three materials: 0 empty (sand), 1 water, 2 cobble (flat placeholder).
   let surf =
-    if mat > 0.5 then mix(WATER_COLOR, WATER_DEEP, bank)
-    else SAND_COLOR * (1.0 - 0.25 * bank) in
+    if mat < 0.5 then SAND_COLOR * (1.0 - 0.25 * bank)
+    else if mat < 1.5 then mix(WATER_COLOR, WATER_DEEP, bank)
+    else mix(COBBLE_BASE, MORTAR_COLOR, bank) in
   let col = lit(surf, @[0.0, 1.0, 0.0]) in
   -- Cyan brush cursor on the ground.
   let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y] in
@@ -74,7 +98,13 @@ entry ground_fragment(#[location(0)] w: vec3f32,
   let mt = ground_t(mro, mrd) in
   let cursor = (mro + mrd * v3(mt)).xz in
   let held = if iMouse.z > 0.0 then 1.0 else 0.0 in
-  let withcur = cursor_ring(col, wxz, cursor, BRUSH, held) in
+  -- Tint the cursor by the selected tool (sandy=empty, cyan=water, stone=cobble).
+  let tool = uistate[0] in
+  let ring_color =
+    if tool < 0.5 then @[0.95, 0.90, 0.70]
+    else if tool < 1.5 then @[0.0, 1.0, 1.0]
+    else @[0.78, 0.78, 0.85] in
+  let withcur = cursor_ring(col, ring_color, wxz, cursor, BRUSH, held) in
   let m = tonemap_aces(withcur) in
   @[m.x, m.y, m.z, 1.0]
 

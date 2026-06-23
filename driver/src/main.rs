@@ -15,6 +15,7 @@ use clap::Parser;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowBuilder;
 
 use gfx::Gfx;
@@ -42,6 +43,9 @@ struct Input {
     mouse_x: f32,
     mouse_y: f32,
     held: bool,
+    /// One-frame key pulses (set on keydown edge, cleared after each frame).
+    tab_pulse: bool,
+    line_pulse: bool,
 }
 
 // ---- built (concrete GPU) passes ----
@@ -149,13 +153,26 @@ impl Renderer {
         let h = self.gfx.config.height as f32;
         let t = self.start.elapsed().as_secs_f32();
         for (name, kind) in &self.sys {
-            let data: [f32; 4] = match kind {
-                SysUniform::Resolution => [w, h, if h > 0.0 { w / h } else { 1.0 }, 0.0],
-                SysUniform::Time => [t, 0.0, 0.0, 0.0],
-                SysUniform::Mouse => [input.mouse_x, input.mouse_y, if input.held { 1.0 } else { 0.0 }, 0.0],
-                SysUniform::Frame => [f32::from_bits(self.frame), 0.0, 0.0, 0.0],
-            };
-            q.write_buffer(&self.buffers[name], 0, bytemuck::cast_slice(&data));
+            let buf = &self.buffers[name];
+            match kind {
+                // Discrete key pulses are written as u32 (the shader reads vec4u32).
+                SysUniform::Keys => {
+                    let data: [u32; 4] = [input.tab_pulse as u32, input.line_pulse as u32, 0, 0];
+                    q.write_buffer(buf, 0, bytemuck::cast_slice(&data));
+                }
+                _ => {
+                    let data: [f32; 4] = match kind {
+                        SysUniform::Resolution => [w, h, if h > 0.0 { w / h } else { 1.0 }, 0.0],
+                        SysUniform::Time => [t, 0.0, 0.0, 0.0],
+                        SysUniform::Mouse => {
+                            [input.mouse_x, input.mouse_y, if input.held { 1.0 } else { 0.0 }, 0.0]
+                        }
+                        SysUniform::Frame => [f32::from_bits(self.frame), 0.0, 0.0, 0.0],
+                        SysUniform::Keys => unreachable!(),
+                    };
+                    q.write_buffer(buf, 0, bytemuck::cast_slice(&data));
+                }
+            }
         }
     }
 
@@ -406,6 +423,7 @@ fn build_compute(
             let elems = (buffer_size(graph, buffer) / elem_bytes as u64) as u32;
             elems.div_ceil(workgroup)
         }
+        Dispatch::Fixed { x } => x,
     };
     BuiltCompute { pipeline, sets, groups }
 }
@@ -496,10 +514,24 @@ fn main() -> Result<()> {
                 WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                     input.held = state == ElementState::Pressed;
                 }
+                WindowEvent::KeyboardInput { event: key_event, .. } => {
+                    // Edge-detect keydown (ignore auto-repeat); set a one-frame pulse.
+                    // The driver doesn't interpret these — Wyn's `ui` pass does.
+                    if key_event.state == ElementState::Pressed && !key_event.repeat {
+                        match key_event.physical_key {
+                            PhysicalKey::Code(KeyCode::Tab) => input.tab_pulse = true,
+                            PhysicalKey::Code(KeyCode::KeyL) => input.line_pulse = true,
+                            _ => {}
+                        }
+                    }
+                }
                 WindowEvent::RedrawRequested => {
                     if let Err(e) = renderer.render(&input) {
                         eprintln!("render error: {e:?}");
                     }
+                    // Pulses last exactly one rendered frame.
+                    input.tab_pulse = false;
+                    input.line_pulse = false;
                     if args.frames != 0 && renderer.frame >= args.frames {
                         println!("rendered {} frames; exiting (--frames)", renderer.frame);
                         elwt.exit();

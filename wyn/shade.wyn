@@ -12,6 +12,8 @@ def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
 def SAND_COLOR: vec3f32 = @[0.80, 0.71, 0.55]
 def WATER_COLOR: vec3f32 = @[0.10, 0.34, 0.46]
 def WATER_DEEP: vec3f32 = @[0.05, 0.20, 0.30]
+def COBBLE_BASE: vec3f32 = @[0.46, 0.43, 0.40]   -- grey stone
+def MORTAR_COLOR: vec3f32 = @[0.28, 0.26, 0.24]
 def CURSOR_COLOR: vec3f32 = @[0.0, 1.0, 1.0]
 -- 1950s Venetian render / ochre plaster for the flat-roofed buildings.
 def BUILDING_COLOR: vec3f32 = @[0.78, 0.42, 0.30]
@@ -41,10 +43,10 @@ def gamma(x: vec3f32) vec3f32 =
 
 -- Cyan brush-radius ring on the ground. An anti-aliased band at `radius`, plus
 -- a faint fill inside, brighter while the mouse button is held.
-def cursor_ring(color: vec3f32, ground_xz: vec2f32, cursor_xz: vec2f32,
-                radius: f32, held: f32) vec3f32 =
+def cursor_ring(color: vec3f32, ring_color: vec3f32, ground_xz: vec2f32,
+                cursor_xz: vec2f32, radius: f32, held: f32) vec3f32 =
   let d = distance(ground_xz, cursor_xz) in
   let ring = smoothstep(0.40, 0.0, f32.abs(d - radius)) in
   let fill = smoothstep(radius, radius - 0.5, d) * 0.12 in
   let inten = clamp01(ring * (0.6 + 0.4 * held) + fill) in
-  mix(color, CURSOR_COLOR, inten)
+  mix(color, ring_color, inten)
