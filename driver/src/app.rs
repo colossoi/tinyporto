@@ -6,7 +6,7 @@
 //! resources exist, the seed sizes, the binding-name -> resource mapping, and the
 //! per-frame schedule.
 
-use crate::descriptor::{step_dispatch, step_out_bytes, GROUND_FRAGMENT_BINDINGS, GROUND_VERTEX_BINDINGS, STEP_BINDINGS};
+use crate::generated::{step_dispatch, step_out_bytes, GROUND_FRAGMENT_BINDINGS, GROUND_VERTEX_BINDINGS, STEP_BINDINGS};
 use crate::graph::*;
 
 // Seed element counts — the only buffer sizes authored by hand (must match the
