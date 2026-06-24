@@ -232,18 +232,19 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32,
   let draw_args = [u32(TESS_CAP), 1u32, 0u32, 0u32]
 
   -- Cobble setts as instances: one record per running-bond cell, scattered over
-  -- bidx. Each is (center.x, center.z, height, radius); height/radius are jittered
-  -- per cell (Tiny-Glade per-instance variation), and cells outside the cobble
-  -- region get height 0 so their proxy box collapses. `sett_vertex` instances a
-  -- proxy box from this; a later pass raymarches a rounded box of `radius`.
+  -- bidx. Each is (center.x, center.z, height, roundfrac); height and roundfrac
+  -- are jittered per cell (Tiny-Glade per-instance variation), and cells outside
+  -- the cobble region get height 0 so their proxy box collapses. roundfrac is the
+  -- corner radius as a fraction of the brick's min half-extent, so the fragment
+  -- can clamp-free-ly raymarch a rounded box that varies per instance.
   let sett_inst =
     map(|s|
       let i = i32(s)
       let center = brick_center(i)
       let inside = magnitude(center) < 8.0
-      let height = if inside then BRICK_H * (0.6 + 0.8 * brick_hash(i)) else 0.0
-      let radius = ROUND * (0.5 + brick_hash(i + 7919)) in
-      @[center.x, center.y, height, radius]
+      let height = if inside then BRICK_H * (0.9 + 0.2 * brick_hash(i)) else 0.0
+      let roundfrac = 0.3 + 0.6 * brick_hash(i + 7919) in
+      @[center.x, center.y, height, roundfrac]
       , bidx)
 
   -- Instanced draw args: 36 proxy-box verts, BRICK_COUNT instances.
@@ -295,8 +296,9 @@ entry scene_fragment(#[location(0)] kind: f32, #[location(1)] attr: f32,
 -- `step` scatters a per-instance record (center, height, radius) into sett_inst;
 -- this vertex places one proxy box per instance, scaled by the instance's random
 -- height. A cell with height 0 (outside the cobble region) collapses to a point.
--- Flat-shaded for now; a later pass raymarches a rounded box of `radius` so the
--- silhouette rounds per instance.
+-- The fragment sphere-traces a rounded box of `radius` inside the proxy so the
+-- silhouette rounds per instance; the proxy's outer extent IS the rounded box's,
+-- so the trace starts on the proxy's front face.
 ------------------------------------------------------------
 
 #[vertex]
@@ -305,7 +307,7 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
                   #[uniform(set=1, binding=0)] iResolution: vec3f32,
                   #[uniform(set=1, binding=3)] iCam: vec4f32,
                   #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] f32) =
+  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec4f32, #[location(2)] f32) =
   let inst = sett_inst[iid]
   let center = @[inst.x, inst.y]
   let height = inst.z
@@ -314,12 +316,39 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
   let world = @[center.x + local.x * BRICK_W * keep,
                 local.y * height,
                 center.y + local.z * BRICK_L * keep] in
-  (world_to_clip(world, iResolution, iCam.x), box_nrm[vid], brick_hash(iid))
+  (world_to_clip(world, iResolution, iCam.x), world, inst, brick_hash(iid))
 
+-- Sphere-trace the rounded box for this instance from the proxy front face. On a
+-- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
+-- ray grazes a rounded-off corner) push frag_depth to the far plane so the
+-- already-drawn ground wins the LessEqual depth test — that carves the silhouette.
 #[fragment]
-entry sett_fragment(#[location(0)] normal: vec3f32, #[location(1)] var: f32)
-  #[location(0)] vec4f32 =
-  let base = COBBLE_BASE * v3(0.8 + 0.4 * var)
-  let col = lit(base, normalize(normal))
-  let m = tonemap_aces(col) in
-  @[m.x, m.y, m.z, 1.0]
+entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
+                    #[location(2)] var: f32,
+                    #[uniform(set=1, binding=0)] iResolution: vec3f32,
+                    #[uniform(set=1, binding=3)] iCam: vec4f32)
+  (#[location(0)] vec4f32, #[builtin(frag_depth)] f32) =
+  let height = inst.z
+  let bcenter = @[inst.x, height * 0.5, inst.y]
+  let half = @[BRICK_W * 0.5, height * 0.5, BRICK_L * 0.5]
+  -- Corner radius = roundfrac of the min half-extent (height/2 here), so b stays
+  -- positive on every axis for any roundfrac < 1 — no clamp needed.
+  let r = inst.w * f32.min(half.x, f32.min(half.y, half.z))
+  let b = @[half.x - r, half.y - r, half.z - r]
+  let rd = normalize(world - cam_eye(iCam.x))
+  let (t, hit) =
+    loop (t, hit) = (0.0, false) for _i < 32 do
+      if hit then (t, hit)
+      else
+        let p = world + rd * t
+        let d = sd_round_box(p - bcenter, b, r) in
+        if d < 0.0004 then (t, true) else (t + d, false)
+  let pos = world + rd * t in
+  if hit then
+    let n = round_normal(pos - bcenter, b, r)
+    let clip = world_to_clip(pos, iResolution, iCam.x)
+    let col = lit(COBBLE_BASE * v3(0.8 + 0.4 * var), n)
+    let m = tonemap_aces(col) in
+    (@[m.x, m.y, m.z, 1.0], clip.z / clip.w)
+  else
+    (@[0.0, 0.0, 0.0, 0.0], 1.0)
