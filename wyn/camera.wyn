@@ -20,15 +20,15 @@ def cam_elev(zoom: f32) f32 = mix(ELEV_FAR, ELEV_NEAR, zoom)
 
 -- Pinhole ray through a pixel, camera-space (-z forward).
 def ray_dir(fov: f32, size: vec2f32, pos: vec2f32) vec3f32 =
-  let xy = pos - size * 0.5 in
-  let cot_half = f32.tan(f32.radians(90.0 - fov * 0.5)) in
+  let xy = pos - size * 0.5
+  let cot_half = f32.tan(f32.radians(90.0 - fov * 0.5))
   let z = size.y * 0.5 * cot_half in
   normalize(@[xy.x, xy.y, 0.0 - z])
 
 -- Column-major rotation (outer arrays = columns at SPIR-V emission), matching
 -- mountains.wyn. angle = (elevation, azimuth).
 def rotation(angle: vec2f32) mat3f32 =
-  let c = @[f32.cos(angle.x), f32.cos(angle.y)] in
+  let c = @[f32.cos(angle.x), f32.cos(angle.y)]
   let s = @[f32.sin(angle.x), f32.sin(angle.y)] in
   @[[c.y,       0.0,       0.0 - s.y],
     [s.y * s.x, c.x,       c.y * s.x],
@@ -36,9 +36,9 @@ def rotation(angle: vec2f32) mat3f32 =
 
 -- Primary ray for a fragment. Returns (ro, rd) in world space.
 def get_ray(resolution: vec3f32, fragCoord: vec2f32, zoom: f32) (vec3f32, vec3f32) =
-  let rot = rotation(@[cam_elev(zoom), AZIMUTH]) in
-  let rd0 = ray_dir(FOV, resolution.xy, fragCoord) in
-  let rd = rot * rd0 in
+  let rot = rotation(@[cam_elev(zoom), AZIMUTH])
+  let rd0 = ray_dir(FOV, resolution.xy, fragCoord)
+  let rd = rot * rd0
   let ro = LOOKAT + rot * @[0.0, 0.0, cam_dist(zoom)] in
   (ro, rd)
 
@@ -54,7 +54,7 @@ def ground_t(ro: vec3f32, rd: vec3f32) f32 =
 ------------------------------------------------------------
 
 def perspective(fovy_deg: f32, aspect: f32, near: f32, far: f32) mat4f32 =
-  let f = 1.0 / f32.tan(f32.radians(fovy_deg) * 0.5) in
+  let f = 1.0 / f32.tan(f32.radians(fovy_deg) * 0.5)
   let nf = 1.0 / (near - far) in
   @[[f / aspect, 0.0, 0.0,         0.0],
     [0.0,        f,   0.0,         0.0],
@@ -62,8 +62,8 @@ def perspective(fovy_deg: f32, aspect: f32, near: f32, far: f32) mat4f32 =
     [0.0,        0.0, far * near * nf, 0.0]]
 
 def look_at(eye: vec3f32, center: vec3f32, up: vec3f32) mat4f32 =
-  let f = normalize(center - eye) in
-  let s = normalize(cross(f, up)) in
+  let f = normalize(center - eye)
+  let s = normalize(cross(f, up))
   let u = cross(s, f) in
   @[[s.x,             u.x,             0.0 - f.x,     0.0],
     [s.y,             u.y,             0.0 - f.y,     0.0],
@@ -76,8 +76,8 @@ def cam_eye(zoom: f32) vec3f32 =
   LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)]
 
 def world_to_clip(p: vec3f32, resolution: vec3f32, zoom: f32) vec4f32 =
-  let aspect = resolution.x / resolution.y in
-  let eye = LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)] in
-  let view = look_at(eye, LOOKAT, @[0.0, 1.0, 0.0]) in
+  let aspect = resolution.x / resolution.y
+  let eye = LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)]
+  let view = look_at(eye, LOOKAT, @[0.0, 1.0, 0.0])
   let proj = perspective(FOV, aspect, 0.1, 1000.0) in
   proj * (view * @[p.x, p.y, p.z, 1.0])

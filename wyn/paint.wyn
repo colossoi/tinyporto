@@ -41,15 +41,15 @@ def cross2(a: vec2f32, b: vec2f32) f32 = a.x * b.y - a.y * b.x
 
 -- Distance from p to the segment [a,b].
 def sd_seg(p: vec2f32, a: vec2f32, b: vec2f32) f32 =
-  let pa = p - a in
-  let ba = b - a in
+  let pa = p - a
+  let ba = b - a
   let h = f32.clamp(dot(pa, ba) / f32.max(dot(ba, ba), 1e-9), 0.0, 1.0) in
   magnitude(pa - ba * v2(h))
 
 -- Signed distance to an axis-aligned box (half-extents hb) centered at origin.
 def sd_box2(p: vec2f32, hb: vec2f32) f32 =
-  let dx = f32.abs(p.x) - hb.x in
-  let dz = f32.abs(p.y) - hb.y in
+  let dx = f32.abs(p.x) - hb.x
+  let dz = f32.abs(p.y) - hb.y
   let outside = magnitude(@[f32.max(dx, 0.0), f32.max(dz, 0.0)]) in
   outside + f32.min(f32.max(dx, dz), 0.0)
 
@@ -60,20 +60,19 @@ def sd_box2(p: vec2f32, hb: vec2f32) f32 =
 -- floored to a small epsilon so duplicated endpoints don't divide by zero.
 -- Barry-Goldman pyramidal evaluation.
 def cr(p0: vec2f32, p1: vec2f32, p2: vec2f32, p3: vec2f32, u: f32) vec2f32 =
-  let t0 = 0.0 in
-  let t1 = t0 + f32.max(f32.sqrt(distance(p0, p1)), 1e-4) in
-  let t2 = t1 + f32.max(f32.sqrt(distance(p1, p2)), 1e-4) in
-  let t3 = t2 + f32.max(f32.sqrt(distance(p2, p3)), 1e-4) in
-  let t = mix(t1, t2, u) in
-  let a1 = p0 * v2((t1 - t) / (t1 - t0)) + p1 * v2((t - t0) / (t1 - t0)) in
-  let a2 = p1 * v2((t2 - t) / (t2 - t1)) + p2 * v2((t - t1) / (t2 - t1)) in
-  let a3 = p2 * v2((t3 - t) / (t3 - t2)) + p3 * v2((t - t2) / (t3 - t2)) in
-  let b1 = a1 * v2((t2 - t) / (t2 - t0)) + a2 * v2((t - t0) / (t2 - t0)) in
+  let t0 = 0.0
+  let t1 = t0 + f32.max(f32.sqrt(distance(p0, p1)), 1e-4)
+  let t2 = t1 + f32.max(f32.sqrt(distance(p1, p2)), 1e-4)
+  let t3 = t2 + f32.max(f32.sqrt(distance(p2, p3)), 1e-4)
+  let t = mix(t1, t2, u)
+  let a1 = p0 * v2((t1 - t) / (t1 - t0)) + p1 * v2((t - t0) / (t1 - t0))
+  let a2 = p1 * v2((t2 - t) / (t2 - t1)) + p2 * v2((t - t1) / (t2 - t1))
+  let a3 = p2 * v2((t3 - t) / (t3 - t2)) + p3 * v2((t - t2) / (t3 - t2))
+  let b1 = a1 * v2((t2 - t) / (t2 - t0)) + a2 * v2((t - t0) / (t2 - t0))
   let b2 = a2 * v2((t3 - t) / (t3 - t1)) + a3 * v2((t - t1) / (t3 - t1)) in
   b1 * v2((t2 - t) / (t2 - t1)) + b2 * v2((t - t1) / (t2 - t1))
 
 -- The stroke/curve distance, item compositing, and overlay are inlined into
--- ground_fragment: they index the `points`/`items` storage buffers, and the
--- compiler currently passes a storage buffer into a helper as an opaque handle
--- struct that the SPIR-V->naga path can't dynamically index. Indexing only an
--- entry's own bound globals avoids that, so the loops live in the entry.
+-- ground_fragment, where they index the bound `points`/`items` storage buffers
+-- directly. They could be factored into helpers that take those buffers as
+-- parameters; kept inline here for now.
