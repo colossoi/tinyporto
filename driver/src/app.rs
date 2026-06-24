@@ -1,24 +1,27 @@
 //! The tiny-porto frame-graph, as plain data.
 //!
-//! NO domain types here (no Ground/Building); it's a generic `Graph` value. All
-//! meaning lives in the Wyn program (`../wyn`). Must stay in sync with the
-//! descriptor `wyn compile` emits for `wyn/main.wyn`; a future `build.rs`
-//! enforces that.
+//! The per-pipeline binding tables and the dispatch/output-size calculations are
+//! GENERATED from `wyn/main.wyn`'s descriptor by build.rs (the `descriptor`
+//! module). This file authors only what the descriptor can't know: which
+//! resources exist, the seed sizes, the binding-name -> resource mapping, and the
+//! per-frame schedule.
 
+use crate::descriptor::{step_dispatch, step_out_bytes, GROUND_FRAGMENT_BINDINGS, GROUND_VERTEX_BINDINGS, STEP_BINDINGS};
 use crate::graph::*;
 
-// Capture-buffer capacities — must match the constants in wyn/paint.wyn.
-const POINTS_CAP: u64 = 1024; // control points (vec2f32)
-const ITEMS_CAP: u64 = 128; // items (vec4f32)
-const HEAD_LEN: u64 = 12; // capture-state floats
+// Seed element counts — the only buffer sizes authored by hand (must match the
+// constants in wyn/paint.wyn). Everything downstream is derived by the generated
+// `step_out_bytes` from these.
+const POINTS_CAP: u64 = 1024;
+const ITEMS_CAP: u64 = 128;
+const TESS_CAP: u64 = 95238;
+const TIDX_BYTES: u64 = TESS_CAP * 4;
+const PIDX_BYTES: u64 = POINTS_CAP * 4;
+const IIDX_BYTES: u64 = ITEMS_CAP * 4;
 
-// Shorthand for a plain binding.
-const fn b(set: u32, binding: u32, resource: &'static str, kind: BindingKind) -> Binding {
-    Binding { set, binding, resource, kind, role: Role::Plain }
-}
-// Shorthand for a ping-pong binding (Prev = last frame, Next = this frame).
-const fn pp(set: u32, binding: u32, resource: &'static str, kind: BindingKind, role: Role) -> Binding {
-    Binding { set, binding, resource, kind, role }
+// Output buffer size for binding `b`, derived by the generated descriptor calc.
+const fn out(b: u32) -> u64 {
+    step_out_bytes(b, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
 }
 
 pub const GRAPH: Graph = Graph {
@@ -27,47 +30,51 @@ pub const GRAPH: Graph = Graph {
         Resource::SysUniform { name: "iMouse", kind: SysUniform::Mouse },
         Resource::SysUniform { name: "iKeys", kind: SysUniform::Keys },
         Resource::SysUniform { name: "iCam", kind: SysUniform::Cam },
-        // UI state [tool, overlay_on], ping-ponged; advanced by the `ui` pass.
-        Resource::PingPong { name: "uistate", size: 8 },
-        // Paint state (all ping-pong): control points, items, capture head.
-        Resource::PingPong { name: "points", size: POINTS_CAP * 8 },
-        Resource::PingPong { name: "items", size: ITEMS_CAP * 16 },
-        Resource::PingPong { name: "head", size: HEAD_LEN * 4 },
-        // Per-buffer iota index seeds (so each `map` recovers its element index).
-        // paint_head emits a fixed array literal, so it needs no seed.
-        Resource::Buffer(BufferDef { name: "pidx", size: POINTS_CAP * 4, indirect: false, init: BufInit::Iota }),
-        Resource::Buffer(BufferDef { name: "iidx", size: ITEMS_CAP * 4, indirect: false, init: BufInit::Iota }),
+        // Persistent state (ping-pong); sizes derived from the seed sizes.
+        Resource::PingPong { name: "uistate", size: out(7) },
+        Resource::PingPong { name: "points", size: out(8) },
+        Resource::PingPong { name: "items", size: out(9) },
+        Resource::PingPong { name: "head", size: out(10) },
+        // Iota index seeds (the hand-picked design sizes).
+        Resource::Buffer(BufferDef { name: "tidx", size: TIDX_BYTES, init: BufInit::Iota }),
+        Resource::Buffer(BufferDef { name: "pidx", size: PIDX_BYTES, init: BufInit::Iota }),
+        Resource::Buffer(BufferDef { name: "iidx", size: IIDX_BYTES, init: BufInit::Iota }),
+        // Derived ribbon geometry (written by `step`, drawn by `ground`).
+        Resource::Buffer(BufferDef { name: "tess", size: out(11), init: BufInit::Zeroed }),
+    ],
+
+    // Shader binding name -> resource name. Roles (prev/next/plain) are derived
+    // from the binding kind + whether the resource is ping-pong.
+    names: &[
+        ("tidx", "tidx"),
+        ("pidx", "pidx"),
+        ("iidx", "iidx"),
+        ("uistate_in", "uistate"),
+        ("points_in", "points"),
+        ("items_in", "items"),
+        ("head_in", "head"),
+        ("iResolution", "iResolution"),
+        ("iMouse", "iMouse"),
+        ("iCam", "iCam"),
+        ("iKeys", "iKeys"),
+        ("step_output_0", "uistate"),
+        ("step_output_1", "points"),
+        ("step_output_2", "items"),
+        ("step_output_3", "head"),
+        ("step_output_4", "tess"),
+        ("tess", "tess"),
     ],
 
     passes: &[
-        // UI state machine: advance [tool, overlay_on] from key pulses (Wyn-owned).
-        // One compute entry advances all persistent state: reads the previous
-        // ping-pong buffers (Prev) + iota seeds, writes the next ones (Next). The
-        // compiler scheduled the whole thing into a single kernel dispatched over
-        // pidx; set-0 bindings are compiler-allocated (see shaders/main.json).
+        // Advance all persistent state + tessellate the ribbon (one kernel).
         Pass::Compute(ComputePass {
             label: "step",
             module: "main",
             entry: "step",
-            bindings: &[
-                b(0, 0, "pidx", BindingKind::StorageRead),
-                b(0, 1, "iidx", BindingKind::StorageRead),
-                pp(0, 2, "uistate", BindingKind::StorageRead, Role::Prev),
-                pp(0, 3, "points", BindingKind::StorageRead, Role::Prev),
-                pp(0, 4, "items", BindingKind::StorageRead, Role::Prev),
-                pp(0, 5, "head", BindingKind::StorageRead, Role::Prev),
-                pp(0, 6, "uistate", BindingKind::StorageWrite, Role::Next),
-                pp(0, 7, "points", BindingKind::StorageWrite, Role::Next),
-                pp(0, 8, "items", BindingKind::StorageWrite, Role::Next),
-                pp(0, 9, "head", BindingKind::StorageWrite, Role::Next),
-                b(1, 0, "iResolution", BindingKind::Uniform),
-                b(1, 1, "iMouse", BindingKind::Uniform),
-                b(1, 3, "iCam", BindingKind::Uniform),
-                b(1, 7, "iKeys", BindingKind::Uniform),
-            ],
-            dispatch: Dispatch::FromBufferElems { buffer: "pidx", elem_bytes: 4, workgroup: 64 },
+            bindings: STEP_BINDINGS,
+            groups: step_dispatch(TIDX_BYTES)[0],
         }),
-        // Scene: the whole ground as one quad; items composited per fragment.
+        // Draw the tessellated ground ribbon.
         Pass::Render(RenderPass {
             label: "scene",
             depth: None,
@@ -77,17 +84,9 @@ pub const GRAPH: Graph = Graph {
                 module: "main",
                 vs: "ground_vertex",
                 fs: "ground_fragment",
-                bindings: &[
-                    b(1, 0, "iResolution", BindingKind::Uniform),
-                    b(1, 1, "iMouse", BindingKind::Uniform),
-                    pp(1, 2, "uistate", BindingKind::StorageRead, Role::Next),
-                    b(1, 3, "iCam", BindingKind::Uniform),
-                    pp(1, 4, "items", BindingKind::StorageRead, Role::Next),
-                    pp(1, 5, "points", BindingKind::StorageRead, Role::Next),
-                    pp(1, 6, "head", BindingKind::StorageRead, Role::Next),
-                ],
-                draw: Draw::Direct { vertices: 6, instances: 1 },
-                depth_write: false,
+                vs_bindings: GROUND_VERTEX_BINDINGS,
+                fs_bindings: GROUND_FRAGMENT_BINDINGS,
+                draw: Draw::Direct { vertices: TESS_CAP as u32, instances: 1 },
             }],
         }),
     ],
