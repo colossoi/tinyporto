@@ -39,6 +39,8 @@ pub struct BufferDef {
     pub name: &'static str,
     pub size: Option<u64>,
     pub init: BufInit,
+    /// Also usable as a `draw_indirect` args buffer (adds INDIRECT usage).
+    pub indirect: bool,
 }
 
 /// A GPU resource the graph needs.
@@ -98,14 +100,10 @@ pub struct ComputePass {
     pub out_bytes: fn(u32) -> u64,
 }
 
-/// What a render item draws.
-#[derive(Clone, Copy, Debug)]
-pub enum Draw {
-    Direct { vertices: u32, instances: u32 },
-}
-
 /// One pipeline drawn within a render pass. Vertex and fragment binding tables
-/// are merged (they share one pipeline layout).
+/// are merged (they share one pipeline layout). The draw is always indirect:
+/// `draw_args` names a buffer holding [vertex_count, instance_count, first_vertex,
+/// first_instance], written by a compute pass.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderItem {
     pub label: &'static str,
@@ -114,7 +112,7 @@ pub struct RenderItem {
     pub fs: &'static str,
     pub vs_bindings: BindTable,
     pub fs_bindings: BindTable,
-    pub draw: Draw,
+    pub draw_args: &'static str,
 }
 
 /// A render pass: the surface color (+ optional depth) and items drawn in order.

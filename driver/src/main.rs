@@ -78,7 +78,7 @@ struct BuiltCompute {
 struct BuiltItem {
     pipeline: wgpu::RenderPipeline,
     sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
-    draw: Draw,
+    draw_args: &'static str,
 }
 
 struct BuiltRender {
@@ -139,7 +139,7 @@ impl Renderer {
                     sys.push((name, kind));
                 }
                 Resource::Buffer(def) => {
-                    let buf = make_storage(device, &gfx.queue, def.name, size_of(def.name, def.size), def.init);
+                    let buf = make_storage(device, &gfx.queue, def.name, size_of(def.name, def.size), def.init, def.indirect);
                     buffers.insert(def.name, buf);
                 }
                 Resource::PingPong { name, size } => {
@@ -256,9 +256,7 @@ impl Renderer {
                         for (set, bg) in &it.sets[parity % it.sets.len()] {
                             rp.set_bind_group(*set, bg, &[]);
                         }
-                        match it.draw {
-                            Draw::Direct { vertices, instances } => rp.draw(0..vertices, 0..instances),
-                        }
+                        rp.draw_indirect(&self.buffers[it.draw_args], 0);
                     }
                 }
             }
@@ -402,8 +400,8 @@ fn make_storage_raw(device: &wgpu::Device, label: &str, size: u64, indirect: boo
     device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
 }
 
-fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, size: u64, init: BufInit) -> wgpu::Buffer {
-    let buf = make_storage_raw(device, name, size, false);
+fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, size: u64, init: BufInit, indirect: bool) -> wgpu::Buffer {
+    let buf = make_storage_raw(device, name, size, indirect);
     if let BufInit::Iota = init {
         let count = (size / 4) as u32;
         let data: Vec<u32> = (0..count).collect();
@@ -627,7 +625,7 @@ fn build_item(
     for p in 1..variant_count(&binds) {
         sets.push(build_sets(device, it.label, &binds, wgpu::ShaderStages::VERTEX_FRAGMENT, buffers, pp, p).1);
     }
-    BuiltItem { pipeline, sets, draw: it.draw }
+    BuiltItem { pipeline, sets, draw_args: it.draw_args }
 }
 
 // winit 0.30 drives the app through `ApplicationHandler`: the window (and thus

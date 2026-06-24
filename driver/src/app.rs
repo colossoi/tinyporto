@@ -38,11 +38,12 @@ pub const GRAPH: Graph = Graph {
         Resource::PingPong { name: "items", size: None },
         Resource::PingPong { name: "head", size: None },
         // Iota index seeds (the hand-picked design sizes).
-        Resource::Buffer(BufferDef { name: "tidx", size: Some(TIDX_BYTES), init: BufInit::Iota }),
-        Resource::Buffer(BufferDef { name: "pidx", size: Some(PIDX_BYTES), init: BufInit::Iota }),
-        Resource::Buffer(BufferDef { name: "iidx", size: Some(IIDX_BYTES), init: BufInit::Iota }),
-        // Derived ribbon geometry (a `step` output; written by step, drawn by ground).
-        Resource::Buffer(BufferDef { name: "tess", size: None, init: BufInit::Zeroed }),
+        Resource::Buffer(BufferDef { name: "tidx", size: Some(TIDX_BYTES), init: BufInit::Iota, indirect: false }),
+        Resource::Buffer(BufferDef { name: "pidx", size: Some(PIDX_BYTES), init: BufInit::Iota, indirect: false }),
+        Resource::Buffer(BufferDef { name: "iidx", size: Some(IIDX_BYTES), init: BufInit::Iota, indirect: false }),
+        // Derived `step` outputs: the ribbon geometry and its draw_indirect args.
+        Resource::Buffer(BufferDef { name: "tess", size: None, init: BufInit::Zeroed, indirect: false }),
+        Resource::Buffer(BufferDef { name: "draw_args", size: None, init: BufInit::Zeroed, indirect: true }),
     ],
 
     // Shader binding name -> resource name. Roles (prev/next/plain) are derived
@@ -64,6 +65,7 @@ pub const GRAPH: Graph = Graph {
         ("step_output_2", "items"),
         ("step_output_3", "head"),
         ("step_output_4", "tess"),
+        ("step_output_5", "draw_args"),
         ("tess", "tess"),
     ],
 
@@ -89,7 +91,7 @@ pub const GRAPH: Graph = Graph {
                 fs: "ground_fragment",
                 vs_bindings: GROUND_VERTEX_BINDINGS,
                 fs_bindings: GROUND_FRAGMENT_BINDINGS,
-                draw: Draw::Direct { vertices: TESS_CAP as u32, instances: 1 },
+                draw_args: "draw_args",
             }],
         }),
     ],

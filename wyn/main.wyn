@@ -105,7 +105,7 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            #[uniform(set=1, binding=1)] iMouse: vec4f32,
            #[uniform(set=1, binding=3)] iCam: vec4f32,
            #[uniform(set=1, binding=7)] iKeys: vec4u32)
-  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32) =
+  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []u32) =
   -- UI: cycle tool on a Tab pulse; toggle the overlay on its pulse.
   let tool0 = uistate_in[0]
   let ovl0 = uistate_in[1]
@@ -189,7 +189,12 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
             @[pos.x, pos.y, kind, et]
         , tidx) in
 
-  (uistate_out, points_out, items_out, head_out, tess_out)
+  -- Non-indexed draw_indirect args for the ribbon: vertex_count covers the base
+  -- quad plus the per-item budget of the live items (the rest of the tess buffer
+  -- is unused items, never drawn). dic = previous item count (what tess built).
+  let draw_args = [u32(TESS_BASE + dic * TESS_VPI), 1u32, 0u32, 0u32] in
+
+  (uistate_out, points_out, items_out, head_out, tess_out, draw_args)
 
 ------------------------------------------------------------
 -- Ground (one quad over the whole patch; every item composited per fragment)
