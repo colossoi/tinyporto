@@ -19,9 +19,11 @@ const TIDX_BYTES: u64 = TESS_CAP * 4;
 const PIDX_BYTES: u64 = POINTS_CAP * 4;
 const IIDX_BYTES: u64 = ITEMS_CAP * 4;
 
-// Output buffer size for binding `b`, derived by the generated descriptor calc.
-const fn out(b: u32) -> u64 {
-    step_out_bytes(b, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
+// `step`'s output sizes, by binding, from the generated calc (the seed sizes are
+// baked in). The driver pairs this with the binding table to size each output
+// buffer by name — no output binding numbers appear here.
+const fn step_out(binding: u32) -> u64 {
+    step_out_bytes(binding, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
 }
 
 pub const GRAPH: Graph = Graph {
@@ -30,17 +32,17 @@ pub const GRAPH: Graph = Graph {
         Resource::SysUniform { name: "iMouse", kind: SysUniform::Mouse },
         Resource::SysUniform { name: "iKeys", kind: SysUniform::Keys },
         Resource::SysUniform { name: "iCam", kind: SysUniform::Cam },
-        // Persistent state (ping-pong); sizes derived from the seed sizes.
-        Resource::PingPong { name: "uistate", size: out(7) },
-        Resource::PingPong { name: "points", size: out(8) },
-        Resource::PingPong { name: "items", size: out(9) },
-        Resource::PingPong { name: "head", size: out(10) },
+        // Persistent state (ping-pong); sizes derived (they're `step` outputs).
+        Resource::PingPong { name: "uistate", size: None },
+        Resource::PingPong { name: "points", size: None },
+        Resource::PingPong { name: "items", size: None },
+        Resource::PingPong { name: "head", size: None },
         // Iota index seeds (the hand-picked design sizes).
-        Resource::Buffer(BufferDef { name: "tidx", size: TIDX_BYTES, init: BufInit::Iota }),
-        Resource::Buffer(BufferDef { name: "pidx", size: PIDX_BYTES, init: BufInit::Iota }),
-        Resource::Buffer(BufferDef { name: "iidx", size: IIDX_BYTES, init: BufInit::Iota }),
-        // Derived ribbon geometry (written by `step`, drawn by `ground`).
-        Resource::Buffer(BufferDef { name: "tess", size: out(11), init: BufInit::Zeroed }),
+        Resource::Buffer(BufferDef { name: "tidx", size: Some(TIDX_BYTES), init: BufInit::Iota }),
+        Resource::Buffer(BufferDef { name: "pidx", size: Some(PIDX_BYTES), init: BufInit::Iota }),
+        Resource::Buffer(BufferDef { name: "iidx", size: Some(IIDX_BYTES), init: BufInit::Iota }),
+        // Derived ribbon geometry (a `step` output; written by step, drawn by ground).
+        Resource::Buffer(BufferDef { name: "tess", size: None, init: BufInit::Zeroed }),
     ],
 
     // Shader binding name -> resource name. Roles (prev/next/plain) are derived
@@ -73,6 +75,7 @@ pub const GRAPH: Graph = Graph {
             entry: "step",
             bindings: STEP_BINDINGS,
             groups: step_dispatch(TIDX_BYTES)[0],
+            out_bytes: step_out,
         }),
         // Draw the tessellated ground ribbon.
         Pass::Render(RenderPass {

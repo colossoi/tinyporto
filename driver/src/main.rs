@@ -108,6 +108,23 @@ impl Renderer {
             modules.insert(key, wync::load_module_bytes(device, key, bytes));
         }
 
+        // Byte size of each buffer that is a compute output (resource name ->
+        // bytes), from each compute pass's generated size calc applied to its
+        // StorageWrite bindings. Buffers with no declared size are sized from here.
+        let mut derived: HashMap<&'static str, u64> = HashMap::new();
+        for pass in graph.passes {
+            if let Pass::Compute(cp) = pass {
+                for &(_, binding, kind, name) in cp.bindings {
+                    if matches!(kind, BindingKind::StorageWrite) {
+                        derived.insert(name_to_resource(graph, name), (cp.out_bytes)(binding));
+                    }
+                }
+            }
+        }
+        let size_of = |name: &'static str, declared: Option<u64>| -> u64 {
+            declared.unwrap_or_else(|| *derived.get(name).unwrap_or_else(|| panic!("no size for '{name}'")))
+        };
+
         // Resources.
         let mut buffers: HashMap<&'static str, wgpu::Buffer> = HashMap::new();
         let mut pingpong: HashMap<&'static str, [wgpu::Buffer; 2]> = HashMap::new();
@@ -119,9 +136,11 @@ impl Renderer {
                     sys.push((name, kind));
                 }
                 Resource::Buffer(def) => {
-                    buffers.insert(def.name, make_storage(device, &gfx.queue, def));
+                    let buf = make_storage(device, &gfx.queue, def.name, size_of(def.name, def.size), def.init);
+                    buffers.insert(def.name, buf);
                 }
                 Resource::PingPong { name, size } => {
+                    let size = size_of(name, size);
                     let a = make_storage_raw(device, &format!("{name}#0"), size, false);
                     let b = make_storage_raw(device, &format!("{name}#1"), size, false);
                     pingpong.insert(name, [a, b]);
@@ -282,10 +301,10 @@ fn make_storage_raw(device: &wgpu::Device, label: &str, size: u64, indirect: boo
     device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
 }
 
-fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, def: BufferDef) -> wgpu::Buffer {
-    let buf = make_storage_raw(device, def.name, def.size, false);
-    if let BufInit::Iota = def.init {
-        let count = (def.size / 4) as u32;
+fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, size: u64, init: BufInit) -> wgpu::Buffer {
+    let buf = make_storage_raw(device, name, size, false);
+    if let BufInit::Iota = init {
+        let count = (size / 4) as u32;
         let data: Vec<u32> = (0..count).collect();
         queue.write_buffer(&buf, 0, bytemuck::cast_slice(&data));
     }
@@ -293,6 +312,16 @@ fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, def: BufferDef) -> w
 }
 
 // ---- bind groups (shared by compute + render) ----
+
+/// Map a shader binding name to its resource name (via `graph.names`).
+fn name_to_resource(graph: &Graph, binding_name: &str) -> &'static str {
+    graph
+        .names
+        .iter()
+        .find(|(n, _)| *n == binding_name)
+        .map(|(_, r)| *r)
+        .unwrap_or_else(|| panic!("no resource mapping for binding '{binding_name}'"))
+}
 
 /// Resolve a generated binding table into driver `Binding`s: map each shader
 /// binding name to a resource (via `graph.names`) and derive its role — a
@@ -306,12 +335,7 @@ fn resolve_table(
     table
         .iter()
         .map(|&(set, binding, kind, name)| {
-            let resource = graph
-                .names
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, r)| *r)
-                .unwrap_or_else(|| panic!("no resource mapping for binding '{name}'"));
+            let resource = name_to_resource(graph, name);
             let is_pp = pp.contains_key(resource);
             let role = match kind {
                 BindingKind::StorageWrite if is_pp => Role::Next,

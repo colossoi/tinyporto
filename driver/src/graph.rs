@@ -31,11 +31,13 @@ pub enum BufInit {
     Iota,
 }
 
-/// A storage buffer the graph owns (STORAGE | COPY_DST).
+/// A storage buffer the graph owns (STORAGE | COPY_DST). `size` is `None` when
+/// the buffer is a compute output — the driver derives it from the descriptor
+/// calc (see `ComputePass::out_bytes`).
 #[derive(Clone, Copy, Debug)]
 pub struct BufferDef {
     pub name: &'static str,
-    pub size: u64,
+    pub size: Option<u64>,
     pub init: BufInit,
 }
 
@@ -47,8 +49,9 @@ pub enum Resource {
     /// A storage buffer (compute I/O, derived geometry, …).
     Buffer(BufferDef),
     /// Two storage buffers swapped each frame (persistent state). A binding reads
-    /// the prev one (StorageRead) and writes the next (StorageWrite).
-    PingPong { name: &'static str, size: u64 },
+    /// the prev one (StorageRead) and writes the next (StorageWrite). `size` is
+    /// `None` for a buffer that is also a compute output (derived).
+    PingPong { name: &'static str, size: Option<u64> },
 }
 
 /// How a binding resolves a ping-pong resource for the current frame.
@@ -82,7 +85,9 @@ pub struct Binding {
     pub role: Role,
 }
 
-/// A compute pass: one entry, its generated binding table, and a dispatch count.
+/// A compute pass: one entry, its generated binding table, a dispatch count, and
+/// the generated size calc for its output bindings (used to derive the byte sizes
+/// of buffers this pass writes).
 #[derive(Clone, Copy, Debug)]
 pub struct ComputePass {
     pub label: &'static str,
@@ -90,6 +95,7 @@ pub struct ComputePass {
     pub entry: &'static str,
     pub bindings: BindTable,
     pub groups: u32,
+    pub out_bytes: fn(u32) -> u64,
 }
 
 /// What a render item draws.
