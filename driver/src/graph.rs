@@ -54,6 +54,8 @@ pub enum Resource {
     /// the prev one (StorageRead) and writes the next (StorageWrite). `size` is
     /// `None` for a buffer that is also a compute output (derived).
     PingPong { name: &'static str, size: Option<u64> },
+    /// A window-sized depth texture (recreated on resize). One per graph.
+    Depth,
 }
 
 /// How a binding resolves a ping-pong resource for the current frame.
@@ -113,6 +115,10 @@ pub struct RenderItem {
     pub vs_bindings: BindTable,
     pub fs_bindings: BindTable,
     pub draw_args: &'static str,
+    /// Write depth + test LessEqual (true): 3D geometry self-occludes while
+    /// coplanar fragments fall back to draw order. Ignore depth + keep painter
+    /// order (false) for a pure flat overlay.
+    pub depth_write: bool,
 }
 
 /// A render pass: the surface color (+ optional depth) and items drawn in order.

@@ -8,8 +8,10 @@
 -- Strokes capture control points online (Reumann-Witkam) and render through a
 -- Catmull-Rom curve. Z-order is order of addition.
 --
--- `step` does all per-frame state + geometry work; the vertex/fragment pair just
--- shades the ribbon `step` emits. Curve/ribbon math lives in paint.wyn.
+-- Cobble setts protrude as real proxy boxes over the ground, emitted by `step`
+-- into the same geometry stream as the ground ribbon. `step` does all per-frame
+-- state + geometry work; one thin vertex + one fragment shade everything it emits,
+-- branching on a per-vertex kind. Curve/ribbon math lives in geom.wyn.
 --
 -- Idiom: root does `open f32`; library modules pulled in via bare `import`.
 
@@ -19,6 +21,7 @@ import "camera"
 import "shade"
 import "geom"
 import "paint"
+import "bricks"
 
 ------------------------------------------------------------
 -- State update (Wyn-owned). One compute entry, `step`, advances ALL persistent
@@ -99,13 +102,13 @@ def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
 -- tidx is first so the compiler derives the dispatch from it: it's the largest
 -- map (the ribbon), and the smaller maps (points/items) run guarded within it.
 #[compute]
-entry step(tidx: []u32, pidx: []u32, iidx: []u32,
+entry step(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32,
            uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
            #[uniform(set=1, binding=0)] iResolution: vec3f32,
            #[uniform(set=1, binding=1)] iMouse: vec4f32,
            #[uniform(set=1, binding=3)] iCam: vec4f32,
            #[uniform(set=1, binding=7)] iKeys: vec4u32)
-  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []u32) =
+  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32, []vec4f32, []u32) =
   -- UI: cycle tool on a Tab pulse; toggle the overlay on its pulse.
   let tool0 = uistate_in[0]
   let ovl0 = uistate_in[1]
@@ -148,15 +151,18 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   let head_out =
     [d.new_pc, d.new_ic, d.held01, d.ax, d.az, d.dx, d.dz, d.lx, d.lz, d.hd, 0.0, 0.0]
 
-  -- Tessellated ribbon geometry: each output vertex = (x, z, kind, edge_t).
-  -- Leading TESS_BASE verts are the sand base quad; then a fixed budget per item
-  -- (centripetal-CR ribbon for strokes, one quad for buildings). Unused slots
-  -- collapse to a degenerate (zero) triangle. Built from the PREVIOUS state.
-  let tess_out =
+  -- Ground geometry, as two parallel streams: geom_pos = (pos.xyz, kind) and
+  -- geom_nrm = (nrm.xyz, attr). Two index regions, built from the PREVIOUS state:
+  -- [0, TESS_BASE) the sand base quad; [TESS_BASE, TESS_CAP) a fixed budget per
+  -- item (centripetal-CR ribbon for strokes, one quad for buildings). Unused item
+  -- slots collapse to a degenerate (zero) triangle. `attr` is the ribbon edge param;
+  -- ground normals point up. The cobble setts are NOT here — they are instanced
+  -- (see sett_inst / sett_vertex), the Tiny-Glade "tons of tiny instances" model.
+  let geom_pos =
     map(|s|
       let v = i32(s) in
       if v < TESS_BASE then
-        let c = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in @[c.x, c.y, 0.0, 0.0]
+        let c = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in @[c.x, 0.0, c.y, 0.0]
       else
         let vi = v - TESS_BASE
         let item = vi / TESS_VPI
@@ -170,7 +176,7 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
         else if kind > 2.5 then
           if local < 6 then
             let c = rect_vertex(points_in[pstart], BUILD_HX, BUILD_HZ, local) in
-            @[c.x, c.y, kind, 1.0]
+            @[c.x, 0.0, c.y, kind]
           else @[0.0, 0.0, 0.0, 0.0]
         else
           let span = local / TESS_VPS
@@ -185,32 +191,84 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
             let p3 = if span + 2 < pcount then points_in[pstart + span + 2] else p2
             let u0 = f32(sub) / f32(CR_SUB)
             let u1 = f32(sub + 1) / f32(CR_SUB)
-            let (pos, et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
-            @[pos.x, pos.y, kind, et]
-        , tidx) in
+            let (pos, _et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
+            @[pos.x, 0.0, pos.y, kind]
+      , tidx)
 
-  -- Non-indexed draw_indirect args for the ribbon: vertex_count covers the base
-  -- quad plus the per-item budget of the live items (the rest of the tess buffer
-  -- is unused items, never drawn). dic = previous item count (what tess built).
-  let draw_args = [u32(TESS_BASE + dic * TESS_VPI), 1u32, 0u32, 0u32] in
+  let geom_nrm =
+    map(|s|
+      let v = i32(s) in
+      if v < TESS_BASE then @[0.0, 1.0, 0.0, 0.0]
+      else
+        let vi = v - TESS_BASE
+        let item = vi / TESS_VPI
+        let local = vi % TESS_VPI
+        let it = items_in[item]
+        let kind = it.x
+        let pstart = i32(it.y)
+        let pcount = i32(it.z)
+        let prm = it.w in
+        if kind < 0.5 then @[0.0, 1.0, 0.0, 0.0]
+        else if kind > 2.5 then @[0.0, 1.0, 0.0, 1.0]
+        else
+          let span = local / TESS_VPS
+          let rem = local % TESS_VPS
+          let sub = rem / 6
+          let corner = rem % 6 in
+          if span >= pcount - 1 then @[0.0, 1.0, 0.0, 0.0]
+          else
+            let p1 = points_in[pstart + span]
+            let p2 = points_in[pstart + span + 1]
+            let p0 = if span > 0 then points_in[pstart + span - 1] else p1
+            let p3 = if span + 2 < pcount then points_in[pstart + span + 2] else p2
+            let u0 = f32(sub) / f32(CR_SUB)
+            let u1 = f32(sub + 1) / f32(CR_SUB)
+            let (_pos, et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
+            @[0.0, 1.0, 0.0, et]
+      , tidx)
 
-  (uistate_out, points_out, items_out, head_out, tess_out, draw_args)
+  -- Non-indexed draw_indirect args for the ground: the whole geom buffer (base
+  -- quad + all item slots; unused slots are degenerate).
+  let draw_args = [u32(TESS_CAP), 1u32, 0u32, 0u32]
+
+  -- Cobble setts as instances: one record per running-bond cell, scattered over
+  -- bidx. Each is (center.x, center.z, height, radius); height/radius are jittered
+  -- per cell (Tiny-Glade per-instance variation), and cells outside the cobble
+  -- region get height 0 so their proxy box collapses. `sett_vertex` instances a
+  -- proxy box from this; a later pass raymarches a rounded box of `radius`.
+  let sett_inst =
+    map(|s|
+      let i = i32(s)
+      let center = brick_center(i)
+      let inside = magnitude(center) < 8.0
+      let height = if inside then BRICK_H * (0.6 + 0.8 * brick_hash(i)) else 0.0
+      let radius = ROUND * (0.5 + brick_hash(i + 7919)) in
+      @[center.x, center.y, height, radius]
+      , bidx)
+
+  -- Instanced draw args: 36 proxy-box verts, BRICK_COUNT instances.
+  let sett_args = [36u32, u32(BRICK_COUNT), 0u32, 0u32] in
+
+  (uistate_out, points_out, items_out, head_out, geom_pos, geom_nrm, draw_args, sett_inst, sett_args)
 
 ------------------------------------------------------------
--- Ground (one quad over the whole patch; every item composited per fragment)
+-- Scene (one thin vertex + one fragment for the whole scene). The vertex pulls a
+-- finished vertex from `step`'s two geom streams and projects it; the fragment
+-- shades it by `kind`. No geometry work here — `step` already built everything.
 ------------------------------------------------------------
 
--- Pull a tessellated-ribbon vertex (x, z, kind, edge_t) and project it. kind and
--- edge_t pass through to the fragment as the only surface attributes it needs.
+-- Pull (pos.xyz, kind) and (nrm.xyz, attr) for vertex `vid` and project. kind,
+-- attr, and the world normal pass through as the only surface attributes.
 #[vertex]
-entry ground_vertex(#[builtin(vertex_index)] vid: i32,
-                    #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                    #[uniform(set=1, binding=3)] iCam: vec4f32,
-                    #[storage(set=1, binding=8, access=read)] tess: []vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] f32, #[location(1)] f32) =
-  let vtx = tess[vid]
-  let world = @[vtx.x, 0.0, vtx.y] in
-  (world_to_clip(world, iResolution, iCam.x), vtx.z, vtx.w)
+entry scene_vertex(#[builtin(vertex_index)] vid: i32,
+                   #[uniform(set=1, binding=0)] iResolution: vec3f32,
+                   #[uniform(set=1, binding=3)] iCam: vec4f32,
+                   #[storage(set=1, binding=8, access=read)] geom_pos: []vec4f32,
+                   #[storage(set=1, binding=9, access=read)] geom_nrm: []vec4f32)
+  (#[builtin(position)] vec4f32, #[location(0)] f32, #[location(1)] f32, #[location(2)] vec3f32) =
+  let p = geom_pos[vid]
+  let n = geom_nrm[vid] in
+  (world_to_clip(@[p.x, p.y, p.z], iResolution, iCam.x), p.w, n.w, @[n.x, n.y, n.z])
 
 def item_color(kind: f32) vec3f32 =
   if kind < 0.5 then SAND_COLOR
@@ -218,15 +276,50 @@ def item_color(kind: f32) vec3f32 =
   else if kind < 2.5 then WALL_COLOR
   else BUILDING_COLOR
 
--- Shade one ribbon fragment: material color from `kind`, a darker edging course
--- near the stroke boundary (|edge_t| -> 1), then lighting + tonemap. No scene
--- loop, no curve eval — that all moved into `step`'s tessellation.
+-- Shade one ground fragment: material color from `kind`, a darker edging course
+-- near a stroke boundary (|attr| -> 1), lit by the (up) normal, then tonemapped.
 #[fragment]
-entry ground_fragment(#[location(0)] kind: f32, #[location(1)] edge_t: f32)
+entry scene_fragment(#[location(0)] kind: f32, #[location(1)] attr: f32,
+                     #[location(2)] normal: vec3f32)
   #[location(0)] vec4f32 =
+  let nrm = normalize(normal)
   let base = item_color(kind)
-  let edge = smoothstep(0.78, 1.0, f32.abs(edge_t))
+  let edge = smoothstep(0.78, 1.0, f32.abs(attr))
   let surf = mix(base, OUTLINE_COLOR, edge * 0.5)
-  let col = lit(surf, @[0.0, 1.0, 0.0])
+  let col = lit(surf, nrm)
+  let m = tonemap_aces(col) in
+  @[m.x, m.y, m.z, 1.0]
+
+------------------------------------------------------------
+-- Cobble setts: instanced proxy boxes (Tiny-Glade "tons of tiny instances").
+-- `step` scatters a per-instance record (center, height, radius) into sett_inst;
+-- this vertex places one proxy box per instance, scaled by the instance's random
+-- height. A cell with height 0 (outside the cobble region) collapses to a point.
+-- Flat-shaded for now; a later pass raymarches a rounded box of `radius` so the
+-- silhouette rounds per instance.
+------------------------------------------------------------
+
+#[vertex]
+entry sett_vertex(#[builtin(vertex_index)] vid: i32,
+                  #[builtin(instance_index)] iid: i32,
+                  #[uniform(set=1, binding=0)] iResolution: vec3f32,
+                  #[uniform(set=1, binding=3)] iCam: vec4f32,
+                  #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
+  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] f32) =
+  let inst = sett_inst[iid]
+  let center = @[inst.x, inst.y]
+  let height = inst.z
+  let keep = if height > 0.0 then 1.0 else 0.0
+  let local = box_pos[vid]
+  let world = @[center.x + local.x * BRICK_W * keep,
+                local.y * height,
+                center.y + local.z * BRICK_L * keep] in
+  (world_to_clip(world, iResolution, iCam.x), box_nrm[vid], brick_hash(iid))
+
+#[fragment]
+entry sett_fragment(#[location(0)] normal: vec3f32, #[location(1)] var: f32)
+  #[location(0)] vec4f32 =
+  let base = COBBLE_BASE * v3(0.8 + 0.4 * var)
+  let col = lit(base, normalize(normal))
   let m = tonemap_aces(col) in
   @[m.x, m.y, m.z, 1.0]

@@ -132,6 +132,7 @@ impl Renderer {
         let mut buffers: HashMap<&'static str, wgpu::Buffer> = HashMap::new();
         let mut pingpong: HashMap<&'static str, [wgpu::Buffer; 2]> = HashMap::new();
         let mut sys: Vec<(&'static str, SysUniform)> = Vec::new();
+        let mut has_depth = false;
         for res in graph.resources {
             match *res {
                 Resource::SysUniform { name, kind } => {
@@ -148,9 +149,11 @@ impl Renderer {
                     let b = make_storage_raw(device, &format!("{name}#1"), size, false);
                     pingpong.insert(name, [a, b]);
                 }
+                Resource::Depth => has_depth = true,
             }
         }
-        let depth_view: Option<wgpu::TextureView> = None;
+        let depth_view =
+            has_depth.then(|| create_depth(device, gfx.config.width, gfx.config.height));
 
         // Passes (preserve order).
         let mut passes = Vec::new();
@@ -176,6 +179,9 @@ impl Renderer {
 
     fn resize(&mut self, w: u32, h: u32) {
         self.gfx.resize(w, h);
+        if self.depth_view.is_some() {
+            self.depth_view = Some(create_depth(&self.gfx.device, self.gfx.config.width, self.gfx.config.height));
+        }
     }
 
     fn update_uniforms(&self, input: &Input) {
@@ -311,7 +317,7 @@ impl Renderer {
             let input = Input {
                 mouse_x: (0.25 + 0.50 * t) * w as f32,
                 mouse_y: (0.5 - 0.18 * (t * std::f32::consts::PI).sin()) * h as f32,
-                held: f < total - 6, // release near the end
+                held: f + 6 < total, // release near the end
                 ..Input::default()
             };
             self.update_uniforms(&input);
@@ -408,6 +414,20 @@ fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, size: u6
         queue.write_buffer(&buf, 0, bytemuck::cast_slice(&data));
     }
     buf
+}
+
+fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 // ---- bind groups (shared by compute + render) ----
@@ -586,10 +606,13 @@ fn build_item(
         push_constant_ranges: &[],
     });
     let depth_stencil = if has_depth {
+        // Depth-writers test LessEqual: protruding geometry self-occludes, while
+        // coplanar fragments at equal depth let the later draw win, preserving
+        // painter order within the geometry stream. Non-writers test Always.
         Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: it.depth_write,
+            depth_compare: if it.depth_write { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Always },
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         })
