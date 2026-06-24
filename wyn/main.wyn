@@ -65,32 +65,21 @@ def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
   let press = held && (!prev)
   let release = prev && (!held)
   let moved = distance(cursor, last) > STEP
-  let toward = cursor - anchor
-  let perp = f32.abs(cross2(dir, toward))
-  let chord = magnitude(toward)
 
-  -- Online Reumann-Witkam: establish a direction on the first move, then emit a
-  -- control point (at the previous sample `last`) when the stroke leaves the
-  -- corridor or the chord runs long. On release, snap a final point to the end.
-  let estab = held && (!press) && (!is_building) && moved && (!have_dir)
-  let midcommit = held && (!press) && (!is_building) && moved && have_dir
-                  && (perp > CORRIDOR || chord > MAXCHORD)
+  -- A stroke advances its Reumann-Witkam strip per moved sample; press starts it
+  -- (first control point) and release snaps a final one to the end. Buildings
+  -- skip all of this (a single plunked point on press).
+  let drawing = held && (!press) && (!is_building) && moved
+  let (rw_emit, rw_pos, rw_a, rw_d, rw_l, rw_hd) =
+    if drawing then rw_advance(anchor, dir, last, have_dir, cursor, CORRIDOR, MAXCHORD)
+    else (false, last, anchor, dir, last, have_dir)
   let endcommit = release && (!is_building) && distance(last, anchor) > 0.05
-  let commit = press || midcommit || endcommit
-  let commit_pos = if press then cursor else last
+  let commit = press || rw_emit || endcommit
+  let commit_pos = if press then cursor else rw_pos
 
   let (n_ax, n_az, n_dx, n_dz, n_lx, n_lz, n_hd) =
     if press then (cursor.x, cursor.y, 0.0, 0.0, cursor.x, cursor.y, 0.0)
-    else if estab then
-      let nd = normalize(cursor - anchor) in
-      (anchor.x, anchor.y, nd.x, nd.y, cursor.x, cursor.y, 1.0)
-    else if midcommit then
-      let nd = normalize(cursor - last) in
-      (last.x, last.y, nd.x, nd.y, cursor.x, cursor.y, 1.0)
-    else if held && moved && (!is_building) then
-      (anchor.x, anchor.y, dir.x, dir.y, cursor.x, cursor.y, if have_dir then 1.0 else 0.0)
-    else
-      (anchor.x, anchor.y, dir.x, dir.y, last.x, last.y, if have_dir then 1.0 else 0.0)
+    else (rw_a.x, rw_a.y, rw_d.x, rw_d.y, rw_l.x, rw_l.y, if rw_hd then 1.0 else 0.0)
 
   let new_pc = if commit && pc < POINTS_CAP then f32(pc + 1) else f32(pc)
   let new_ic = if press && ic < ITEMS_CAP then f32(ic + 1) else f32(ic) in

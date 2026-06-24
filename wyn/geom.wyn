@@ -65,3 +65,20 @@ def ribbon_vertex(p0: vec2f32, p1: vec2f32, p2: vec2f32, p3: vec2f32,
   else if i == 3 then (pb, 0.0 - 1.0)
   else if i == 4 then (pd, 0.0 - 1.0)
   else (pc, 1.0)
+
+-- Reumann-Witkam online polyline simplification, one sample at a time. Given the
+-- current strip (anchor, unit direction, last sample, have_dir) and a new sample,
+-- returns (emit, emit_point, anchor', dir', last', have_dir'): emit a control
+-- point (at the *previous* sample) when the new sample leaves the direction
+-- corridor (perpendicular distance > corridor) or the chord exceeds maxchord,
+-- restarting the strip there; on the first sample, establish the direction.
+def rw_advance(anchor: vec2f32, dir: vec2f32, last: vec2f32, have_dir: bool,
+               sample: vec2f32, corridor: f32, maxchord: f32)
+  (bool, vec2f32, vec2f32, vec2f32, vec2f32, bool) =
+  if !have_dir then
+    (false, last, anchor, normalize(sample - anchor), sample, true)
+  else
+    let toward = sample - anchor in
+    let leave = f32.abs(cross2(dir, toward)) > corridor || magnitude(toward) > maxchord in
+    if leave then (true, last, last, normalize(sample - last), sample, true)
+    else (false, last, anchor, dir, sample, true)
