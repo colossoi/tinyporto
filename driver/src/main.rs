@@ -12,11 +12,12 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::WindowBuilder;
+use winit::window::{Window, WindowAttributes, WindowId};
 
 use gfx::Gfx;
 use graph::*;
@@ -232,6 +233,7 @@ impl Renderer {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
                             resolve_target: None,
+                            depth_slice: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0], g: c[1], b: c[2], a: c[3] }),
                                 store: wgpu::StoreOp::Store,
@@ -420,8 +422,9 @@ fn build_compute(
         label: Some(cp.label),
         layout: Some(&pl),
         module,
-        entry_point: cp.entry,
+        entry_point: Some(cp.entry),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
     });
     let mut sets = vec![sets0];
     for p in 1..variant_count(cp.bindings) {
@@ -470,13 +473,13 @@ fn build_item(
         layout: Some(&pl),
         vertex: wgpu::VertexState {
             module,
-            entry_point: it.vs,
+            entry_point: Some(it.vs),
             buffers: &[],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: it.fs,
+            entry_point: Some(it.fs),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::REPLACE),
@@ -488,6 +491,7 @@ fn build_item(
         depth_stencil,
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
+        cache: None,
     });
     let mut sets = vec![sets0];
     for p in 1..variant_count(it.bindings) {
@@ -496,68 +500,103 @@ fn build_item(
     BuiltItem { pipeline, sets, draw: it.draw }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+// winit 0.30 drives the app through `ApplicationHandler`: the window (and thus
+// the GPU surface) is created in `resumed`, events arrive in `window_event`, and
+// `about_to_wait` keeps redraws flowing.
+struct App {
+    args: Args,
+    input: Input,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+}
 
-    let event_loop = EventLoop::new()?;
-    let window = Arc::new(
-        WindowBuilder::new()
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.renderer.is_some() {
+            return;
+        }
+        let attrs = WindowAttributes::default()
             .with_title("tiny porto")
-            .with_inner_size(LogicalSize::new(args.width, args.height))
-            .build(&event_loop)?,
-    );
-    let gfx = Gfx::new(window.clone())?;
-    let mut renderer = Renderer::new(gfx, &app::GRAPH)?;
-    let mut input = Input::default();
+            .with_inner_size(LogicalSize::new(self.args.width, self.args.height));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                eprintln!("create_window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let renderer = Gfx::new(window.clone()).and_then(|gfx| Renderer::new(gfx, &app::GRAPH));
+        match renderer {
+            Ok(r) => {
+                self.window = Some(window);
+                self.renderer = Some(r);
+            }
+            Err(e) => {
+                eprintln!("gpu init: {e:?}");
+                event_loop.exit();
+            }
+        }
+    }
 
-    event_loop.run(move |event, elwt| {
-        elwt.set_control_flow(ControlFlow::Poll);
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
         match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => elwt.exit(),
-                WindowEvent::Resized(sz) => renderer.resize(sz.width, sz.height),
-                WindowEvent::CursorMoved { position, .. } => {
-                    input.mouse_x = position.x as f32;
-                    input.mouse_y = position.y as f32;
-                }
-                WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                    input.held = state == ElementState::Pressed;
-                }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    let dy = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y,
-                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
-                    };
-                    input.zoom = (input.zoom + dy * 0.08).clamp(0.0, 1.0);
-                }
-                WindowEvent::KeyboardInput { event: key_event, .. } => {
-                    // Edge-detect keydown (ignore auto-repeat); set a one-frame pulse.
-                    // The driver doesn't interpret these — Wyn's `ui` pass does.
-                    if key_event.state == ElementState::Pressed && !key_event.repeat {
-                        match key_event.physical_key {
-                            PhysicalKey::Code(KeyCode::Tab) => input.tab_pulse = true,
-                            PhysicalKey::Code(KeyCode::KeyL) => input.line_pulse = true,
-                            _ => {}
-                        }
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(sz) => renderer.resize(sz.width, sz.height),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input.mouse_x = position.x as f32;
+                self.input.mouse_y = position.y as f32;
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                self.input.held = state == ElementState::Pressed;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
+                };
+                self.input.zoom = (self.input.zoom + dy * 0.08).clamp(0.0, 1.0);
+            }
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                // Edge-detect keydown (ignore auto-repeat); set a one-frame pulse.
+                // The driver doesn't interpret these — Wyn's `ui` pass does.
+                if key_event.state == ElementState::Pressed && !key_event.repeat {
+                    match key_event.physical_key {
+                        PhysicalKey::Code(KeyCode::Tab) => self.input.tab_pulse = true,
+                        PhysicalKey::Code(KeyCode::KeyL) => self.input.line_pulse = true,
+                        _ => {}
                     }
                 }
-                WindowEvent::RedrawRequested => {
-                    if let Err(e) = renderer.render(&input) {
-                        eprintln!("render error: {e:?}");
-                    }
-                    // Pulses last exactly one rendered frame.
-                    input.tab_pulse = false;
-                    input.line_pulse = false;
-                    if args.frames != 0 && renderer.frame >= args.frames {
-                        println!("rendered {} frames; exiting (--frames)", renderer.frame);
-                        elwt.exit();
-                    }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Err(e) = renderer.render(&self.input) {
+                    eprintln!("render error: {e:?}");
                 }
-                _ => {}
-            },
-            Event::AboutToWait => window.request_redraw(),
+                // Pulses last exactly one rendered frame.
+                self.input.tab_pulse = false;
+                self.input.line_pulse = false;
+                if self.args.frames != 0 && renderer.frame >= self.args.frames {
+                    println!("rendered {} frames; exiting (--frames)", renderer.frame);
+                    event_loop.exit();
+                }
+            }
             _ => {}
         }
-    })?;
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = App { args, input: Input::default(), window: None, renderer: None };
+    event_loop.run_app(&mut app)?;
     Ok(())
 }

@@ -9,12 +9,15 @@
 -- Sett dimensions (meters), from a 10"x7"x4" cobble reference.
 def BRICK_W: f32 = 0.25     -- x footprint
 def BRICK_L: f32 = 0.18     -- z footprint
-def BRICK_H: f32 = 0.04     -- protrusion above ground
+def BRICK_H: f32 = 0.06     -- protrusion above ground
 def MORTAR:  f32 = 0.015    -- joint width
-def ROUND:   f32 = 0.015    -- corner radius
+def ROUND:   f32 = 0.028    -- corner radius (must be < min half-extent; min is H/2=0.03)
 
 def CELLX: f32 = 0.265      -- BRICK_W + MORTAR
 def CELLZ: f32 = 0.195      -- BRICK_L + MORTAR
+
+-- Width of the perimeter edging band (~2 courses = a double course).
+def EDGE_BAND: f32 = 0.40
 
 -- Running-bond grid covering the ~40 m ground (centered on origin).
 def BCOLS: i32 = 168

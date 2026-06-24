@@ -1,4 +1,17 @@
--- tiny porto — root shader module (M2: ground grid + Voronoi + water painter).
+-- tiny porto — root shader module.
+--
+-- Ground painting as an ordered list of parametric items, evaluated per fragment
+-- as an analytic SDF composite (no geometry above the ground plane). Three tools:
+--   tool 0 / kind 1  water    — big-radius capsule chain (one outline per stroke)
+--   tool 1 / kind 2  fence    — thin capsule chain along a curve
+--   tool 2 / kind 3  building — fixed-size rectangle plunked on click
+-- Strokes capture control points online (Reumann-Witkam) and render through a
+-- Catmull-Rom curve. Z-order is order of addition.
+--
+-- Storage buffers are only ever indexed inside the entry that binds them: the
+-- compiler passes a buffer into a helper as an opaque handle the SPIR-V->naga
+-- path can't dynamically index, so the curve/SDF loops are inlined here and the
+-- shared helpers (cr/sd_seg/sd_box2/cross2 in paint.wyn) take only scalars/vecs.
 --
 -- Idiom: root does `open f32`; library modules pulled in via bare `import`.
 
@@ -7,8 +20,7 @@ import "math"
 import "camera"
 import "shade"
 import "mesh"
-import "grid"
-import "bricks"
+import "paint"
 
 -- Indirect (non-indexed) draw arguments, named. Matches wgpu's draw_indirect
 -- layout: vertex_count, instance_count, first_vertex, first_instance.
@@ -16,216 +28,249 @@ type draw_args = { vertex_count: u32, instance_count: u32,
                    first_vertex: u32, first_instance: u32 }
 
 ------------------------------------------------------------
--- UI state (Wyn-owned). Persistent [tool, lines_on], ping-ponged each frame.
--- The driver feeds generic one-frame key pulses in iKeys (x = Tab pressed,
--- y = line-toggle pressed); this advances the state. The driver never knows
--- what the keys mean.
+-- State update (Wyn-owned). One compute entry, `step`, advances ALL persistent
+-- state each frame: UI [tool, overlay_on], the control points, the items, and the
+-- Reumann-Witkam capture head. Persistent buffers are ping-ponged (prev -> next);
+-- the driver feeds generic one-frame key pulses in iKeys and never interprets
+-- them. `step`'s two runtime-sized outputs are produced by `map` (the required
+-- idiom for a streamed output) and its two small outputs by fixed-array literals;
+-- the compiler schedules whatever kernels that needs.
+--
+-- `decide` reads the previous head + mouse as scalars (never a storage buffer as
+-- a parameter) and returns one frame's capture decision.
 ------------------------------------------------------------
 
-#[compute]
-entry ui(state_in: []f32,
-         #[uniform(set=1, binding=0)] iKeys: vec4u32) []f32 =
-  let tool0 = state_in[0] in
-  let lines0 = state_in[1] in
-  -- on a Tab pulse, cycle the tool 0 -> 1 -> 2 -> 0
-  let tool1 = if iKeys.x != 0u32 then f32.i32((i32.f32(tool0) + 1) % 3) else tool0 in
-  let lines1 = if iKeys.y != 0u32 then 1.0 - lines0 else lines0 in
-  [tool1, lines1]
+-- One frame's capture decision (computed identically by all three paint passes).
+type decision = { commit: f32, cx: f32, cz: f32,        -- control point to append at index pc
+                  press: f32, kind: f32, param: f32,
+                  pc: i32, ic: i32,                      -- counts read from head
+                  new_pc: f32, new_ic: f32, held01: f32, -- new head scalars
+                  ax: f32, az: f32, dx: f32, dz: f32,    -- new anchor / direction
+                  lx: f32, lz: f32, hd: f32 }            -- new last-sample / have_dir
 
-------------------------------------------------------------
--- Water painting (compute, ping-pong over the material buffer)
-------------------------------------------------------------
+def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
+           h_dx: f32, h_dz: f32, h_lx: f32, h_lz: f32, h_hd: f32,
+           iResolution: vec3f32, iMouse: vec4f32, iCam: vec4f32, tool: f32) decision =
+  let pc = i32.f32(h_pc) in
+  let ic = i32.f32(h_ic) in
+  let prev = h_prev > 0.5 in
+  let anchor = @[h_ax, h_az] in
+  let dir = @[h_dx, h_dz] in
+  let last = @[h_lx, h_lz] in
+  let have_dir = h_hd > 0.5 in
 
--- Reads the previous per-control-point material, writes the next. The driver
--- swaps the two physical buffers each frame. Painting sets material->water (1)
--- for control points within the brush of the mouse-ground cursor.
-#[compute]
-entry edit(seed: []u32, material_in: []f32,
-           #[uniform(set=1, binding=0)] iResolution: vec3f32,
-           #[uniform(set=1, binding=1)] iMouse: vec4f32,
-           #[storage(set=1, binding=2, access=read)] uistate: []f32,
-           #[uniform(set=1, binding=3)] iCam: vec4f32) []f32 =
+  -- Mouse -> ground cursor (same ray as the rendered cursor).
+  let held = iMouse.z > 0.0 in
   let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y] in
   let (mro, mrd) = get_ray(iResolution, mouseCoord, iCam.x) in
-  let mt = ground_t(mro, mrd) in
-  let cursor = (mro + mrd * v3(mt)).xz in
-  let painting = iMouse.z > 0.0 in
-  let tool = uistate[0] in   -- selected material: 0 empty, 1 water, 2 cobble
-  map(|s|
-        let i = i32.u32(s) in
-        let cell = i / 4 in
-        let cx = cell % GW in
-        let cz = cell / GW in
-        let k = i % 4 in
-        let cpw = cp_world(cx, cz, k) in
-        let old = material_in[i] in
-        if painting && distance(cpw, cursor) < BRUSH then tool else old
-      , seed)
+  let cursor = (mro + mrd * v3(ground_t(mro, mrd))).xz in
+
+  let kind = tool + 1.0 in
+  let is_building = tool > 1.5 in
+  let param = if tool < 0.5 then WATER_R else if tool < 1.5 then FENCE_HW else 0.0 in
+
+  let press = held && (!prev) in
+  let release = prev && (!held) in
+  let moved = distance(cursor, last) > STEP in
+  let toward = cursor - anchor in
+  let perp = f32.abs(cross2(dir, toward)) in
+  let chord = magnitude(toward) in
+
+  -- Online Reumann-Witkam: establish a direction on the first move, then emit a
+  -- control point (at the previous sample `last`) when the stroke leaves the
+  -- corridor or the chord runs long. On release, snap a final point to the end.
+  let estab = held && (!press) && (!is_building) && moved && (!have_dir) in
+  let midcommit = held && (!press) && (!is_building) && moved && have_dir
+                  && (perp > CORRIDOR || chord > MAXCHORD) in
+  let endcommit = release && (!is_building) && distance(last, anchor) > 0.05 in
+  let commit = press || midcommit || endcommit in
+  let commit_pos = if press then cursor else last in
+
+  let (n_ax, n_az, n_dx, n_dz, n_lx, n_lz, n_hd) =
+    if press then (cursor.x, cursor.y, 0.0, 0.0, cursor.x, cursor.y, 0.0)
+    else if estab then
+      let nd = normalize(cursor - anchor) in
+      (anchor.x, anchor.y, nd.x, nd.y, cursor.x, cursor.y, 1.0)
+    else if midcommit then
+      let nd = normalize(cursor - last) in
+      (last.x, last.y, nd.x, nd.y, cursor.x, cursor.y, 1.0)
+    else if held && moved && (!is_building) then
+      (anchor.x, anchor.y, dir.x, dir.y, cursor.x, cursor.y, if have_dir then 1.0 else 0.0)
+    else
+      (anchor.x, anchor.y, dir.x, dir.y, last.x, last.y, if have_dir then 1.0 else 0.0) in
+
+  let new_pc = if commit && pc < POINTS_CAP then f32.i32(pc + 1) else f32.i32(pc) in
+  let new_ic = if press && ic < ITEMS_CAP then f32.i32(ic + 1) else f32.i32(ic) in
+
+  { commit = if commit then 1.0 else 0.0, cx = commit_pos.x, cz = commit_pos.y,
+    press = if press then 1.0 else 0.0, kind = kind, param = param,
+    pc = pc, ic = ic,
+    new_pc = new_pc, new_ic = new_ic, held01 = if held then 1.0 else 0.0,
+    ax = n_ax, az = n_az, dx = n_dx, dz = n_dz, lx = n_lx, lz = n_lz, hd = n_hd }
+
+-- One frame's whole state update. Reads the previous state (ping-pong prev) and
+-- the inputs; returns the next state. Output order: uistate, points, items, head.
+-- pidx/iidx are iota index seeds so each `map` recovers its element index.
+#[compute]
+entry step(pidx: []u32, iidx: []u32,
+           uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
+           #[uniform(set=1, binding=0)] iResolution: vec3f32,
+           #[uniform(set=1, binding=1)] iMouse: vec4f32,
+           #[uniform(set=1, binding=3)] iCam: vec4f32,
+           #[uniform(set=1, binding=7)] iKeys: vec4u32)
+  ([]f32, []vec2f32, []vec4f32, []f32) =
+  -- UI: cycle tool on a Tab pulse; toggle the overlay on its pulse.
+  let tool0 = uistate_in[0] in
+  let ovl0 = uistate_in[1] in
+  let tool1 = if iKeys.x != 0u32 then f32.i32((i32.f32(tool0) + 1) % 3) else tool0 in
+  let ovl1 = if iKeys.y != 0u32 then 1.0 - ovl0 else ovl0 in
+  let uistate_out = [tool1, ovl1] in
+
+  -- Capture decision from the previous head + mouse. Painting uses the current
+  -- tool (tool0); a Tab this frame takes effect next frame.
+  let d = decide(head_in[0], head_in[1], head_in[2], head_in[3], head_in[4],
+                 head_in[5], head_in[6], head_in[7], head_in[8], head_in[9],
+                 iResolution, iMouse, iCam, tool0) in
+  -- Capture only scalars in the map lambdas (the decision struct must not be
+  -- captured, or the lambda stops inlining and can't index its buffer).
+  let dcommit = d.commit in
+  let dpress = d.press in
+  let dpc = d.pc in
+  let dic = d.ic in
+  let dcx = d.cx in
+  let dcz = d.cz in
+  let dkind = d.kind in
+  let dparam = d.param in
+
+  -- Points: append a control point at index pc on a commit (else copy through).
+  let points_out =
+    map(|s| let i = i32.u32(s) in
+            if dcommit > 0.5 && i == dpc then @[dcx, dcz] else points_in[i]
+        , pidx) in
+
+  -- Items: create a new item on press; bump the current item's count on a commit.
+  let items_out =
+    map(|s| let i = i32.u32(s) in
+            if dpress > 0.5 && i == dic then @[dkind, f32.i32(dpc), 1.0, dparam]
+            else if dpress < 0.5 && dcommit > 0.5 && i == dic - 1 then
+              let it = items_in[i] in @[it.x, it.y, it.z + 1.0, it.w]
+            else items_in[i]
+        , iidx) in
+
+  -- Head: counts + Reumann-Witkam anchor/dir/last, as a fixed-size literal.
+  let head_out =
+    [d.new_pc, d.new_ic, d.held01, d.ax, d.az, d.dx, d.dz, d.lx, d.lz, d.hd, 0.0, 0.0] in
+
+  (uistate_out, points_out, items_out, head_out)
 
 ------------------------------------------------------------
--- Ground (one quad over the whole grid; Voronoi resolved per fragment)
+-- Ground (one quad over the whole patch; every item composited per fragment)
 ------------------------------------------------------------
 
 #[vertex]
 entry ground_vertex(#[builtin(vertex_index)] vid: i32,
                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                    #[uniform(set=1, binding=4)] iCam: vec4f32)
+                    #[uniform(set=1, binding=3)] iCam: vec4f32)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32) =
-  let half = f32.i32(GW) * CELL * 0.5 in
   let q = quad_pos[vid] in
-  let world = @[q.x * half, 0.0, q.z * half] in
+  let world = @[q.x * GROUND_HALF, 0.0, q.z * GROUND_HALF] in
   (world_to_clip(world, iResolution, iCam.x), @[world.x, world.z, 0.0])
+
+-- Tool tint for the brush cursor.
+def tool_color(tool: f32) vec3f32 =
+  if tool < 0.5 then @[0.25, 0.95, 1.0]
+  else if tool < 1.5 then @[0.55, 0.95, 0.45]
+  else @[1.0, 0.72, 0.45]
+
+def item_color(kind: f32) vec3f32 =
+  if kind < 1.5 then WATER_COLOR
+  else if kind < 2.5 then WALL_COLOR
+  else BUILDING_COLOR
 
 #[fragment]
 entry ground_fragment(#[location(0)] w: vec3f32,
                       #[uniform(set=1, binding=0)] iResolution: vec3f32,
                       #[uniform(set=1, binding=1)] iMouse: vec4f32,
-                      #[storage(set=1, binding=2, access=read)] material: []f32,
-                      #[storage(set=1, binding=3, access=read)] uistate: []f32,
-                      #[uniform(set=1, binding=4)] iCam: vec4f32)
+                      #[storage(set=1, binding=2, access=read)] uistate: []f32,
+                      #[uniform(set=1, binding=3)] iCam: vec4f32,
+                      #[storage(set=1, binding=4, access=read)] items: []vec4f32,
+                      #[storage(set=1, binding=5, access=read)] points: []vec2f32,
+                      #[storage(set=1, binding=6, access=read)] head: []f32)
   #[location(0)] vec4f32 =
   let wxz = @[w.x, w.y] in
-  let (mat, f1, f2) = voronoi(wxz, material) in
-  -- Voronoi cell-boundary lines, toggled by the UI state (off by default).
-  let lines_on = uistate[1] > 0.5 in
-  let bankraw = 1.0 - smoothstep(0.0, 0.12, f2 - f1) in
-  let bank = if lines_on then bankraw else 0.0 in
-  -- Three materials: 0 empty (sand), 1 water, 2 cobble (flat placeholder).
-  let surf =
-    if mat < 0.5 then SAND_COLOR * (1.0 - 0.25 * bank)
-    else if mat < 1.5 then mix(WATER_COLOR, WATER_DEEP, bank)
-    else mix(COBBLE_BASE, MORTAR_COLOR, bank) in
+  let ic = i32.f32(head[1]) in
+
+  -- Composite items in order of addition (later items paint over earlier ones);
+  -- each draws a subtle darker outline at its boundary. `lastsd` keeps the signed
+  -- distance of the most-recent item for the overlay below.
+  let (_, surf, lastsd) =
+    loop (j, col, lastsd) = (0, SAND_COLOR, 1e9) while j < ic && j < MAXIT do
+      let it = items[j] in
+      let kind = it.x in
+      let pstart = i32.f32(it.y) in
+      let pcount = i32.f32(it.z) in
+      let param = it.w in
+      let dsd =
+        if kind > 2.5 then sd_box2(wxz - points[pstart], @[BUILD_HX, BUILD_HZ])
+        else if pcount <= 1 then distance(wxz, points[pstart]) - param
+        else
+          let (_, dcurve) =
+            loop (s, dc) = (0, 1e9) while s < pcount - 1 do
+              let p1 = points[pstart + s] in
+              let p2 = points[pstart + s + 1] in
+              let p0 = if s > 0 then points[pstart + s - 1] else p1 in
+              let p3 = if s + 2 < pcount then points[pstart + s + 2] else p2 in
+              let (_, dseg) =
+                loop (k, ds) = (0, 1e9) while k < CR_SUB do
+                  let u0 = f32.i32(k) / f32.i32(CR_SUB) in
+                  let u1 = f32.i32(k + 1) / f32.i32(CR_SUB) in
+                  (k + 1, f32.min(ds, sd_seg(wxz, cr(p0, p1, p2, p3, u0), cr(p0, p1, p2, p3, u1))))
+              in (s + 1, f32.min(dc, dseg))
+          in dcurve - param in
+      let filled = if dsd < 0.0 then item_color(kind) else col in
+      let edged = if f32.abs(dsd) < EDGE_BAND then mix(filled, OUTLINE_COLOR, 0.55) else filled in
+      let nls = if j == ic - 1 then dsd else lastsd in
+      (j + 1, edged, nls)
+  in
   let col = lit(surf, @[0.0, 1.0, 0.0]) in
-  -- Cyan brush cursor on the ground.
+
+  -- Brush cursor: circle for water/fence, rectangle preview for building.
+  let tool = uistate[0] in
   let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y] in
   let (mro, mrd) = get_ray(iResolution, mouseCoord, iCam.x) in
-  let mt = ground_t(mro, mrd) in
-  let cursor = (mro + mrd * v3(mt)).xz in
+  let cursor = (mro + mrd * v3(ground_t(mro, mrd))).xz in
   let held = if iMouse.z > 0.0 then 1.0 else 0.0 in
-  -- Tint the cursor by the selected tool (sandy=empty, cyan=water, stone=cobble).
-  let tool = uistate[0] in
-  let ring_color =
-    if tool < 0.5 then @[0.95, 0.90, 0.70]
-    else if tool < 1.5 then @[0.0, 1.0, 1.0]
-    else @[0.78, 0.78, 0.85] in
-  let withcur = cursor_ring(col, ring_color, wxz, cursor, BRUSH, held) in
-  let m = tonemap_aces(withcur) in
-  @[m.x, m.y, m.z, 1.0]
+  let cur_d =
+    if tool > 1.5 then f32.abs(sd_box2(wxz - cursor, @[BUILD_HX, BUILD_HZ]))
+    else if tool < 0.5 then f32.abs(distance(wxz, cursor) - WATER_R)
+    else f32.abs(distance(wxz, cursor) - 0.6) in
+  let curband = smoothstep(0.18, 0.0, cur_d) * (0.55 + 0.45 * held) in
+  let withcur = mix(col, tool_color(tool), clamp01(curband)) in
 
-------------------------------------------------------------
--- Buildings (indirect instanced draw) — from M1
-------------------------------------------------------------
-
-def BGRID: i32 = 24         -- building-site grid (distinct from the ground grid)
-def BSPACING: f32 = 1.6
-def KEEP_RADIUS: f32 = 14.0
-def FOOT: f32 = 0.8
-
-def hash1(i: i32) f32 = fract(sin(f32.i32(i) * 12.9898) * 43758.5453)
-
-def candidate(i: i32) vec4f32 =
-  let gx = i % BGRID in
-  let gz = i / BGRID in
-  let x = (f32.i32(gx) - f32.i32(BGRID) * 0.5 + 0.5) * BSPACING in
-  let z = (f32.i32(gz) - f32.i32(BGRID) * 0.5 + 0.5) * BSPACING in
-  let r = sqrt(x * x + z * z) in
-  -- sparse: keep only a handful of building sites (~5-7)
-  let keep = if r < KEEP_RADIUS && hash1(i) > 0.975 then 1.0 else 0.0 in
-  let height = 2.0 + 4.0 * hash1(i * 7 + 1) in
-  @[x, z, height, keep]
-
-#[compute]
-entry gen(seed: []u32) ([]vec4f32, draw_args) =
-  let insts = map(|s| candidate(i32.u32(s)), seed) in
-  (insts, { vertex_count = 36u32, instance_count = u32.i32(length(seed)),
-            first_vertex = 0u32, first_instance = 0u32 })
-
-#[vertex]
-entry box_vertex(#[builtin(vertex_index)] vid: i32,
-                 #[builtin(instance_index)] iid: i32,
-                 #[storage(set=1, binding=0, access=read)] instances: []vec4f32,
-                 #[uniform(set=1, binding=1)] iResolution: vec3f32,
-                 #[uniform(set=1, binding=2)] iCam: vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32) =
-  let inst = instances[iid] in
-  let k = inst.w in
-  let local = box_pos[vid] in
-  let world = @[inst.x + local.x * FOOT * k,
-                local.y * inst.z * k,
-                inst.y + local.z * FOOT * k] in
-  (world_to_clip(world, iResolution, iCam.x), box_nrm[vid])
-
-#[fragment]
-entry box_fragment(#[location(0)] normal: vec3f32) #[location(0)] vec4f32 =
-  let c = lit(BUILDING_COLOR, normalize(normal)) in
-  let m = tonemap_aces(c) in
-  @[m.x, m.y, m.z, 1.0]
-
-------------------------------------------------------------
--- Cobblestone setts (indirect instanced; rounded-box bevel)
-------------------------------------------------------------
-
--- One sett per running-bond grid cell; kept only where the ground is cobble
--- (material 2). instance = (centerX, centerZ, keep, variation).
-#[compute]
-entry brick_gen(seed: []u32, material: []f32) ([]vec4f32, draw_args) =
-  let insts = map(|s|
-        let i = i32.u32(s) in
-        let c = brick_center(i) in
-        let (mat, _, _) = voronoi(c, material) in
-        let keep = if mat > 1.5 then 1.0 else 0.0 in
-        @[c.x, c.y, keep, brick_hash(i)]
-      , seed) in
-  (insts, { vertex_count = 36u32, instance_count = u32.i32(length(seed)),
-            first_vertex = 0u32, first_instance = 0u32 })
-
-#[vertex]
-entry brick_vertex(#[builtin(vertex_index)] vid: i32,
-                   #[builtin(instance_index)] iid: i32,
-                   #[storage(set=1, binding=0, access=read)] instances: []vec4f32,
-                   #[uniform(set=1, binding=1)] iResolution: vec3f32,
-                   #[uniform(set=1, binding=2)] iCam: vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec3f32,
-   #[location(2)] f32) =
-  let inst = instances[iid] in   -- (cx, cz, keep, variation)
-  let keep = inst.z in
-  let local = box_pos[vid] in     -- x,z in [-0.5,0.5], y in [0,1]
-  let world = @[inst.x + local.x * BRICK_W * keep,
-                local.y * BRICK_H * keep,
-                inst.y + local.z * BRICK_L * keep] in
-  let center = @[inst.x, BRICK_H * 0.5, inst.y] in
-  (world_to_clip(world, iResolution, iCam.x), world, center, inst.w)
-
--- Per-pixel rounded-box ray march (Tiny Glade trick): the proxy box just
--- triggers the fragment; we sphere-trace the rounded box from the camera ray so
--- the SILHOUETTE rounds too. A miss writes frag_depth 1.0 -> fails the depth
--- test -> effectively discarded (Wyn has no `discard`).
-#[fragment]
-entry brick_fragment(#[location(0)] worldPos: vec3f32,
-                     #[location(1)] center: vec3f32,
-                     #[location(2)] var: f32,
-                     #[uniform(set=1, binding=1)] iResolution: vec3f32,
-                     #[uniform(set=1, binding=2)] iCam: vec4f32)
-  (#[location(0)] vec4f32, #[builtin(frag_depth)] f32) =
-  let eye = cam_eye(iCam.x) in
-  let rd = normalize(worldPos - eye) in
-  let bb = @[BRICK_W * 0.5, BRICK_H * 0.5, BRICK_L * 0.5] in
-  let bi = bb - v3(ROUND) in
-  let t0 = distance(eye, worldPos) in
-  let (_, t, hit) =
-    loop (i, t, hit) = (0, t0, false) while i < 24 && !hit do
-      let p = eye + rd * v3(t) - center in
-      let d = sd_round_box(p, bi, ROUND) in
-      if d < 0.0008 then (i + 1, t, true)
-      else if t > t0 + 0.5 then (24, t, false)
-      else (i + 1, t + d, false)
+  -- Bonus overlay: the curve + control points of the most-recently-added item.
+  -- The spine is recovered from `lastsd` (centerline = signed dist + radius for a
+  -- stroke; |signed dist| for a building); dots loop over that item's points.
+  let show = uistate[1] > 0.5 && ic > 0 in
+  let lit_item = items[if ic > 0 then ic - 1 else 0] in
+  let lkind = lit_item.x in
+  let lpstart = i32.f32(lit_item.y) in
+  let lpcount = i32.f32(lit_item.z) in
+  let lparam = lit_item.w in
+  let spine = if lkind > 2.5 then f32.abs(lastsd) else f32.abs(lastsd + lparam) in
+  let oline = if show then smoothstep(OVL_LINE, 0.0, spine) else 0.0 in
+  let (_, dotmin) =
+    loop (k, dmin) = (0, 1e9) while k < lpcount && k < 4096 do
+      (k + 1, f32.min(dmin, distance(wxz, points[lpstart + k])))
   in
-  if hit then
-    let hw = eye + rd * v3(t) in
-    let n = round_normal(hw - center, bb, ROUND) in
-    let base = COBBLE_BASE * v3(0.8 + 0.4 * var) in
-    let m = tonemap_aces(lit(base, n)) in
-    let clip = world_to_clip(hw, iResolution, iCam.x) in
-    (@[m.x, m.y, m.z, 1.0], clip.z / clip.w)
-  else
-    (@[0.0, 0.0, 0.0, 1.0], 1.0)
+  -- For a building, the four corners read as the "control points".
+  let bcorner =
+    f32.min(f32.min(distance(wxz, points[lpstart] + @[BUILD_HX, BUILD_HZ]),
+                    distance(wxz, points[lpstart] + @[0.0 - BUILD_HX, BUILD_HZ])),
+            f32.min(distance(wxz, points[lpstart] + @[BUILD_HX, 0.0 - BUILD_HZ]),
+                    distance(wxz, points[lpstart] + @[0.0 - BUILD_HX, 0.0 - BUILD_HZ]))) in
+  let dotd = if lkind > 2.5 then bcorner else dotmin in
+  let odot = if show then smoothstep(OVL_DOT, 0.0, dotd) else 0.0 in
+  let withovl = mix(mix(withcur, OVL_CURVE_COLOR, oline), OVL_DOT_COLOR, odot) in
+
+  let m = tonemap_aces(withovl) in
+  @[m.x, m.y, m.z, 1.0]

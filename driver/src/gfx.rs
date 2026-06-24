@@ -19,7 +19,7 @@ impl Gfx {
 
     async fn new_async(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = instance
             .create_surface(window.clone())
             .context("create_surface")?;
@@ -33,15 +33,21 @@ impl Gfx {
             .await
             .context("no suitable GPU adapter")?;
 
+        // The single `step` compute entry binds 10 storage buffers (6 inputs +
+        // 4 outputs); the default per-stage limit is 8. Raise it to whatever the
+        // adapter actually supports.
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffers_per_shader_stage =
+            adapter.limits().max_storage_buffers_per_shader_stage;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("tinyporto-device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("tinyporto-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .context("request_device")?;
 

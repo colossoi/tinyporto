@@ -13,10 +13,19 @@ def SAND_COLOR: vec3f32 = @[0.80, 0.71, 0.55]
 def WATER_COLOR: vec3f32 = @[0.10, 0.34, 0.46]
 def WATER_DEEP: vec3f32 = @[0.05, 0.20, 0.30]
 def COBBLE_BASE: vec3f32 = @[0.46, 0.43, 0.40]   -- grey stone
+def COBBLE_EDGE: vec3f32 = @[0.24, 0.26, 0.33]   -- darker, cool slate edging course
 def MORTAR_COLOR: vec3f32 = @[0.28, 0.26, 0.24]
 def CURSOR_COLOR: vec3f32 = @[0.0, 1.0, 1.0]
 -- 1950s Venetian render / ochre plaster for the flat-roofed buildings.
 def BUILDING_COLOR: vec3f32 = @[0.78, 0.42, 0.30]
+-- Wall / fence painted ground: sage hedge green (distinct in hue from both
+-- water-teal and building-terracotta).
+def WALL_COLOR: vec3f32 = @[0.34, 0.48, 0.30]
+-- Subtle darker outline drawn at every item's boundary.
+def OUTLINE_COLOR: vec3f32 = @[0.12, 0.11, 0.10]
+-- Most-recent-item overlay: cyan curve + amber control-point dots.
+def OVL_CURVE_COLOR: vec3f32 = @[0.25, 1.0, 1.0]
+def OVL_DOT_COLOR: vec3f32 = @[1.0, 0.82, 0.20]
 
 def sun: vec3f32 = normalize(SUN_DIR)
 

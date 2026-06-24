@@ -58,3 +58,32 @@ def voronoi(world: vec2f32, material: []f32) (f32, f32, f32) =
       else (i + 1, f1, f2, mat1)
   in
   (mat1, f1, f2)
+
+-- Material-boundary query. Tracks the two nearest control points; if they differ
+-- in material we're near a boundary. Returns (here_material, edge_dist, tangent):
+-- edge_dist is the (approx) distance to the boundary (large if none nearby), and
+-- tangent is the unit boundary direction (the course runs along it). The 2nd-
+-- nearest approximation is exact right at a boundary, which is where it matters.
+def boundary(world: vec2f32, material: []f32) (f32, f32, vec2f32) =
+  let (cx, cz) = cell_of(world) in
+  let z2 = @[0.0, 0.0] in
+  let (_, f1, m1, cp1, f2, m2, cp2) =
+    loop (i, f1, m1, cp1, f2, m2, cp2) = (0, 1e9, 0.0, z2, 1e9, 0.0, z2) while i < 36 do
+      let cell = i / 4 in
+      let k = i % 4 in
+      let ncx = cx + (cell % 3 - 1) in
+      let ncz = cz + (cell / 3 - 1) in
+      if ncx >= 0 && ncx < GW && ncz >= 0 && ncz < GH then
+        let cpw = cp_world(ncx, ncz, k) in
+        let d = distance(world, cpw) in
+        let m = material[cp_index(ncx, ncz, k)] in
+        if d < f1 then (i + 1, d, m, cpw, f1, m1, cp1)
+        else if d < f2 then (i + 1, f1, m1, cp1, d, m, cpw)
+        else (i + 1, f1, m1, cp1, f2, m2, cp2)
+      else (i + 1, f1, m1, cp1, f2, m2, cp2)
+  in
+  let diff = f32.abs(m2 - m1) > 0.5 in
+  let edge_dist = if diff then (f2 - f1) * 0.5 else 1e9 in
+  let nrm = if diff then normalize(cp1 - cp2) else @[1.0, 0.0] in
+  let tangent = @[0.0 - nrm.y, nrm.x] in
+  (m1, edge_dist, tangent)
