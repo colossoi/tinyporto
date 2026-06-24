@@ -16,6 +16,8 @@ pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Encode offscreen readback to PNG for `--screenshot` (headless visual checks).
+png = "0.17"
 
 [build-dependencies]
 # Parse the wyn pipeline descriptor (.json) and codegen Rust from it.

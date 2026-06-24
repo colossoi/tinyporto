@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -42,6 +42,9 @@ struct Args {
     /// Render N frames then exit (headless smoke test). 0 = run forever.
     #[arg(long, default_value_t = 0)]
     frames: u32,
+    /// Render a scripted scenario offscreen to this PNG and exit (no window).
+    #[arg(long)]
+    screenshot: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -205,23 +208,9 @@ impl Renderer {
         }
     }
 
-    fn render(&mut self, input: &Input) -> Result<()> {
-        self.update_uniforms(input);
-
-        let frame = match self.gfx.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.gfx.surface.configure(&self.gfx.device, &self.gfx.config);
-                return Ok(());
-            }
-            Err(e) => return Err(anyhow::anyhow!("acquire frame: {e:?}")),
-        };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut enc = self
-            .gfx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-
+    /// Record all passes for one frame into `enc`, drawing into `target`. Shared
+    /// by the window path (`render`) and the offscreen path (`screenshot`).
+    fn record(&self, enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
         let parity = (self.frame & 1) as usize;
         for pass in &self.passes {
             match pass {
@@ -250,7 +239,7 @@ impl Renderer {
                     let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("render"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
+                            view: target,
                             resolve_target: None,
                             depth_slice: None,
                             ops: wgpu::Operations {
@@ -274,10 +263,122 @@ impl Renderer {
                 }
             }
         }
+    }
 
+    fn render(&mut self, input: &Input) -> Result<()> {
+        self.update_uniforms(input);
+        let surface = self.gfx.surface.as_ref().expect("window mode has a surface");
+        let frame = match surface.get_current_texture() {
+            Ok(f) => f,
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                surface.configure(&self.gfx.device, &self.gfx.config);
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!("acquire frame: {e:?}")),
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc = self
+            .gfx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        self.record(&mut enc, &view);
         self.gfx.queue.submit(Some(enc.finish()));
         frame.present();
         self.frame = self.frame.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Headless: render a scripted scenario into an offscreen texture and write it
+    /// to `path` as a PNG. Used to eyeball the pipeline without a window.
+    fn screenshot(&mut self, path: &std::path::Path) -> Result<()> {
+        let (w, h) = (self.gfx.config.width, self.gfx.config.height);
+        let tex = self.gfx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.gfx.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Script a water-stroke drag across the middle of the screen, then release,
+        // so the shot exercises capture -> tessellation -> ribbon, not just the base.
+        let total = 60u32;
+        for f in 0..total {
+            let t = f as f32 / (total - 1).max(1) as f32;
+            // A curved sweep (one sine arch) so the ribbon shows the spline curving.
+            let input = Input {
+                mouse_x: (0.25 + 0.50 * t) * w as f32,
+                mouse_y: (0.5 - 0.18 * (t * std::f32::consts::PI).sin()) * h as f32,
+                held: f < total - 6, // release near the end
+                ..Input::default()
+            };
+            self.update_uniforms(&input);
+            let mut enc = self
+                .gfx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
+            self.record(&mut enc, &view);
+            self.gfx.queue.submit(Some(enc.finish()));
+            self.frame = self.frame.wrapping_add(1);
+            let _ = self.gfx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        }
+
+        // Read the offscreen texture back (rows padded to 256 bytes).
+        let bpp = 4u32;
+        let unpadded = w * bpp;
+        let padded = unpadded.div_ceil(256) * 256;
+        let readback = self.gfx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (padded * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .gfx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy") });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.gfx.queue.submit(Some(enc.finish()));
+
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.gfx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = readback.slice(..).get_mapped_range();
+
+        // Drop the row padding into a tight RGBA8 buffer.
+        let mut pixels = Vec::with_capacity((unpadded * h) as usize);
+        for row in 0..h {
+            let start = (row * padded) as usize;
+            pixels.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+        drop(data);
+        readback.unmap();
+
+        let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(&pixels)?;
+        eprintln!("wrote {} ({w}x{h})", path.display());
         Ok(())
     }
 }
@@ -623,6 +724,14 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Headless: render a scripted scenario offscreen to a PNG and exit.
+    if let Some(path) = args.screenshot.clone() {
+        let gfx = Gfx::new_headless(args.width, args.height)?;
+        let mut renderer = Renderer::new(gfx, &app::GRAPH)?;
+        return renderer.screenshot(&path);
+    }
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App { args, input: Input::default(), window: None, renderer: None };
