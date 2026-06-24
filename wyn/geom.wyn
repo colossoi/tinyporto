@@ -1,0 +1,67 @@
+-- geom: generic 2D geometry for flat triangle tessellation — Catmull-Rom splines,
+-- swept ribbons, and rectangles. No domain knowledge (no item kinds, tool sizes,
+-- or buffer layout): pure, reusable math. The `*_vertex` helpers return the i-th
+-- vertex of a triangle-list quad (i in [0,6), two tris).
+-- Library module: no `open`; f32.* / vec.* qualified (see math.wyn for the idiom).
+
+import "math"
+
+-- Vertex i of an axis-aligned rectangle (half-extents hx,hz) centered at c.
+def rect_vertex(c: vec2f32, hx: f32, hz: f32, i: i32) vec2f32 =
+  let o = if i == 0 then @[0.0 - hx, 0.0 - hz]
+          else if i == 1 then @[0.0 - hx, hz]
+          else if i == 2 then @[hx, hz]
+          else if i == 3 then @[0.0 - hx, 0.0 - hz]
+          else if i == 4 then @[hx, hz]
+          else @[hx, 0.0 - hz] in
+  c + o
+
+-- Centripetal Catmull-Rom point at u in [0,1] on the span p1->p2 (p0,p3 =
+-- neighbors). Knot spacing = sqrt(segment length) (alpha = 0.5), which avoids the
+-- overshoot/cusps/self-loops a uniform parameterization produces on sharp,
+-- unevenly-spaced control points. Knot deltas are floored to a small epsilon so
+-- duplicated endpoints don't divide by zero. Barry-Goldman pyramidal evaluation.
+def catmull_rom(p0: vec2f32, p1: vec2f32, p2: vec2f32, p3: vec2f32, u: f32) vec2f32 =
+  let t0 = 0.0
+  let t1 = t0 + f32.max(f32.sqrt(distance(p0, p1)), 1e-4)
+  let t2 = t1 + f32.max(f32.sqrt(distance(p1, p2)), 1e-4)
+  let t3 = t2 + f32.max(f32.sqrt(distance(p2, p3)), 1e-4)
+  let t = mix(t1, t2, u)
+  let a1 = p0 * v2((t1 - t) / (t1 - t0)) + p1 * v2((t - t0) / (t1 - t0))
+  let a2 = p1 * v2((t2 - t) / (t2 - t1)) + p2 * v2((t - t1) / (t2 - t1))
+  let a3 = p2 * v2((t3 - t) / (t3 - t2)) + p3 * v2((t - t2) / (t3 - t2))
+  let b1 = a1 * v2((t2 - t) / (t2 - t0)) + a2 * v2((t - t0) / (t2 - t0))
+  let b2 = a2 * v2((t3 - t) / (t3 - t1)) + a3 * v2((t - t1) / (t3 - t1)) in
+  b1 * v2((t2 - t) / (t2 - t1)) + b2 * v2((t - t1) / (t2 - t1))
+
+-- Unit tangent of the centripetal Catmull-Rom span at u (central finite difference).
+def catmull_rom_tangent(p0: vec2f32, p1: vec2f32, p2: vec2f32, p3: vec2f32, u: f32) vec2f32 =
+  let e = 0.04
+  let a = catmull_rom(p0, p1, p2, p3, f32.max(u - e, 0.0))
+  let b = catmull_rom(p0, p1, p2, p3, f32.min(u + e, 1.0))
+  let d = b - a
+  let l = magnitude(d) in
+  if l > 1e-6 then d * v2(1.0 / l) else @[1.0, 0.0]
+
+-- Vertex i of the ribbon quad spanning Catmull-Rom params u0..u1 at half-width hw
+-- (the span p1->p2, with neighbors p0,p3). Returns (position, side), where side is
+-- +1 on one edge and -1 on the other (|side| -> 1 at the stroke boundary, for the
+-- edging course). Quad = tris (A,B,C),(B,D,C) with A,C on +side and B,D on -side.
+def ribbon_vertex(p0: vec2f32, p1: vec2f32, p2: vec2f32, p3: vec2f32,
+                  u0: f32, u1: f32, hw: f32, i: i32) (vec2f32, f32) =
+  let a0 = catmull_rom(p0, p1, p2, p3, u0)
+  let a1 = catmull_rom(p0, p1, p2, p3, u1)
+  let tg0 = catmull_rom_tangent(p0, p1, p2, p3, u0)
+  let tg1 = catmull_rom_tangent(p0, p1, p2, p3, u1)
+  let n0 = @[0.0 - tg0.y, tg0.x]
+  let n1 = @[0.0 - tg1.y, tg1.x]
+  let pa = a0 + n0 * v2(hw)
+  let pb = a0 - n0 * v2(hw)
+  let pc = a1 + n1 * v2(hw)
+  let pd = a1 - n1 * v2(hw) in
+  if i == 0 then (pa, 1.0)
+  else if i == 1 then (pb, 0.0 - 1.0)
+  else if i == 2 then (pc, 1.0)
+  else if i == 3 then (pb, 0.0 - 1.0)
+  else if i == 4 then (pd, 0.0 - 1.0)
+  else (pc, 1.0)

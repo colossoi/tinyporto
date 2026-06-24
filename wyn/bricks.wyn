@@ -6,6 +6,11 @@
 -- (see round_normal); a later pass upgrades to a per-pixel rounded-box ray
 -- march so the silhouette rounds too (the Tiny Glade trick).
 
+-- Sett palette.
+def COBBLE_BASE: vec3f32 = @[0.46, 0.43, 0.40]   -- grey stone
+def COBBLE_EDGE: vec3f32 = @[0.24, 0.26, 0.33]   -- cool slate edging course
+def MORTAR_COLOR: vec3f32 = @[0.28, 0.26, 0.24]
+
 -- Sett dimensions (meters), from a 10"x7"x4" cobble reference.
 def BRICK_W: f32 = 0.25     -- x footprint
 def BRICK_L: f32 = 0.18     -- z footprint

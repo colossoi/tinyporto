@@ -71,10 +71,6 @@ def look_at(eye: vec3f32, center: vec3f32, up: vec3f32) mat4f32 =
     [0.0 - dot(s, eye), 0.0 - dot(u, eye), dot(f, eye), 1.0]]
 
 -- World position -> clip space. Applies view then projection (no mat*mat).
--- Camera eye (world) for a given zoom — used by per-pixel ray marching.
-def cam_eye(zoom: f32) vec3f32 =
-  LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)]
-
 def world_to_clip(p: vec3f32, resolution: vec3f32, zoom: f32) vec4f32 =
   let aspect = resolution.x / resolution.y
   let eye = LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)]

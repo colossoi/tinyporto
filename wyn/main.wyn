@@ -8,8 +8,8 @@
 -- Strokes capture control points online (Reumann-Witkam) and render through a
 -- Catmull-Rom curve. Z-order is order of addition.
 --
--- Storage buffers are only ever indexed inside the entry that binds them, and the
--- shared helpers (cr/sd_seg/sd_box2/cross2 in paint.wyn) take only scalars/vecs.
+-- `step` does all per-frame state + geometry work; the vertex/fragment pair just
+-- shades the ribbon `step` emits. Curve/ribbon math lives in paint.wyn.
 --
 -- Idiom: root does `open f32`; library modules pulled in via bare `import`.
 
@@ -17,7 +17,7 @@ open f32
 import "math"
 import "camera"
 import "shade"
-import "mesh"
+import "geom"
 import "paint"
 
 ------------------------------------------------------------
@@ -104,14 +104,19 @@ def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
 -- One frame's whole state update. Reads the previous state (ping-pong prev) and
 -- the inputs; returns the next state. Output order: uistate, points, items, head.
 -- pidx/iidx are iota index seeds so each `map` recovers its element index.
+-- tidx is the iota seed for the tessellated-ribbon output (the geometry the
+-- ground draw consumes). It tessellates the PREVIOUS points/items, so the
+-- rendered geometry lags input by one frame (imperceptible).
+-- tidx is first so the compiler derives the dispatch from it: it's the largest
+-- map (the ribbon), and the smaller maps (points/items) run guarded within it.
 #[compute]
-entry step(pidx: []u32, iidx: []u32,
+entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
            #[uniform(set=1, binding=0)] iResolution: vec3f32,
            #[uniform(set=1, binding=1)] iMouse: vec4f32,
            #[uniform(set=1, binding=3)] iCam: vec4f32,
            #[uniform(set=1, binding=7)] iKeys: vec4u32)
-  ([]f32, []vec2f32, []vec4f32, []f32) =
+  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32) =
   -- UI: cycle tool on a Tab pulse; toggle the overlay on its pulse.
   let tool0 = uistate_in[0]
   let ovl0 = uistate_in[1]
@@ -152,118 +157,82 @@ entry step(pidx: []u32, iidx: []u32,
 
   -- Head: counts + Reumann-Witkam anchor/dir/last, as a fixed-size literal.
   let head_out =
-    [d.new_pc, d.new_ic, d.held01, d.ax, d.az, d.dx, d.dz, d.lx, d.lz, d.hd, 0.0, 0.0] in
+    [d.new_pc, d.new_ic, d.held01, d.ax, d.az, d.dx, d.dz, d.lx, d.lz, d.hd, 0.0, 0.0]
 
-  (uistate_out, points_out, items_out, head_out)
+  -- Tessellated ribbon geometry: each output vertex = (x, z, kind, edge_t).
+  -- Leading TESS_BASE verts are the sand base quad; then a fixed budget per item
+  -- (centripetal-CR ribbon for strokes, one quad for buildings). Unused slots
+  -- collapse to a degenerate (zero) triangle. Built from the PREVIOUS state.
+  let tess_out =
+    map(|s|
+      let v = i32(s) in
+      if v < TESS_BASE then
+        let c = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in @[c.x, c.y, 0.0, 0.0]
+      else
+        let vi = v - TESS_BASE
+        let item = vi / TESS_VPI
+        let local = vi % TESS_VPI
+        let it = items_in[item]
+        let kind = it.x
+        let pstart = i32(it.y)
+        let pcount = i32(it.z)
+        let prm = it.w in
+        if kind < 0.5 then @[0.0, 0.0, 0.0, 0.0]
+        else if kind > 2.5 then
+          if local < 6 then
+            let c = rect_vertex(points_in[pstart], BUILD_HX, BUILD_HZ, local) in
+            @[c.x, c.y, kind, 1.0]
+          else @[0.0, 0.0, 0.0, 0.0]
+        else
+          let span = local / TESS_VPS
+          let rem = local % TESS_VPS
+          let sub = rem / 6
+          let corner = rem % 6 in
+          if span >= pcount - 1 then @[0.0, 0.0, 0.0, 0.0]
+          else
+            let p1 = points_in[pstart + span]
+            let p2 = points_in[pstart + span + 1]
+            let p0 = if span > 0 then points_in[pstart + span - 1] else p1
+            let p3 = if span + 2 < pcount then points_in[pstart + span + 2] else p2
+            let u0 = f32(sub) / f32(CR_SUB)
+            let u1 = f32(sub + 1) / f32(CR_SUB)
+            let (pos, et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
+            @[pos.x, pos.y, kind, et]
+        , tidx) in
+
+  (uistate_out, points_out, items_out, head_out, tess_out)
 
 ------------------------------------------------------------
 -- Ground (one quad over the whole patch; every item composited per fragment)
 ------------------------------------------------------------
 
+-- Pull a tessellated-ribbon vertex (x, z, kind, edge_t) and project it. kind and
+-- edge_t pass through to the fragment as the only surface attributes it needs.
 #[vertex]
 entry ground_vertex(#[builtin(vertex_index)] vid: i32,
                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                    #[uniform(set=1, binding=3)] iCam: vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32) =
-  let q = quad_pos[vid]
-  let world = @[q.x * GROUND_HALF, 0.0, q.z * GROUND_HALF] in
-  (world_to_clip(world, iResolution, iCam.x), @[world.x, world.z, 0.0])
-
--- Tool tint for the brush cursor.
-def tool_color(tool: f32) vec3f32 =
-  if tool < 0.5 then @[0.25, 0.95, 1.0]
-  else if tool < 1.5 then @[0.55, 0.95, 0.45]
-  else @[1.0, 0.72, 0.45]
+                    #[uniform(set=1, binding=3)] iCam: vec4f32,
+                    #[storage(set=1, binding=8, access=read)] tess: []vec4f32)
+  (#[builtin(position)] vec4f32, #[location(0)] f32, #[location(1)] f32) =
+  let vtx = tess[vid]
+  let world = @[vtx.x, 0.0, vtx.y] in
+  (world_to_clip(world, iResolution, iCam.x), vtx.z, vtx.w)
 
 def item_color(kind: f32) vec3f32 =
-  if kind < 1.5 then WATER_COLOR
+  if kind < 0.5 then SAND_COLOR
+  else if kind < 1.5 then WATER_COLOR
   else if kind < 2.5 then WALL_COLOR
   else BUILDING_COLOR
 
+-- Shade one ribbon fragment: material color from `kind`, a darker edging course
+-- near the stroke boundary (|edge_t| -> 1), then lighting + tonemap. No scene
+-- loop, no curve eval — that all moved into `step`'s tessellation.
 #[fragment]
-entry ground_fragment(#[location(0)] w: vec3f32,
-                      #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                      #[uniform(set=1, binding=1)] iMouse: vec4f32,
-                      #[storage(set=1, binding=2, access=read)] uistate: []f32,
-                      #[uniform(set=1, binding=3)] iCam: vec4f32,
-                      #[storage(set=1, binding=4, access=read)] items: []vec4f32,
-                      #[storage(set=1, binding=5, access=read)] points: []vec2f32,
-                      #[storage(set=1, binding=6, access=read)] head: []f32)
+entry ground_fragment(#[location(0)] kind: f32, #[location(1)] edge_t: f32)
   #[location(0)] vec4f32 =
-  let wxz = @[w.x, w.y]
-  let ic = i32(head[1])
-
-  -- Composite items in order of addition (later items paint over earlier ones);
-  -- each draws a subtle darker outline at its boundary. `lastsd` keeps the signed
-  -- distance of the most-recent item for the overlay below.
-  let (_, surf, lastsd) =
-    loop (j, col, lastsd) = (0, SAND_COLOR, 1e9) while j < ic && j < MAXIT do
-      let it = items[j]
-      let kind = it.x
-      let pstart = i32(it.y)
-      let pcount = i32(it.z)
-      let param = it.w
-      let dsd =
-        if kind > 2.5 then sd_box2(wxz - points[pstart], @[BUILD_HX, BUILD_HZ])
-        else if pcount <= 1 then distance(wxz, points[pstart]) - param
-        else
-          let (_, dcurve) =
-            loop (s, dc) = (0, 1e9) while s < pcount - 1 do
-              let p1 = points[pstart + s]
-              let p2 = points[pstart + s + 1]
-              let p0 = if s > 0 then points[pstart + s - 1] else p1
-              let p3 = if s + 2 < pcount then points[pstart + s + 2] else p2
-              let (_, dseg) =
-                loop (k, ds) = (0, 1e9) while k < CR_SUB do
-                  let u0 = f32(k) / f32(CR_SUB)
-                  let u1 = f32(k + 1) / f32(CR_SUB) in
-                  (k + 1, f32.min(ds, sd_seg(wxz, cr(p0, p1, p2, p3, u0), cr(p0, p1, p2, p3, u1))))
-              in (s + 1, f32.min(dc, dseg))
-          in dcurve - param
-      let filled = if dsd < 0.0 then item_color(kind) else col
-      let edged = if f32.abs(dsd) < EDGE_BAND then mix(filled, OUTLINE_COLOR, 0.55) else filled
-      let nls = if j == ic - 1 then dsd else lastsd in
-      (j + 1, edged, nls)
-  in
+  let base = item_color(kind)
+  let edge = smoothstep(0.78, 1.0, f32.abs(edge_t))
+  let surf = mix(base, OUTLINE_COLOR, edge * 0.5)
   let col = lit(surf, @[0.0, 1.0, 0.0])
-
-  -- Brush cursor: circle for water/fence, rectangle preview for building.
-  let tool = uistate[0]
-  let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y]
-  let (mro, mrd) = get_ray(iResolution, mouseCoord, iCam.x)
-  let cursor = (mro + mrd * v3(ground_t(mro, mrd))).xz
-  let held = if iMouse.z > 0.0 then 1.0 else 0.0
-  let cur_d =
-    if tool > 1.5 then f32.abs(sd_box2(wxz - cursor, @[BUILD_HX, BUILD_HZ]))
-    else if tool < 0.5 then f32.abs(distance(wxz, cursor) - WATER_R)
-    else f32.abs(distance(wxz, cursor) - 0.6)
-  let curband = smoothstep(0.18, 0.0, cur_d) * (0.55 + 0.45 * held)
-  let withcur = mix(col, tool_color(tool), clamp01(curband))
-
-  -- Bonus overlay: the curve + control points of the most-recently-added item.
-  -- The spine is recovered from `lastsd` (centerline = signed dist + radius for a
-  -- stroke; |signed dist| for a building); dots loop over that item's points.
-  let show = uistate[1] > 0.5 && ic > 0
-  let lit_item = items[if ic > 0 then ic - 1 else 0]
-  let lkind = lit_item.x
-  let lpstart = i32(lit_item.y)
-  let lpcount = i32(lit_item.z)
-  let lparam = lit_item.w
-  let spine = if lkind > 2.5 then f32.abs(lastsd) else f32.abs(lastsd + lparam)
-  let oline = if show then smoothstep(OVL_LINE, 0.0, spine) else 0.0
-  let (_, dotmin) =
-    loop (k, dmin) = (0, 1e9) while k < lpcount && k < 4096 do
-      (k + 1, f32.min(dmin, distance(wxz, points[lpstart + k])))
-  in
-  -- For a building, the four corners read as the "control points".
-  let bcorner =
-    f32.min(f32.min(distance(wxz, points[lpstart] + @[BUILD_HX, BUILD_HZ]),
-                    distance(wxz, points[lpstart] + @[0.0 - BUILD_HX, BUILD_HZ])),
-            f32.min(distance(wxz, points[lpstart] + @[BUILD_HX, 0.0 - BUILD_HZ]),
-                    distance(wxz, points[lpstart] + @[0.0 - BUILD_HX, 0.0 - BUILD_HZ])))
-  let dotd = if lkind > 2.5 then bcorner else dotmin
-  let odot = if show then smoothstep(OVL_DOT, 0.0, dotd) else 0.0
-  let withovl = mix(mix(withcur, OVL_CURVE_COLOR, oline), OVL_DOT_COLOR, odot) in
-
-  let m = tonemap_aces(withovl) in
+  let m = tonemap_aces(col) in
   @[m.x, m.y, m.z, 1.0]

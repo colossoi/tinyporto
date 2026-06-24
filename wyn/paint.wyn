@@ -1,21 +1,17 @@
--- paint: ground items as analytic SDFs, evaluated per fragment.
+-- paint: domain constants for the ground painter — item kinds, tool footprints,
+-- buffer capacities, and the tessellation budget. The generic spline/ribbon
+-- algorithms live in curve.wyn; the capture + tessellation logic in main.wyn.
 --
 -- The world is an ordered list of parametric items (the source of truth):
 --   * water  (kind 1): a stroke (control-point polyline) swept by a big radius
 --   * fence  (kind 2): a stroke swept by a small half-width
 --   * building (kind 3): a single center point, fixed-size rectangle
--- Strokes capture control points online (Reumann-Witkam, in main.wyn) and render
--- as a Catmull-Rom capsule chain, so the curve passes through its control points.
--- Nothing is drawn above the ground plane; this module is pure 2D distance work.
---
--- Library module: no `open`; f32.* / vec.* qualified (see math.wyn for the idiom).
-
-import "math"
+-- Strokes capture control points online (Reumann-Witkam); `step` tessellates them
+-- into a flat triangle ribbon. Nothing is drawn above the ground plane.
 
 -- Buffer capacities. MUST match the driver's buffer sizes (driver/src/app.rs).
 def POINTS_CAP: i32 = 1024     -- total control points across all items
 def ITEMS_CAP:  i32 = 128      -- max items
-def HEAD_LEN:   i32 = 12       -- capture-state floats (see main.wyn `decide`)
 
 -- Online capture tuning (world meters).
 def STEP:     f32 = 0.40       -- min cursor travel to take a new raw sample
@@ -31,48 +27,12 @@ def BUILD_HZ: f32 = 1.5        -- building half-extent z (3 m deep)
 -- Rendering.
 def GROUND_HALF: f32 = 20.0    -- half-size of the ground quad (40 m patch)
 def CR_SUB:    i32 = 4         -- Catmull-Rom subsegments per control-point span
-def EDGE_BAND: f32 = 0.10      -- subtle outline half-width at item boundaries
-def OVL_LINE:  f32 = 0.06      -- overlay spine half-width
-def OVL_DOT:   f32 = 0.18      -- overlay control-point dot radius
-def MAXIT:     i32 = 64        -- fragment item-loop cap (perf guard)
 
--- 2D cross (z-component) for points in the ground (x,z) plane.
-def cross2(a: vec2f32, b: vec2f32) f32 = a.x * b.y - a.y * b.x
-
--- Distance from p to the segment [a,b].
-def sd_seg(p: vec2f32, a: vec2f32, b: vec2f32) f32 =
-  let pa = p - a
-  let ba = b - a
-  let h = f32.clamp(dot(pa, ba) / f32.max(dot(ba, ba), 1e-9), 0.0, 1.0) in
-  magnitude(pa - ba * v2(h))
-
--- Signed distance to an axis-aligned box (half-extents hb) centered at origin.
-def sd_box2(p: vec2f32, hb: vec2f32) f32 =
-  let dx = f32.abs(p.x) - hb.x
-  let dz = f32.abs(p.y) - hb.y
-  let outside = magnitude(@[f32.max(dx, 0.0), f32.max(dz, 0.0)]) in
-  outside + f32.min(f32.max(dx, dz), 0.0)
-
--- Centripetal Catmull-Rom point at u in [0,1] on the span p1->p2 (p0,p3 =
--- neighbors). Knot spacing = sqrt(segment length) (alpha = 0.5), which avoids the
--- overshoot/cusps/self-loops a uniform parameterization produces on sharp,
--- unevenly-spaced control points (a fast, willy-nilly stroke). Knot deltas are
--- floored to a small epsilon so duplicated endpoints don't divide by zero.
--- Barry-Goldman pyramidal evaluation.
-def cr(p0: vec2f32, p1: vec2f32, p2: vec2f32, p3: vec2f32, u: f32) vec2f32 =
-  let t0 = 0.0
-  let t1 = t0 + f32.max(f32.sqrt(distance(p0, p1)), 1e-4)
-  let t2 = t1 + f32.max(f32.sqrt(distance(p1, p2)), 1e-4)
-  let t3 = t2 + f32.max(f32.sqrt(distance(p2, p3)), 1e-4)
-  let t = mix(t1, t2, u)
-  let a1 = p0 * v2((t1 - t) / (t1 - t0)) + p1 * v2((t - t0) / (t1 - t0))
-  let a2 = p1 * v2((t2 - t) / (t2 - t1)) + p2 * v2((t - t1) / (t2 - t1))
-  let a3 = p2 * v2((t3 - t) / (t3 - t2)) + p3 * v2((t - t2) / (t3 - t2))
-  let b1 = a1 * v2((t2 - t) / (t2 - t0)) + a2 * v2((t - t0) / (t2 - t0))
-  let b2 = a2 * v2((t3 - t) / (t3 - t1)) + a3 * v2((t - t1) / (t3 - t1)) in
-  b1 * v2((t2 - t) / (t2 - t1)) + b2 * v2((t - t1) / (t2 - t1))
-
--- The stroke/curve distance, item compositing, and overlay are inlined into
--- ground_fragment, where they index the bound `points`/`items` storage buffers
--- directly. They could be factored into helpers that take those buffers as
--- parameters; kept inline here for now.
+-- Tessellation budget for the `tessellate` compute pass, which turns the item
+-- list into a flat triangle ribbon (a fixed-size vertex buffer; unused slots
+-- collapse to degenerate triangles — real compaction is later Nine work).
+def TESS_MAXCP: i32 = 32       -- max control points tessellated per item
+def TESS_VPS:   i32 = 24       -- verts per control-point span (CR_SUB quads * 6)
+def TESS_VPI:   i32 = 744      -- verts per item ((TESS_MAXCP - 1) * TESS_VPS)
+def TESS_BASE:  i32 = 6        -- leading verts = the ground base quad (sand)
+def TESS_CAP:   i32 = 95238    -- TESS_BASE + ITEMS_CAP * TESS_VPI

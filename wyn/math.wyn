@@ -19,3 +19,6 @@ def v3(s: f32) vec3f32 = @[s, s, s]
 
 -- Smooth 0..1 ramp on a value already in [0,1].
 def smoothbump(x: f32) f32 = x * x * (3.0 - 2.0 * x)
+
+-- 2D cross product (z-component of a x b).
+def cross2(a: vec2f32, b: vec2f32) f32 = a.x * b.y - a.y * b.x
