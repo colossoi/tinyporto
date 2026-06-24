@@ -240,7 +240,10 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32,
   let sett_inst =
     map(|s|
       let i = i32(s)
-      let center = brick_center(i)
+      let base = brick_center(i)
+      let jx = (brick_hash(i + 13) - 0.5) * 0.04
+      let jz = (brick_hash(i + 53) - 0.5) * 0.04
+      let center = @[base.x + jx, base.y + jz]
       let inside = magnitude(center) < 8.0
       let height = if inside then BRICK_H * (0.9 + 0.2 * brick_hash(i)) else 0.0
       let roundfrac = 0.3 + 0.6 * brick_hash(i + 7919) in
@@ -307,16 +310,24 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
                   #[uniform(set=1, binding=0)] iResolution: vec3f32,
                   #[uniform(set=1, binding=3)] iCam: vec4f32,
                   #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec4f32, #[location(2)] f32) =
+  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec4f32,
+   #[location(2)] f32, #[location(3)] f32) =
   let inst = sett_inst[iid]
   let center = @[inst.x, inst.y]
   let height = inst.z
   let keep = if height > 0.0 then 1.0 else 0.0
+  -- Per-instance yaw (~+-7 deg) so rows aren't grid-perfect; the proxy box and
+  -- the fragment's ray transform share this angle.
+  let yaw = (brick_hash(iid + 31) - 0.5) * 0.24
+  let cw = f32.cos(yaw)
+  let sw = f32.sin(yaw)
   let local = box_pos[vid]
-  let world = @[center.x + local.x * BRICK_W * keep,
+  let sx = local.x * BRICK_W * keep
+  let sz = local.z * BRICK_L * keep
+  let world = @[center.x + cw * sx - sw * sz,
                 local.y * height,
-                center.y + local.z * BRICK_L * keep] in
-  (world_to_clip(world, iResolution, iCam.x), world, inst, brick_hash(iid))
+                center.y + sw * sx + cw * sz] in
+  (world_to_clip(world, iResolution, iCam.x), world, inst, brick_hash(iid), yaw)
 
 -- Sphere-trace the rounded box for this instance from the proxy front face. On a
 -- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
@@ -324,7 +335,7 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
 -- already-drawn ground wins the LessEqual depth test — that carves the silhouette.
 #[fragment]
 entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
-                    #[location(2)] var: f32,
+                    #[location(2)] var: f32, #[location(3)] yaw: f32,
                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
                     #[uniform(set=1, binding=3)] iCam: vec4f32)
   (#[location(0)] vec4f32, #[builtin(frag_depth)] f32) =
@@ -335,17 +346,25 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
   -- positive on every axis for any roundfrac < 1 — no clamp needed.
   let r = inst.w * f32.min(half.x, f32.min(half.y, half.z))
   let b = @[half.x - r, half.y - r, half.z - r]
+  -- The box is axis-aligned in its own frame, yawed by `yaw` in the world. Trace
+  -- in box-local space: rotate the world offset by -yaw before sd_round_box.
+  let cw = f32.cos(yaw)
+  let sw = f32.sin(yaw)
   let rd = normalize(world - cam_eye(iCam.x))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 32 do
       if hit then (t, hit)
       else
-        let p = world + rd * t
-        let d = sd_round_box(p - bcenter, b, r) in
+        let rel = (world + rd * t) - bcenter
+        let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
+        let d = sd_round_box(pl, b, r) in
         if d < 0.0004 then (t, true) else (t + d, false)
   let pos = world + rd * t in
   if hit then
-    let n = round_normal(pos - bcenter, b, r)
+    let rel = pos - bcenter
+    let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
+    let nl = round_normal(pl, b, r)
+    let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
     let clip = world_to_clip(pos, iResolution, iCam.x)
     let col = lit(COBBLE_BASE * v3(0.8 + 0.4 * var), n)
     let m = tonemap_aces(col) in
