@@ -14,7 +14,7 @@ def MORTAR_COLOR: vec3f32 = @[0.28, 0.26, 0.24]
 -- Sett dimensions (meters), from a 10"x7"x4" cobble reference.
 def BRICK_W: f32 = 0.25     -- x footprint
 def BRICK_L: f32 = 0.18     -- z footprint
-def BRICK_H: f32 = 0.06     -- protrusion above ground
+def BRICK_H: f32 = 0.03     -- protrusion above ground
 def MORTAR:  f32 = 0.015    -- joint width
 def ROUND:   f32 = 0.028    -- corner radius (must be < min half-extent; min is H/2=0.03)
 

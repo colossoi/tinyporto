@@ -246,7 +246,7 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32,
       let center = @[base.x + jx, base.y + jz]
       let inside = magnitude(center) < 8.0
       let height = if inside then BRICK_H * (0.9 + 0.2 * brick_hash(i)) else 0.0
-      let roundfrac = 0.3 + 0.6 * brick_hash(i + 7919) in
+      let roundfrac = 0.05 + 0.95 * brick_hash(i + 7919) in
       @[center.x, center.y, height, roundfrac]
       , bidx)
 
