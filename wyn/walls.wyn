@@ -7,6 +7,8 @@
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
+import "bricks"   -- brick_hash for the per-brick jitter
+
 -- Brick cell spacing (the running-bond grid) and the drawn half-extents. The brick
 -- is a bit smaller than its cell so neighbours leave a mortar gap, exactly like the
 -- cobble setts. Local frame: x = along the wall, y = up, z = wall thickness.
@@ -15,7 +17,8 @@ def BRK_CRS: f32 = 0.10     -- course height
 def BRK_HX:  f32 = 0.105    -- half length  (< BRK_LEN/2)
 def BRK_HY:  f32 = 0.043    -- half course  (< BRK_CRS/2)
 def BRK_HZ:  f32 = 0.060    -- half thickness
-def BRICK_BASE: vec3f32 = @[0.71, 0.36, 0.28]   -- terracotta
+def BRICK_BASE:  vec3f32 = @[0.71, 0.36, 0.28]   -- terracotta
+def BRICK_BASE2: vec3f32 = @[0.60, 0.30, 0.24]   -- browner / darker fired clay
 
 -- Fixed per-wall brick budget (a grid of PER_COURSE x COURSES). Slots past the
 -- wall's real extent are marked dead and compacted away, like the cobble grid.
@@ -62,9 +65,18 @@ def wall_brick(i: i32) vec4f32 =
   let n_per = i32(len / BRK_LEN)
   let n_crs = i32(h / BRK_CRS)
   let off = if (course % 2) == 1 then BRK_LEN * 0.5 else 0.0
-  let along = f32(col) * BRK_LEN + off + BRK_LEN * 0.5
+  -- Per-brick jitter, keyed on the STABLE index i (so a brick's look survives
+  -- compaction). Wall bricks are neatly laid — only a faint hand-laid wobble.
+  -- `perp` is the horizontal out-of-wall axis.
+  let ja = (brick_hash(i * 4 + 1) - 0.5) * 0.012
+  let jp = (brick_hash(i * 4 + 2) - 0.5) * 0.010
+  let jv = (brick_hash(i * 4 + 3) - 0.5) * 0.007
+  let jyaw = (brick_hash(i * 4 + 5) - 0.5) * 0.05
+  let along = f32(col) * BRK_LEN + off + BRK_LEN * 0.5 + ja
   let dead = col >= n_per || course >= n_crs || (along + BRK_HX) > len
-  let cx = a.x + dir.x * along
-  let cz = a.y + dir.y * along
-  let cy = f32(course) * BRK_CRS + BRK_CRS * 0.5 in
-  if dead then @[cx, 0.0 - 1.0, cz, yaw] else @[cx, cy, cz, yaw]
+  let px = 0.0 - dir.y
+  let pz = dir.x
+  let cx = a.x + dir.x * along + px * jp
+  let cz = a.y + dir.y * along + pz * jp
+  let cy = f32(course) * BRK_CRS + BRK_CRS * 0.5 + jv in
+  if dead then @[cx, 0.0 - 1.0, cz, yaw + jyaw] else @[cx, cy, cz, yaw + jyaw]

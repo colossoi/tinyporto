@@ -14,7 +14,7 @@ def MORTAR_COLOR: vec3f32 = @[0.28, 0.26, 0.24]
 -- Sett dimensions (meters), from a 10"x7"x4" cobble reference.
 def BRICK_W: f32 = 0.25     -- x footprint
 def BRICK_L: f32 = 0.18     -- z footprint
-def BRICK_H: f32 = 0.03     -- protrusion above ground
+def BRICK_H: f32 = 0.05     -- protrusion above ground (chunky stone, so the rounding reads)
 def MORTAR:  f32 = 0.015    -- joint width
 def ROUND:   f32 = 0.028    -- corner radius (must be < min half-extent; min is H/2=0.03)
 
@@ -59,6 +59,41 @@ def sd_round_box(p: vec3f32, b: vec3f32, r: f32) f32 =
 -- Per-sett deterministic value in [0,1) for color variation.
 def brick_hash(i: i32) f32 =
   f32.fract(f32.sin(f32.i32(i) * 91.37) * 47453.31)
+
+-- Stable per-sett seed from its world (x,z) centre. Keyed on position, NOT the
+-- compacted instance index (which reorders as culling changes each frame), so a
+-- sett's size / yaw / tone stay put. Cobbles are irregular — unlike wall bricks
+-- they vary in footprint and orientation.
+def sett_seed(cx: f32, cz: f32) i32 = i32(cx * 53.0 + cz * 131.0 + 20000.0)
+def sett_scale(cx: f32, cz: f32) f32 = 0.93 + 0.18 * brick_hash(sett_seed(cx, cz) + 7)
+def sett_yaw(cx: f32, cz: f32) f32 = (brick_hash(sett_seed(cx, cz) + 31) - 0.5) * 0.225
+def sett_var(cx: f32, cz: f32) f32 = brick_hash(sett_seed(cx, cz) + 3)
+
+-- Per-sett orientation as an orthonormal basis (right, up, fwd). `up` is a slightly
+-- random top normal, so the stone leans in SOME direction (a normal captures tilt
+-- in any direction, unlike a single-axis pitch). `yaw` is the separate spin about
+-- that normal, orienting the rectangular footprint. Vertex (place the proxy) and
+-- fragment (trace) both build this from the stable centre so they agree.
+def sett_basis(cx: f32, cz: f32) (vec3f32, vec3f32, vec3f32) =
+  let s = sett_seed(cx, cz)
+  let tx = (brick_hash(s + 51) - 0.5) * 0.18
+  let tz = (brick_hash(s + 61) - 0.5) * 0.18
+  let yaw = sett_yaw(cx, cz)
+  let up = normalize(@[tx, 1.0, tz])
+  let fwd0 = @[f32.sin(yaw), 0.0, f32.cos(yaw)]
+  let right = normalize(cross(up, fwd0))
+  let fwd = cross(right, up) in
+  (right, up, fwd)
+
+-- Box-local offset -> world (orient) and its inverse (unorient = projection onto
+-- the orthonormal basis).
+def sett_orient(p: vec3f32, r: vec3f32, u: vec3f32, f: vec3f32) vec3f32 =
+  @[r.x * p.x + u.x * p.y + f.x * p.z,
+    r.y * p.x + u.y * p.y + f.y * p.z,
+    r.z * p.x + u.z * p.y + f.z * p.z]
+
+def sett_unorient(p: vec3f32, r: vec3f32, u: vec3f32, f: vec3f32) vec3f32 =
+  @[dot(p, r), dot(p, u), dot(p, f)]
 
 -- Unit proxy box for a sett: x,z in [-0.5,0.5], y in [0,1] (scaled per instance).
 -- 6 faces x 2 tris x 3 verts = 36, non-indexed. Every triangle is wound CCW as

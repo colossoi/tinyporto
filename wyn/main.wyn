@@ -299,8 +299,9 @@ entry cull(bidx: []u32,
           let occ = image_load(od, @[i32(px) / OCC_TILE, i32(py) / OCC_TILE]).x in
           occ < 0.9999 && ndcz > occ + 0.02
       let keep = visible && (!occluded)
-      let height = if keep then BRICK_H * (0.9 + 0.2 * brick_hash(i)) else 0.0
-      let roundfrac = 0.05 + 0.95 * brick_hash(i + 7919) in
+      let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
+      -- Roundness spread: some cobbles fairly crisp, some rounded.
+      let roundfrac = 0.21 + 0.64 * brick_hash(i + 7919) in
       @[center.x, center.y, height, roundfrac]
       , bidx)
   let inst = filter(|c| c.z > 0.0, cand)
@@ -417,22 +418,20 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
                   #[uniform(set=1, binding=3)] iCam: vec4f32,
                   #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec4f32,
-   #[location(2)] f32, #[location(3)] f32) =
+   #[location(2)] f32) =
   let inst = sett_inst[iid]
   let center = @[inst.x, inst.y]
   let height = inst.z
-  -- Per-instance yaw (~+-7 deg) so rows aren't grid-perfect; the proxy box and
-  -- the fragment's ray transform share this angle.
-  let yaw = (brick_hash(iid + 31) - 0.5) * 0.24
-  let cw = f32.cos(yaw)
-  let sw = f32.sin(yaw)
+  -- Per-sett orientation (random-tilt basis) + footprint scale, keyed on the stable
+  -- centre. Cobbles are irregular: varied size, leaning in random directions.
+  let (right, up, fwd) = sett_basis(center.x, center.y)
+  let sc = sett_scale(center.x, center.y)
   let local = box_pos[vid]
-  let sx = local.x * BRICK_W
-  let sz = local.z * BRICK_L
-  let world = @[center.x + cw * sx - sw * sz,
-                local.y * height,
-                center.y + sw * sx + cw * sz] in
-  (world_to_clip(world, iResolution, iCam.x), world, inst, brick_hash(iid), yaw)
+  -- Centre the proxy box (y in [-h/2, h/2]) so it tilts about its middle.
+  let lc = @[local.x * BRICK_W * sc, (local.y - 0.5) * height, local.z * BRICK_L * sc]
+  let bcenter = @[center.x, height * 0.5, center.y]
+  let world = bcenter + sett_orient(lc, right, up, fwd) in
+  (world_to_clip(world, iResolution, iCam.x), world, inst, sett_var(center.x, center.y))
 
 -- Sphere-trace the rounded box for this instance from the proxy front face. On a
 -- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
@@ -440,36 +439,35 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
 -- already-drawn ground wins the LessEqual depth test — that carves the silhouette.
 #[fragment]
 entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
-                    #[location(2)] var: f32, #[location(3)] yaw: f32,
+                    #[location(2)] var: f32,
                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
                     #[uniform(set=1, binding=3)] iCam: vec4f32)
   (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
   let height = inst.z
   let bcenter = @[inst.x, height * 0.5, inst.y]
-  let half = @[BRICK_W * 0.5, height * 0.5, BRICK_L * 0.5]
-  -- Corner radius = roundfrac of the min half-extent (height/2 here), so b stays
-  -- positive on every axis for any roundfrac < 1 — no clamp needed.
+  -- Same stable per-sett scale + orientation basis as the vertex, so the traced
+  -- box matches the proxy. Roundness is `roundfrac` of the min half-extent.
+  let sc = sett_scale(inst.x, inst.y)
+  let (right, up, fwd) = sett_basis(inst.x, inst.y)
+  let half = @[BRICK_W * 0.5 * sc, height * 0.5, BRICK_L * 0.5 * sc]
   let r = inst.w * f32.min(half.x, f32.min(half.y, half.z))
   let b = @[half.x - r, half.y - r, half.z - r]
-  -- The box is axis-aligned in its own frame, yawed by `yaw` in the world. Trace
-  -- in box-local space: rotate the world offset by -yaw before sd_round_box.
-  let cw = f32.cos(yaw)
-  let sw = f32.sin(yaw)
+  -- Trace in box-local space: project the world offset onto the sett's basis.
   let rd = normalize(world - cam_eye(iCam.x))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 16 do
       if hit then (t, hit)
       else
         let rel = (world + rd * t) - bcenter
-        let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
+        let pl = sett_unorient(rel, right, up, fwd)
         let d = sd_round_box(pl, b, r) in
         if d < 0.0004 then (t, true) else (t + d, false)
   let pos = world + rd * t in
   if hit then
     let rel = pos - bcenter
-    let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
+    let pl = sett_unorient(rel, right, up, fwd)
     let nl = round_normal(pl, b, r)
-    let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
+    let n = sett_orient(nl, right, up, fwd)
     let clip = world_to_clip(pos, iResolution, iCam.x)
     let alb = COBBLE_BASE * v3(0.8 + 0.4 * var)
     let d = clip.z / clip.w in
@@ -533,8 +531,11 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
   let lx = local.x * (BRK_HX * 2.0)
   let ly = (local.y - 0.5) * (BRK_HY * 2.0)
   let lz = local.z * (BRK_HZ * 2.0)
-  let world = @[center.x + cw * lx - sw * lz, center.y + ly, center.z + sw * lx + cw * lz] in
-  (world_to_clip(world, iResolution, iCam.x), world, center, yaw, brick_hash(iid))
+  let world = @[center.x + cw * lx - sw * lz, center.y + ly, center.z + sw * lx + cw * lz]
+  -- Tone seed from the (stable, baked) brick centre — NOT iid, which is the
+  -- compaction order and would make a brick's colour shimmer as culling changes.
+  let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0)) in
+  (world_to_clip(world, iResolution, iCam.x), world, center, yaw, cv)
 
 -- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
 -- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
@@ -544,7 +545,9 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
                      #[uniform(set=1, binding=0)] iResolution: vec3f32,
                      #[uniform(set=1, binding=3)] iCam: vec4f32)
   (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
-  let rr = 0.012
+  -- Wall bricks are uniform: a single small corner radius (crisp), no per-brick
+  -- roundness variation. (Roundness variation lives on the cobbles instead.)
+  let rr = 0.010
   let b = @[BRK_HX - rr, BRK_HY - rr, BRK_HZ - rr]
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
@@ -564,7 +567,10 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
     let nl = round_normal(pl, b, rr)
     let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
     let clip = world_to_clip(pos, iResolution, iCam.x)
-    let alb = BRICK_BASE * v3(0.82 + 0.36 * cv)
+    -- Per-brick variation: `cv` (from the stable centre) drives lightness; a second
+    -- position hash mixes between two fired-clay tones for hue variation.
+    let hue = brick_hash(i32(bcenter.x * 97.0 + bcenter.z * 57.0 + bcenter.y * 181.0 + 10000.0))
+    let alb = mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * cv)
     let d = clip.z / clip.w in
     (@[alb.x, alb.y, alb.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)
   else
