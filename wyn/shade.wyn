@@ -33,6 +33,17 @@ def lit_ao(albedo: vec3f32, n: vec3f32, ao: f32) vec3f32 =
   let occ = 1.0 - 0.75 * clamp01(ao) in
   albedo * (AMBIENT * v3(occ) + SUN_COLOR * v3(ndl))
 
+-- As `lit_ao`, plus a directional shadow term `sh` in [0,1] (1 = fully occluded
+-- toward the sun) that attenuates the DIRECT sun contribution — this is where
+-- ray-marched contact shadows land. A little sun is kept even in shadow (0.85 max
+-- occlusion) to stand in for sky/bounce fill and avoid crushed blacks. The ambient
+-- term (governed by AO) is untouched: shadow blocks the sun, not the sky.
+def lit_ao_sh(albedo: vec3f32, n: vec3f32, ao: f32, sh: f32) vec3f32 =
+  let ndl = clamp01(dot(n, sun))
+  let occ = 1.0 - 0.75 * clamp01(ao)
+  let sunvis = 1.0 - 0.85 * clamp01(sh) in
+  albedo * (AMBIENT * v3(occ) + SUN_COLOR * v3(ndl * sunvis))
+
 def tonemap_aces(x: vec3f32) vec3f32 =
   let a = 2.51
   let b = 0.03

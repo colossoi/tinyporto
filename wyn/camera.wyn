@@ -58,6 +58,11 @@ def ground_t(ro: vec3f32, rd: vec3f32) f32 =
 -- mat3 convention and the SPIR-V emission. RH view, z in [0,1] (wgpu/Vulkan).
 ------------------------------------------------------------
 
+-- Clip near/far planes (metres). world_to_clip / linear_depth share these so a
+-- stored NDC depth inverts back to a metric distance consistently.
+def CLIP_NEAR: f32 = 0.1
+def CLIP_FAR:  f32 = 1000.0
+
 def perspective(fovy_deg: f32, aspect: f32, near: f32, far: f32) mat4f32 =
   let f = 1.0 / f32.tan(f32.radians(fovy_deg) * 0.5)
   let nf = 1.0 / (near - far) in
@@ -80,8 +85,27 @@ def world_to_clip(p: vec3f32, resolution: vec3f32, zoom: f32) vec4f32 =
   let aspect = resolution.x / resolution.y
   let eye = cam_eye(zoom)
   let view = look_at(eye, LOOKAT, @[0.0, 1.0, 0.0])
-  let proj = perspective(FOV, aspect, 0.1, 1000.0) in
+  let proj = perspective(FOV, aspect, CLIP_NEAR, CLIP_FAR) in
   proj * (view * @[p.x, p.y, p.z, 1.0])
+
+-- Linear view-forward distance (metres, +toward the scene) from a stored NDC depth
+-- d = clip.z / clip.w. The exact inverse of perspective()'s z map for our RH,
+-- z in [0,1] projection, so contact-shadow depth compares in real metres.
+def linear_depth(d: f32) f32 =
+  let nf = 1.0 / (CLIP_NEAR - CLIP_FAR)
+  let a = CLIP_FAR * nf
+  let b = CLIP_FAR * CLIP_NEAR * nf in
+  b / (a + d)
+
+-- World position of the surface at `fragCoord` (pixel centre, y measured bottom-up
+-- like get_ray) given its stored NDC depth `d`. Reconstructs the eye ray and walks
+-- it out to the linear distance the depth encodes. Inverse of the rasterized
+-- world_to_clip for on-surface points.
+def world_from_depth(resolution: vec3f32, fragCoord: vec2f32, zoom: f32, d: f32) vec3f32 =
+  let (ro, rd) = get_ray(resolution, fragCoord, zoom)
+  let fwd = normalize(LOOKAT - ro)
+  let t = linear_depth(d) / dot(rd, fwd) in
+  ro + rd * t
 
 -- Is world point `p` inside the view frustum? Projects to clip space and tests
 -- the clip bounds with a margin (so a small prop straddling an edge isn't culled

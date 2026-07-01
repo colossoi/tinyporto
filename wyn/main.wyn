@@ -23,6 +23,7 @@ import "geom"
 import "paint"
 import "bricks"
 import "walls"
+import "shadow"
 
 ------------------------------------------------------------
 -- State update (Wyn-owned). One compute entry, `step`, advances ALL persistent
@@ -584,20 +585,29 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
 -- is the unified shading home — AO here, contact shadows / local lights later.
 ------------------------------------------------------------
 
--- Screen-space AO is inlined below (a `def` taking a storage_image would be lowered
--- to a function with an image parameter, which the SPIR-V/naga logical model
--- forbids — image ops must reference a global). Kept inline in the map body.
+-- Screen-space AO and contact shadows are inlined below (a `def` taking a
+-- storage_image would be lowered to a function with an image parameter, which the
+-- SPIR-V/naga logical model forbids — image ops must reference a global). Kept
+-- inline in the map body. Values derived from the entry uniforms (resolution, cam)
+-- are copied into map-local bindings first, because a loop inside a `map` may not
+-- reference values bound outside the map (compiler panic; see COMPILER-NOTES.md).
 #[compute]
 entry light(pxl: []u32,
             #[uniform(set=1, binding=0)] iResolution: vec3f32,
+            #[uniform(set=1, binding=3)] iCam: vec4f32,
             #[view(g_albedo, storage_read)]  ga: storage_image,
             #[view(g_normal, storage_read)]  gn: storage_image,
             #[view(scene_depth, storage_read)] sd: storage_image,
             #[view(lit, storage_write)]       lt: storage_image)
   []u32 =
   map(|s|
-    let w = i32(iResolution.x)
-    let h = i32(iResolution.y)
+    let rx = iResolution.x
+    let ry = iResolution.y
+    let resl = @[rx, ry, 0.0]
+    let zoom = iCam.x
+    let sunv = sun
+    let w = i32(rx)
+    let h = i32(ry)
     let i = i32(s)
     let x = i % w
     let y = i / w
@@ -619,7 +629,20 @@ entry light(pxl: []u32,
             let nd = if inb then image_load(sd, @[nx, ny]).x else cd in
             if nd > 0.0 && nd < cd - 0.00004 then occ + 1.0 else occ
         let ao = occ / 8.0
-        let col = lit_ao(@[alb.x, alb.y, alb.z], n, ao)
+        -- Ray-marched contact shadow toward the sun (shadow.wyn owns the math;
+        -- only the depth read stays here, since a `def` can't take an image). March
+        -- from this pixel's reconstructed, surface-lifted world position; a step
+        -- that projects behind a nearer recorded surface blocks the sun.
+        let p = world_from_depth(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], zoom, cd) + n * SH_LIFT
+        let sh =
+          loop sh = 0.0 for k < 20 do
+            if sh > 0.5 then sh
+            else
+              let cq = world_to_clip(shadow_point(p, sunv, k), resl, zoom)
+              let (sx, sy, valid) = shadow_pixel(cq, rx, ry, w, h)
+              let surfd = if valid then image_load(sd, @[sx, sy]).x else 1.0 in
+              if shadow_occluded(cq, surfd) then 1.0 else sh
+        let col = lit_ao_sh(@[alb.x, alb.y, alb.z], n, ao, sh)
         let m = tonemap_aces(col) in
         @[m.x, m.y, m.z, 1.0]
     let _ = image_store(lt, @[x, y], out) in
