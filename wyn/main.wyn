@@ -310,12 +310,13 @@ entry scene_fragment(#[location(0)] kind: f32, #[location(1)] attr: f32,
 
 ------------------------------------------------------------
 -- Cobble setts: instanced proxy boxes (Tiny-Glade "tons of tiny instances").
--- `step` scatters a per-instance record (center, height, radius) into sett_inst;
--- this vertex places one proxy box per instance, scaled by the instance's random
--- height. A cell with height 0 (outside the cobble region) collapses to a point.
--- The fragment sphere-traces a rounded box of `radius` inside the proxy so the
--- silhouette rounds per instance; the proxy's outer extent IS the rounded box's,
--- so the trace starts on the proxy's front face.
+-- `cull` frustum-culls the running-bond cells and COMPACTS the visible ones into
+-- sett_inst (center, height, roundfrac); the instanced draw runs over that live
+-- count, so every instance reaching this vertex is visible. This vertex places one
+-- proxy box per instance, scaled by the instance's random height. The fragment
+-- sphere-traces a rounded box of `roundfrac` inside the proxy so the silhouette
+-- rounds per instance; the proxy's outer extent IS the rounded box's, so the trace
+-- starts on the proxy's front face.
 ------------------------------------------------------------
 
 #[vertex]
@@ -329,15 +330,14 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
   let inst = sett_inst[iid]
   let center = @[inst.x, inst.y]
   let height = inst.z
-  let keep = if height > 0.0 then 1.0 else 0.0
   -- Per-instance yaw (~+-7 deg) so rows aren't grid-perfect; the proxy box and
   -- the fragment's ray transform share this angle.
   let yaw = (brick_hash(iid + 31) - 0.5) * 0.24
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
   let local = box_pos[vid]
-  let sx = local.x * BRICK_W * keep
-  let sz = local.z * BRICK_L * keep
+  let sx = local.x * BRICK_W
+  let sz = local.z * BRICK_L
   let world = @[center.x + cw * sx - sw * sz,
                 local.y * height,
                 center.y + sw * sx + cw * sz] in
