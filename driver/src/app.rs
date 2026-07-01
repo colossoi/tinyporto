@@ -8,8 +8,9 @@
 
 use crate::generated::{
     cull_out_bytes, cull_stages, occ_reduce_out_bytes, occ_reduce_stages, step_out_bytes,
-    step_stages, walls_out_bytes, walls_stages, BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS,
-    BRICK_VERTEX_BINDINGS, CULL_BINDINGS, CULL_STAGE_COUNT, OCC_REDUCE_BINDINGS,
+    light_out_bytes, light_stages, step_stages, walls_out_bytes, walls_stages,
+    BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS, BRICK_VERTEX_BINDINGS, CULL_BINDINGS,
+    CULL_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS,
     OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
     SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, STEP_BINDINGS,
     STEP_STAGE_COUNT, WALLS_BINDINGS, WALLS_STAGE_COUNT,
@@ -35,6 +36,10 @@ const OTILE_BYTES: u64 = OCC_COUNT * 4;
 // domain the `walls` generator maps over (one slot per candidate brick).
 const WALL_BRICKS: u64 = 1920;
 const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
+// Deferred lighting dispatch: one invocation per window pixel (must match the
+// window size / iResolution — see occ_depth's note on window-relative sizing).
+const PXL_COUNT: u64 = 1280 * 800;
+const PXL_BYTES: u64 = PXL_COUNT * 4;
 
 // `step`'s output sizes, by binding, from the generated calc (the seed sizes are
 // baked in). The driver pairs this with the binding table to size each output
@@ -60,6 +65,11 @@ const fn walls_out(binding: u32) -> u64 {
     walls_out_bytes(binding, WBIDX_BYTES)
 }
 
+// `light`'s output size (its unused per-pixel dispatch-carrier buffer).
+const fn light_out(binding: u32) -> u64 {
+    light_out_bytes(binding, PXL_BYTES)
+}
+
 // Ordered compute stages per entry, dispatch sized from the seed counts. The
 // stage entry names and per-stage dispatch rules come from the descriptor (via
 // the generated `*_stages`); only the seed byte sizes are authored here.
@@ -67,6 +77,7 @@ static STEP_STAGES: [ComputeStage; STEP_STAGE_COUNT] = step_stages(IIDX_BYTES, P
 static CULL_STAGES: [ComputeStage; CULL_STAGE_COUNT] = cull_stages(BIDX_BYTES);
 static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OTILE_BYTES);
 static WALLS_STAGES: [ComputeStage; WALLS_STAGE_COUNT] = walls_stages(WBIDX_BYTES);
+static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_BYTES);
 
 pub const GRAPH: Graph = Graph {
     resources: &[
@@ -103,6 +114,10 @@ pub const GRAPH: Graph = Graph {
         // is the fullscreen-triangle draw (3 verts, 1 instance).
         Resource::Image { name: "g_albedo", format: TexFormat::Rgba8Unorm, size: ImgSize::Window, mips: 1 },
         Resource::Image { name: "g_normal", format: TexFormat::Rgba16Float, size: ImgSize::Window, mips: 1 },
+        // Deferred lighting: `light` writes the final `lit` image (over `pxl`, one
+        // per pixel); the resolve fragment copies it to the surface.
+        Resource::Image { name: "lit", format: TexFormat::Rgba16Float, size: ImgSize::Window, mips: 1 },
+        Resource::Buffer(BufferDef { name: "pxl", size: Some(PXL_BYTES), init: BufInit::Iota, indirect: false }),
         Resource::Buffer(BufferDef { name: "blit_args", size: Some(16), init: BufInit::U32s(&[3, 1, 0, 0]), indirect: true }),
         // Brick buildings: `wbidx` is the candidate-brick iota; `walls` compacts the
         // visible bricks into wall_brick_inst and writes wall_brick_args (its live
@@ -151,6 +166,10 @@ pub const GRAPH: Graph = Graph {
         ("walls_output_0", "wall_brick_inst"),
         ("walls_output_1", "wall_brick_args"),
         ("wall_brick_inst", "wall_brick_inst"),
+        // Deferred lighting I/O: `light` writes `lit` (view `lt`) over `pxl`; the
+        // resolve fragment reads it.
+        ("pxl", "pxl"),
+        ("lt", "lit"),
     ],
 
     passes: &[
@@ -237,8 +256,18 @@ pub const GRAPH: Graph = Graph {
             stages: &OCC_STAGES,
             out_bytes: occ_out,
         }),
-        // Deferred resolve: one fullscreen triangle reads the G-buffer and lights it
-        // into the surface. No depth (it covers every pixel unconditionally).
+        // Deferred lighting: one compute invocation per pixel reads the G-buffer,
+        // estimates SSAO from the depth neighbourhood, and writes the final `lit`
+        // image (sun + AO-attenuated sky, tonemapped).
+        Pass::Compute(ComputePass {
+            label: "light",
+            module: "main",
+            bindings: LIGHT_BINDINGS,
+            stages: &LIGHT_STAGES,
+            out_bytes: light_out,
+        }),
+        // Deferred resolve: one fullscreen triangle copies the lit image to the
+        // surface. No depth (it covers every pixel unconditionally).
         Pass::Render(RenderPass {
             label: "resolve",
             depth: None,

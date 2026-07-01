@@ -25,6 +25,14 @@ def lit(albedo: vec3f32, n: vec3f32) vec3f32 =
   let ndl = clamp01(dot(n, sun)) in
   albedo * (AMBIENT + SUN_COLOR * v3(ndl))
 
+-- As `lit`, but ambient occlusion `ao` in [0,1] attenuates the sky-ambient fill —
+-- crevices and contact points lose the ambient term and read as soft shadow. The
+-- direct sun term is untouched (AO models the sky, not the sun).
+def lit_ao(albedo: vec3f32, n: vec3f32, ao: f32) vec3f32 =
+  let ndl = clamp01(dot(n, sun))
+  let occ = 1.0 - 0.75 * clamp01(ao) in
+  albedo * (AMBIENT * v3(occ) + SUN_COLOR * v3(ndl))
+
 def tonemap_aces(x: vec3f32) vec3f32 =
   let a = 2.51
   let b = 0.03
