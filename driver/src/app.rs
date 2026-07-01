@@ -7,8 +7,9 @@
 //! per-frame schedule.
 
 use crate::generated::{
-    step_dispatch, step_out_bytes, SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS,
-    SETT_VERTEX_BINDINGS, STEP_BINDINGS,
+    cull_out_bytes, cull_stages, step_out_bytes, step_stages, CULL_BINDINGS, CULL_STAGE_COUNT,
+    SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS,
+    STEP_BINDINGS, STEP_STAGE_COUNT,
 };
 use crate::graph::*;
 
@@ -28,8 +29,20 @@ const BIDX_BYTES: u64 = BRICK_COUNT * 4;
 // baked in). The driver pairs this with the binding table to size each output
 // buffer by name — no output binding numbers appear here.
 const fn step_out(binding: u32) -> u64 {
-    step_out_bytes(binding, BIDX_BYTES, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
+    step_out_bytes(binding, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
 }
+
+// `cull`'s output sizes (compacted sett records + draw args + scratch count),
+// derived from the brick-grid seed size.
+const fn cull_out(binding: u32) -> u64 {
+    cull_out_bytes(binding, BIDX_BYTES)
+}
+
+// Ordered compute stages per entry, dispatch sized from the seed counts. The
+// stage entry names and per-stage dispatch rules come from the descriptor (via
+// the generated `*_stages`); only the seed byte sizes are authored here.
+static STEP_STAGES: [ComputeStage; STEP_STAGE_COUNT] = step_stages(IIDX_BYTES, PIDX_BYTES, TIDX_BYTES);
+static CULL_STAGES: [ComputeStage; CULL_STAGE_COUNT] = cull_stages(BIDX_BYTES);
 
 pub const GRAPH: Graph = Graph {
     resources: &[
@@ -79,8 +92,8 @@ pub const GRAPH: Graph = Graph {
         ("step_output_4", "geom_pos"),
         ("step_output_5", "geom_nrm"),
         ("step_output_6", "draw_args"),
-        ("step_output_7", "sett_inst"),
-        ("step_output_8", "sett_args"),
+        ("cull_output_0", "sett_inst"),
+        ("cull_output_1", "sett_args"),
         ("geom_pos", "geom_pos"),
         ("geom_nrm", "geom_nrm"),
         ("sett_inst", "sett_inst"),
@@ -91,10 +104,19 @@ pub const GRAPH: Graph = Graph {
         Pass::Compute(ComputePass {
             label: "step",
             module: "main",
-            entry: "step",
             bindings: STEP_BINDINGS,
-            groups: step_dispatch(TIDX_BYTES)[0],
+            stages: &STEP_STAGES,
             out_bytes: step_out,
+        }),
+        // Nine's simple path: build a record per brick cell, frustum/region cull +
+        // compact to the visible ones, and write the instanced draw's args from the
+        // live count. Outputs the compacted sett_inst + sett_args.
+        Pass::Compute(ComputePass {
+            label: "cull",
+            module: "main",
+            bindings: CULL_BINDINGS,
+            stages: &CULL_STAGES,
+            out_bytes: cull_out,
         }),
         // Scene: the flat ground (materialized ribbon), then the instanced cobble
         // setts. Both depth-tested; the setts protrude and self-occlude.

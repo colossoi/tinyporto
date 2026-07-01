@@ -102,13 +102,13 @@ def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
 -- tidx is first so the compiler derives the dispatch from it: it's the largest
 -- map (the ribbon), and the smaller maps (points/items) run guarded within it.
 #[compute]
-entry step(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32,
+entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
            #[uniform(set=1, binding=0)] iResolution: vec3f32,
            #[uniform(set=1, binding=1)] iMouse: vec4f32,
            #[uniform(set=1, binding=3)] iCam: vec4f32,
            #[uniform(set=1, binding=7)] iKeys: vec4u32)
-  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32, []vec4f32, []u32) =
+  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
   -- UI: cycle tool on a Tab pulse; toggle the overlay on its pulse.
   let tool0 = uistate_in[0]
   let ovl0 = uistate_in[1]
@@ -229,31 +229,45 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32,
 
   -- Non-indexed draw_indirect args for the ground: the whole geom buffer (base
   -- quad + all item slots; unused slots are degenerate).
-  let draw_args = [u32(TESS_CAP), 1u32, 0u32, 0u32]
+  let draw_args = [u32(TESS_CAP), 1u32, 0u32, 0u32] in
 
-  -- Cobble setts as instances: one record per running-bond cell, scattered over
-  -- bidx. Each is (center.x, center.z, height, roundfrac); height and roundfrac
-  -- are jittered per cell (Tiny-Glade per-instance variation), and cells outside
-  -- the cobble region get height 0 so their proxy box collapses. roundfrac is the
-  -- corner radius as a fraction of the brick's min half-extent, so the fragment
-  -- can clamp-free-ly raymarch a rounded box that varies per instance.
-  let sett_inst =
+  (uistate_out, points_out, items_out, head_out, geom_pos, geom_nrm, draw_args)
+
+------------------------------------------------------------
+-- Cull (Nine's simple path). One record per running-bond cell is built, then
+-- `filter` keeps only the visible ones (in the cobble region AND the view
+-- frustum) and COMPACTS them — so the instanced draw runs over the live count,
+-- not the whole grid. The fused `filter` is one compute pipeline; it emits the
+-- compacted records plus a scratch count, and we hand back draw args built from
+-- `length`. Output 0 = compacted sett_inst, output 1 = sett_args.
+------------------------------------------------------------
+
+#[compute]
+entry cull(bidx: []u32,
+           #[uniform(set=1, binding=0)] iResolution: vec3f32,
+           #[uniform(set=1, binding=3)] iCam: vec4f32)
+  (?k. [k]vec4f32, [4]u32) =
+  -- Build one candidate record per cell, then `filter` keeps only the visible ones
+  -- (cobble region AND view frustum) and COMPACTS them into a dense prefix — so the
+  -- instanced draw runs over the live count, not the whole grid. Culled records get
+  -- height = 0 so the predicate drops them; the compacted length becomes
+  -- instance_count. Output 0 = compacted sett_inst, output 1 = sett_args.
+  let cand =
     map(|s|
       let i = i32(s)
       let base = brick_center(i)
       let jx = (brick_hash(i + 13) - 0.5) * 0.04
       let jz = (brick_hash(i + 53) - 0.5) * 0.04
       let center = @[base.x + jx, base.y + jz]
-      let inside = magnitude(center) < 8.0
-      let height = if inside then BRICK_H * (0.9 + 0.2 * brick_hash(i)) else 0.0
+      let keep = magnitude(center) < 8.0
+                 && frustum_keep(@[center.x, BRICK_H * 0.5, center.y], iResolution, iCam.x)
+      let height = if keep then BRICK_H * (0.9 + 0.2 * brick_hash(i)) else 0.0
       let roundfrac = 0.05 + 0.95 * brick_hash(i + 7919) in
       @[center.x, center.y, height, roundfrac]
       , bidx)
-
-  -- Instanced draw args: 36 proxy-box verts, BRICK_COUNT instances.
-  let sett_args = [36u32, u32(BRICK_COUNT), 0u32, 0u32] in
-
-  (uistate_out, points_out, items_out, head_out, geom_pos, geom_nrm, draw_args, sett_inst, sett_args)
+  let inst = filter(|c| c.z > 0.0, cand)
+  let n = length(inst) in
+  (inst, [36u32, u32(n), 0u32, 0u32])
 
 ------------------------------------------------------------
 -- Scene (one thin vertex + one fragment for the whole scene). The vertex pulls a
@@ -352,7 +366,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
   let sw = f32.sin(yaw)
   let rd = normalize(world - cam_eye(iCam.x))
   let (t, hit) =
-    loop (t, hit) = (0.0, false) for _i < 32 do
+    loop (t, hit) = (0.0, false) for _i < 16 do
       if hit then (t, hit)
       else
         let rel = (world + rd * t) - bcenter

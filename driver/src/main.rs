@@ -69,10 +69,11 @@ impl Default for Input {
 
 // `sets` is indexed by frame parity (len 1 if the pass has no ping-pong
 // binding, else 2). Each entry is the (set, bind group) list for that parity.
+// `stages` are the ordered (pipeline, dispatch-dims) the entry lowered to; they
+// share `sets` (one binding interface) and run sequentially.
 struct BuiltCompute {
-    pipeline: wgpu::ComputePipeline,
+    stages: Vec<(wgpu::ComputePipeline, [u32; 3])>,
     sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
-    groups: u32,
 }
 
 struct BuiltItem {
@@ -118,7 +119,7 @@ impl Renderer {
         for pass in graph.passes {
             if let Pass::Compute(cp) = pass {
                 for &(_, binding, kind, name) in cp.bindings {
-                    if matches!(kind, BindingKind::StorageWrite) {
+                    if matches!(kind, BindingKind::StorageWrite | BindingKind::StorageReadWrite) {
                         derived.insert(name_to_resource(graph, name), (cp.out_bytes)(binding));
                     }
                 }
@@ -150,6 +151,14 @@ impl Renderer {
                     pingpong.insert(name, [a, b]);
                 }
                 Resource::Depth => has_depth = true,
+            }
+        }
+        // Compiler-internal scratch: any sized write whose name no graph resource
+        // claimed (e.g. a fused `filter`'s gather/count buffer). Auto-allocate it,
+        // keyed by the binding name, so the pass can bind it.
+        for (&name, &size) in &derived {
+            if !buffers.contains_key(name) && !pingpong.contains_key(name) {
+                buffers.insert(name, make_storage_raw(device, name, size, false));
             }
         }
         let depth_view =
@@ -225,11 +234,17 @@ impl Renderer {
                         label: Some("compute"),
                         timestamp_writes: None,
                     });
-                    cp.set_pipeline(&c.pipeline);
-                    for (set, bg) in &c.sets[parity % c.sets.len()] {
-                        cp.set_bind_group(*set, bg, &[]);
+                    let set_list = &c.sets[parity % c.sets.len()];
+                    // Stages share the binding interface; each writes disjoint
+                    // outputs from the shared inputs, so order is free — run them
+                    // in sequence within the one pass.
+                    for (pipeline, groups) in &c.stages {
+                        cp.set_pipeline(pipeline);
+                        for (set, bg) in set_list {
+                            cp.set_bind_group(*set, bg, &[]);
+                        }
+                        cp.dispatch_workgroups(groups[0], groups[1], groups[2]);
                     }
-                    cp.dispatch_workgroups(c.groups, 1, 1);
                 }
                 BuiltPass::Render(r) => {
                     let depth_attach = if r.depth.is_some() {
@@ -310,26 +325,32 @@ impl Renderer {
 
         // Script a water-stroke drag across the middle of the screen, then release,
         // so the shot exercises capture -> tessellation -> ribbon, not just the base.
-        let total = 60u32;
+        let total = 20u32;
+        let mut frame_ms: Vec<f32> = Vec::new();
         for f in 0..total {
             let t = f as f32 / (total - 1).max(1) as f32;
             // A curved sweep (one sine arch) so the ribbon shows the spline curving.
             let input = Input {
                 mouse_x: (0.25 + 0.50 * t) * w as f32,
                 mouse_y: (0.5 - 0.18 * (t * std::f32::consts::PI).sin()) * h as f32,
-                held: f + 6 < total, // release near the end
+                held: f + 4 < total, // release near the end
                 ..Input::default()
             };
             self.update_uniforms(&input);
+            let t0 = Instant::now();
             let mut enc = self
                 .gfx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
             self.record(&mut enc, &view);
             self.gfx.queue.submit(Some(enc.finish()));
-            self.frame = self.frame.wrapping_add(1);
             let _ = self.gfx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
+            self.frame = self.frame.wrapping_add(1);
         }
+        let mut steady: Vec<f32> = frame_ms.split_off(5);
+        steady.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("frame time: median {:.1} ms", steady[steady.len() / 2]);
 
         // Read the offscreen texture back (rows padded to 256 bytes).
         let bpp = 4u32;
@@ -432,14 +453,16 @@ fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 
 // ---- bind groups (shared by compute + render) ----
 
-/// Map a shader binding name to its resource name (via `graph.names`).
-fn name_to_resource(graph: &Graph, binding_name: &str) -> &'static str {
+/// Map a shader binding name to its resource name (via `graph.names`). An
+/// unmapped name is a compiler-internal scratch buffer (e.g. a `filter`'s gather
+/// buffer); it resolves to itself and is auto-allocated.
+fn name_to_resource(graph: &Graph, binding_name: &'static str) -> &'static str {
     graph
         .names
         .iter()
         .find(|(n, _)| *n == binding_name)
         .map(|(_, r)| *r)
-        .unwrap_or_else(|| panic!("no resource mapping for binding '{binding_name}'"))
+        .unwrap_or(binding_name)
 }
 
 /// Resolve a generated binding table into driver `Binding`s: map each shader
@@ -512,7 +535,9 @@ fn build_sets(
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
-                    BindingKind::StorageRead | BindingKind::StorageWrite => {
+                    BindingKind::StorageRead
+                    | BindingKind::StorageWrite
+                    | BindingKind::StorageReadWrite => {
                         wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage {
                                 read_only: matches!(b.kind, BindingKind::StorageRead),
@@ -564,19 +589,28 @@ fn build_compute(
         bind_group_layouts: &layout_refs,
         push_constant_ranges: &[],
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(cp.label),
-        layout: Some(&pl),
-        module,
-        entry_point: Some(cp.entry),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
+    // One pipeline per ordered stage, all sharing the pass's layout (the full
+    // binding interface; a stage that touches only some bindings is fine).
+    let stages = cp
+        .stages
+        .iter()
+        .map(|st| {
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(st.entry),
+                layout: Some(&pl),
+                module,
+                entry_point: Some(st.entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+            (pipeline, st.groups)
+        })
+        .collect();
     let mut sets = vec![sets0];
     for p in 1..variant_count(&binds) {
         sets.push(build_sets(device, cp.label, &binds, wgpu::ShaderStages::COMPUTE, buffers, pp, p).1);
     }
-    BuiltCompute { pipeline, sets, groups: cp.groups }
+    BuiltCompute { stages, sets }
 }
 
 fn build_item(

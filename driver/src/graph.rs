@@ -73,6 +73,10 @@ pub enum BindingKind {
     Uniform,
     StorageRead,
     StorageWrite,
+    /// Read and written by the shader (e.g. a fused `filter`'s scan/gather scratch,
+    /// which one stage fills and a later stage consumes in place). Non-read-only in
+    /// the layout; auto-sized/allocated as scratch like a StorageWrite output.
+    StorageReadWrite,
 }
 
 /// One generated binding row: (set, binding, kind, shader-param name). The driver
@@ -89,16 +93,26 @@ pub struct Binding {
     pub role: Role,
 }
 
-/// A compute pass: one entry, its generated binding table, a dispatch count, and
-/// the generated size calc for its output bindings (used to derive the byte sizes
-/// of buffers this pass writes).
+/// One ordered stage of a compute pass: an entry point and its workgroup dispatch
+/// dims. A Wyn compute entry lowers to one stage per output domain (e.g. `step` →
+/// six: one fixed-grid kernel per fixed output, one input-sized kernel per `map`),
+/// which the descriptor names in order. The stages of a pass share its binding
+/// interface and run sequentially.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputeStage {
+    pub entry: &'static str,
+    pub groups: [u32; 3],
+}
+
+/// A compute pass: its generated binding table, the ordered stages it lowers to
+/// (each with its own dispatch), and the generated size calc for its output
+/// bindings (used to derive the byte sizes of buffers this pass writes).
 #[derive(Clone, Copy, Debug)]
 pub struct ComputePass {
     pub label: &'static str,
     pub module: &'static str,
-    pub entry: &'static str,
     pub bindings: BindTable,
-    pub groups: u32,
+    pub stages: &'static [ComputeStage],
     pub out_bytes: fn(u32) -> u64,
 }
 

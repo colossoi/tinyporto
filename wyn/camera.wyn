@@ -82,3 +82,11 @@ def world_to_clip(p: vec3f32, resolution: vec3f32, zoom: f32) vec4f32 =
   let view = look_at(eye, LOOKAT, @[0.0, 1.0, 0.0])
   let proj = perspective(FOV, aspect, 0.1, 1000.0) in
   proj * (view * @[p.x, p.y, p.z, 1.0])
+
+-- Is world point `p` inside the view frustum? Projects to clip space and tests
+-- the clip bounds with a margin (so a small prop straddling an edge isn't culled
+-- by its center). Used to cull instances before drawing.
+def frustum_keep(p: vec3f32, resolution: vec3f32, zoom: f32) bool =
+  let c = world_to_clip(p, resolution, zoom)
+  let w = c.w * 1.15 in
+  c.w > 0.0 && f32.abs(c.x) < w && f32.abs(c.y) < w && c.z > 0.0 - 0.1 && c.z < c.w + 0.1
