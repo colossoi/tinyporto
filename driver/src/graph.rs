@@ -56,6 +56,12 @@ pub enum Resource {
     PingPong { name: &'static str, size: Option<u64> },
     /// A window-sized depth texture (recreated on resize). One per graph.
     Depth,
+    /// A 2D image backing `storage_image` and/or sampled `texture2d` views. `mips`
+    /// > 1 builds a pyramid (Hi-Z). Storage/texture/copy usages are derived from
+    /// how the graph's bindings reference it.
+    Image { name: &'static str, format: TexFormat, size: ImgSize, mips: u32 },
+    /// A filtering sampler bound to `sampler` params.
+    Sampler { name: &'static str },
 }
 
 /// How a binding resolves a ping-pong resource for the current frame.
@@ -64,6 +70,32 @@ pub enum Role {
     Plain,
     Prev,
     Next,
+}
+
+/// Pixel format for image / storage-image resources. Mirrors the descriptor's
+/// `format` strings (and a `resource`'s `format` field).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TexFormat {
+    Rgba8Unorm,
+    Rgba16Float,
+    Rgba32Float,
+    R32Float,
+}
+
+/// How a compute shader touches a `storage_image` view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ImgAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Extent of an image resource: track the swapchain, or a fixed size.
+#[derive(Clone, Copy, Debug)]
+pub enum ImgSize {
+    /// Recreated on resize to match the surface (Hi-Z, G-buffer).
+    Window,
+    Fixed { w: u32, h: u32 },
 }
 
 /// How a (set, binding) slot is typed in the shader. Matches the values the
@@ -77,6 +109,13 @@ pub enum BindingKind {
     /// which one stage fills and a later stage consumes in place). Non-read-only in
     /// the layout; auto-sized/allocated as scratch like a StorageWrite output.
     StorageReadWrite,
+    /// A sampled `texture2d` (f32, 2D, filterable — Wyn's texture2d is monomorphic).
+    Texture,
+    /// A filtering `sampler`.
+    Sampler,
+    /// A `storage_image` view: fixed `vec4f32` texels; `format` is the on-GPU pixel
+    /// format and `access` is how the shader reads/writes it.
+    StorageImage { format: TexFormat, access: ImgAccess },
 }
 
 /// One generated binding row: (set, binding, kind, shader-param name). The driver
@@ -135,13 +174,25 @@ pub struct RenderItem {
     pub depth_write: bool,
 }
 
-/// A render pass: the surface color (+ optional depth) and items drawn in order.
+/// One color attachment of a render pass, in shader `location` order. `target:
+/// None` is the swapchain surface (or screenshot view); `Some(name)` is a
+/// graph-owned `Image` resource (e.g. an MRT linear-depth target the Hi-Z reduce
+/// reads). `format` is ignored for the surface (it uses the surface format).
+#[derive(Clone, Copy, Debug)]
+pub struct ColorTarget {
+    pub target: Option<&'static str>,
+    pub format: Option<TexFormat>,
+    pub clear: [f64; 4],
+}
+
+/// A render pass: its color attachments (location 0 first; every item's fragment
+/// writes all of them), an optional depth attachment, and items drawn in order.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderPass {
     #[allow(dead_code)]
     pub label: &'static str,
     pub depth: Option<&'static str>,
-    pub clear: [f64; 4],
+    pub color: &'static [ColorTarget],
     pub items: &'static [RenderItem],
 }
 

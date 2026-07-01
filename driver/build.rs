@@ -44,17 +44,45 @@ struct Binding {
     name: String,
     #[serde(default)]
     length: Option<Length>,
+    /// Pixel format for `storage_texture` bindings (e.g. "rgba32_float").
+    #[serde(default)]
+    format: Option<String>,
 }
 
 impl Binding {
-    /// The `BindingKind` token for this binding (uniform / storage read / write).
+    /// The `BindingKind` token for this binding (buffer / texture / sampler /
+    /// storage-image). Texture/sampler/storage_texture come from `#[texture]`,
+    /// `#[sampler]`, and `storage_image` views.
     fn kind_tokens(&self) -> TokenStream {
         match (self.ty.as_str(), self.access.as_deref()) {
             ("uniform", _) => quote! { BindingKind::Uniform },
             ("storage_buffer", Some("write_only")) => quote! { BindingKind::StorageWrite },
             ("storage_buffer", Some("read_write")) => quote! { BindingKind::StorageReadWrite },
             ("storage_buffer", _) => quote! { BindingKind::StorageRead },
+            ("texture", _) => quote! { BindingKind::Texture },
+            ("sampler", _) => quote! { BindingKind::Sampler },
+            ("storage_texture", acc) => {
+                let format = self.format_tokens();
+                let access = match acc {
+                    Some("read_only") => quote! { ImgAccess::Read },
+                    Some("write_only") => quote! { ImgAccess::Write },
+                    Some("read_write") => quote! { ImgAccess::ReadWrite },
+                    other => panic!("descriptor: storage_texture access {other:?}"),
+                };
+                quote! { BindingKind::StorageImage { format: #format, access: #access } }
+            }
             (other, _) => panic!("descriptor: unhandled binding type {other:?}"),
+        }
+    }
+
+    /// The `TexFormat` token for a `storage_texture`'s `format` field.
+    fn format_tokens(&self) -> TokenStream {
+        match self.format.as_deref() {
+            Some("rgba8_unorm") => quote! { TexFormat::Rgba8Unorm },
+            Some("rgba16_float") => quote! { TexFormat::Rgba16Float },
+            Some("rgba32_float") => quote! { TexFormat::Rgba32Float },
+            Some("r32_float") => quote! { TexFormat::R32Float },
+            other => panic!("descriptor: storage_texture format {other:?}"),
         }
     }
 }
@@ -218,10 +246,18 @@ fn codegen_bindings(p: &Pipeline) -> TokenStream {
         return quote! {};
     }
     let table = id(&format!("{}_BINDINGS", base_entry(p).to_uppercase()));
-    let rows = p.bindings.iter().map(|b| {
-        let (set, binding, kind, name) = (b.set, b.binding, b.kind_tokens(), &b.name);
-        quote! { (#set, #binding, #kind, #name) }
-    });
+    // Dedup by (set, binding): the descriptor lists a storage-image resource once
+    // per view kind, so the same slot can appear twice — one layout entry per slot.
+    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let rows: Vec<TokenStream> = p
+        .bindings
+        .iter()
+        .filter(|b| seen.insert((b.set, b.binding)))
+        .map(|b| {
+            let (set, binding, kind, name) = (b.set, b.binding, b.kind_tokens(), &b.name);
+            quote! { (#set, #binding, #kind, #name) }
+        })
+        .collect();
     quote! {
         pub static #table: &[(u32, u32, BindingKind, &str)] = &[#(#rows),*];
     }
@@ -238,7 +274,7 @@ fn main() {
     // One codegen path (quote). Each root contributes its embedded-SPIR-V row and
     // its descriptor translation; everything is emitted into a single file.
     let mut shader_rows: Vec<TokenStream> = Vec::new();
-    let mut codegen = quote! { use crate::graph::BindingKind; };
+    let mut codegen = quote! { use crate::graph::{BindingKind, ImgAccess, TexFormat}; };
 
     for (key, rel) in ROOTS {
         let src = repo.join(rel);

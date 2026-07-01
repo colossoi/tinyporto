@@ -7,7 +7,8 @@
 //! per-frame schedule.
 
 use crate::generated::{
-    cull_out_bytes, cull_stages, step_out_bytes, step_stages, CULL_BINDINGS, CULL_STAGE_COUNT,
+    cull_out_bytes, cull_stages, occ_reduce_out_bytes, occ_reduce_stages, step_out_bytes,
+    step_stages, CULL_BINDINGS, CULL_STAGE_COUNT, OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT,
     SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS,
     STEP_BINDINGS, STEP_STAGE_COUNT,
 };
@@ -24,6 +25,10 @@ const TIDX_BYTES: u64 = TESS_CAP * 4;
 const PIDX_BYTES: u64 = POINTS_CAP * 4;
 const IIDX_BYTES: u64 = ITEMS_CAP * 4;
 const BIDX_BYTES: u64 = BRICK_COUNT * 4;
+// Coarse occlusion grid (Hi-Z simple): window (1280x800) / 8. `otile` is its iota
+// dispatch domain (one invocation per coarse texel).
+const OCC_COUNT: u64 = 160 * 100;
+const OTILE_BYTES: u64 = OCC_COUNT * 4;
 
 // `step`'s output sizes, by binding, from the generated calc (the seed sizes are
 // baked in). The driver pairs this with the binding table to size each output
@@ -38,11 +43,17 @@ const fn cull_out(binding: u32) -> u64 {
     cull_out_bytes(binding, BIDX_BYTES)
 }
 
+// `occ_reduce`'s output size (its unused dispatch-carrier buffer), from the iota.
+const fn occ_out(binding: u32) -> u64 {
+    occ_reduce_out_bytes(binding, OTILE_BYTES)
+}
+
 // Ordered compute stages per entry, dispatch sized from the seed counts. The
 // stage entry names and per-stage dispatch rules come from the descriptor (via
 // the generated `*_stages`); only the seed byte sizes are authored here.
 static STEP_STAGES: [ComputeStage; STEP_STAGE_COUNT] = step_stages(IIDX_BYTES, PIDX_BYTES, TIDX_BYTES);
 static CULL_STAGES: [ComputeStage; CULL_STAGE_COUNT] = cull_stages(BIDX_BYTES);
+static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OTILE_BYTES);
 
 pub const GRAPH: Graph = Graph {
     resources: &[
@@ -68,6 +79,12 @@ pub const GRAPH: Graph = Graph {
         Resource::Buffer(BufferDef { name: "sett_inst", size: None, init: BufInit::Zeroed, indirect: false }),
         Resource::Buffer(BufferDef { name: "sett_args", size: None, init: BufInit::Zeroed, indirect: true }),
         Resource::Depth,
+        // Nine Phase 2 (Hi-Z): the scene writes window-space depth here as a second
+        // MRT target; `occ_reduce` mins it into the coarse occ_depth, which `cull`
+        // reads to occlusion-test candidates. `otile` is occ_reduce's iota domain.
+        Resource::Image { name: "scene_depth", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
+        Resource::Image { name: "occ_depth", format: TexFormat::R32Float, size: ImgSize::Fixed { w: 160, h: 100 }, mips: 1 },
+        Resource::Buffer(BufferDef { name: "otile", size: Some(OTILE_BYTES), init: BufInit::Iota, indirect: false }),
     ],
 
     // Shader binding name -> resource name. Roles (prev/next/plain) are derived
@@ -97,6 +114,10 @@ pub const GRAPH: Graph = Graph {
         ("geom_pos", "geom_pos"),
         ("geom_nrm", "geom_nrm"),
         ("sett_inst", "sett_inst"),
+        // Hi-Z occlusion image views (`sd`/`od` are the shader param names).
+        ("od", "occ_depth"),
+        ("sd", "scene_depth"),
+        ("otile", "otile"),
     ],
 
     passes: &[
@@ -123,7 +144,12 @@ pub const GRAPH: Graph = Graph {
         Pass::Render(RenderPass {
             label: "scene",
             depth: Some("depth"),
-            clear: [0.74, 0.80, 0.86, 1.0],
+            // Location 0: surface color. Location 1: window-space depth (R32Float),
+            // cleared to the far plane (1.0), for the Hi-Z pyramid.
+            color: &[
+                ColorTarget { target: None, format: None, clear: [0.74, 0.80, 0.86, 1.0] },
+                ColorTarget { target: Some("scene_depth"), format: Some(TexFormat::R32Float), clear: [1.0, 1.0, 1.0, 1.0] },
+            ],
             items: &[
                 RenderItem {
                     label: "ground",
@@ -146,6 +172,16 @@ pub const GRAPH: Graph = Graph {
                     depth_write: true,
                 },
             ],
+        }),
+        // Hi-Z reduce: min the scene depth (written by the pass above) into the
+        // coarse occ_depth. Runs last so it sees this frame's depth; `cull` reads
+        // the result next frame. No visible output — pure occlusion bookkeeping.
+        Pass::Compute(ComputePass {
+            label: "occ_reduce",
+            module: "main",
+            bindings: OCC_REDUCE_BINDINGS,
+            stages: &OCC_STAGES,
+            out_bytes: occ_out,
         }),
     ],
 };

@@ -234,24 +234,49 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   (uistate_out, points_out, items_out, head_out, geom_pos, geom_nrm, draw_args)
 
 ------------------------------------------------------------
+-- Hi-Z occlusion (Nine, simple single-level form). The scene writes window-space
+-- depth into scene_depth (MRT); `occ_reduce` mins it down to a coarse occ_depth
+-- (one texel per OCC_TILE^2 block); `cull` projects each candidate sett and drops
+-- it if it lies behind the nearest recorded surface in its tile. This is a
+-- degenerate one-level Hi-Z: a full mip pyramid + the two-pass prev-visible
+-- refinement is later work. cull reads the PREVIOUS frame's occ_depth (occ_reduce
+-- runs after the scene pass), a one-frame lag imperceptible for a slow orbit.
+------------------------------------------------------------
+
+def OCC_TILE: i32 = 8    -- source pixels per coarse texel, per axis
+def OCC_W: i32 = 160     -- coarse grid = window (1280x800) / OCC_TILE
+def OCC_H: i32 = 100
+
+resource scene_depth: image2d {
+  format = r32float
+  size   = window
+  usages = [storage_read]
+}
+
+resource occ_depth: image2d {
+  format = r32float
+  size   = 160x100
+  usages = [storage_read, storage_write]
+}
+
+------------------------------------------------------------
 -- Cull (Nine's simple path). One record per running-bond cell is built, then
--- `filter` keeps only the visible ones (in the cobble region AND the view
--- frustum) and COMPACTS them — so the instanced draw runs over the live count,
--- not the whole grid. The fused `filter` is one compute pipeline; it emits the
--- compacted records plus a scratch count, and we hand back draw args built from
--- `length`. Output 0 = compacted sett_inst, output 1 = sett_args.
+-- `filter` keeps only the visible ones (in the cobble region, the view frustum,
+-- AND not occluded) and COMPACTS them — so the instanced draw runs over the live
+-- count, not the whole grid. The fused `filter` is one compute pipeline; it emits
+-- the compacted records plus a scratch count, and we hand back draw args built
+-- from `length`. Output 0 = compacted sett_inst, output 1 = sett_args.
 ------------------------------------------------------------
 
 #[compute]
 entry cull(bidx: []u32,
            #[uniform(set=1, binding=0)] iResolution: vec3f32,
-           #[uniform(set=1, binding=3)] iCam: vec4f32)
+           #[uniform(set=1, binding=3)] iCam: vec4f32,
+           #[view(occ_depth, storage_read)] od: storage_image)
   (?k. [k]vec4f32, [4]u32) =
   -- Build one candidate record per cell, then `filter` keeps only the visible ones
-  -- (cobble region AND view frustum) and COMPACTS them into a dense prefix — so the
-  -- instanced draw runs over the live count, not the whole grid. Culled records get
-  -- height = 0 so the predicate drops them; the compacted length becomes
-  -- instance_count. Output 0 = compacted sett_inst, output 1 = sett_args.
+  -- and COMPACTS them into a dense prefix. Culled records get height = 0 so the
+  -- predicate drops them; the compacted length becomes instance_count.
   let cand =
     map(|s|
       let i = i32(s)
@@ -259,8 +284,20 @@ entry cull(bidx: []u32,
       let jx = (brick_hash(i + 13) - 0.5) * 0.04
       let jz = (brick_hash(i + 53) - 0.5) * 0.04
       let center = @[base.x + jx, base.y + jz]
-      let keep = magnitude(center) < 8.0
-                 && frustum_keep(@[center.x, BRICK_H * 0.5, center.y], iResolution, iCam.x)
+      let c3 = @[center.x, BRICK_H * 0.5, center.y]
+      let visible = magnitude(center) < 8.0 && frustum_keep(c3, iResolution, iCam.x)
+      -- Occlusion: project the sett centre and compare its depth to the nearest
+      -- surface recorded in its coarse tile. Behind it (by a bias) => occluded.
+      let clip = world_to_clip(c3, iResolution, iCam.x)
+      let occluded =
+        if clip.w <= 0.0 then false
+        else
+          let ndcz = clip.z / clip.w
+          let px = f32.max(0.0, f32.min(iResolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * iResolution.x))
+          let py = f32.max(0.0, f32.min(iResolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * iResolution.y))
+          let occ = image_load(od, @[i32(px) / OCC_TILE, i32(py) / OCC_TILE]).x in
+          occ < 0.9999 && ndcz > occ + 0.02
+      let keep = visible && (!occluded)
       let height = if keep then BRICK_H * (0.9 + 0.2 * brick_hash(i)) else 0.0
       let roundfrac = 0.05 + 0.95 * brick_hash(i + 7919) in
       @[center.x, center.y, height, roundfrac]
@@ -268,6 +305,28 @@ entry cull(bidx: []u32,
   let inst = filter(|c| c.z > 0.0, cand)
   let n = length(inst) in
   (inst, [36u32, u32(n), 0u32, 0u32])
+
+-- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
+-- block of scene_depth under it. Runs after the scene pass; cull reads it next
+-- frame. The `[]u32` output is a required dispatch-domain carrier (unused).
+#[compute]
+entry occ_reduce(otile: []u32,
+                 #[view(scene_depth, storage_read)] sd: storage_image,
+                 #[view(occ_depth, storage_write)]  od: storage_image)
+  []u32 =
+  map(|s|
+    let i = i32(s)
+    let tx = i % OCC_W
+    let ty = i / OCC_W
+    let m =
+      loop m = 1.0 for k < 64 do
+        let sx = tx * OCC_TILE + (k % OCC_TILE)
+        let sy = ty * OCC_TILE + (k / OCC_TILE)
+        let v = image_load(sd, @[sx, sy]) in
+        f32.min(m, v.x)
+    let _ = image_store(od, @[tx, ty], @[m, m, m, m]) in
+    0u32
+    , otile)
 
 ------------------------------------------------------------
 -- Scene (one thin vertex + one fragment for the whole scene). The vertex pulls a
@@ -296,17 +355,20 @@ def item_color(kind: f32) vec3f32 =
 
 -- Shade one ground fragment: material color from `kind`, a darker edging course
 -- near a stroke boundary (|attr| -> 1), lit by the (up) normal, then tonemapped.
+-- Location 1 writes window-space depth (frag_coord.z) into the scene_depth MRT
+-- target for the Hi-Z pyramid (Nine Phase 2); location 0 is the shaded color.
 #[fragment]
 entry scene_fragment(#[location(0)] kind: f32, #[location(1)] attr: f32,
-                     #[location(2)] normal: vec3f32)
-  #[location(0)] vec4f32 =
+                     #[location(2)] normal: vec3f32,
+                     #[builtin(frag_coord)] fc: vec4f32)
+  (#[location(0)] vec4f32, #[location(1)] f32) =
   let nrm = normalize(normal)
   let base = item_color(kind)
   let edge = smoothstep(0.78, 1.0, f32.abs(attr))
   let surf = mix(base, OUTLINE_COLOR, edge * 0.5)
   let col = lit(surf, nrm)
   let m = tonemap_aces(col) in
-  @[m.x, m.y, m.z, 1.0]
+  (@[m.x, m.y, m.z, 1.0], fc.z)
 
 ------------------------------------------------------------
 -- Cobble setts: instanced proxy boxes (Tiny-Glade "tons of tiny instances").
@@ -352,7 +414,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
                     #[location(2)] var: f32, #[location(3)] yaw: f32,
                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
                     #[uniform(set=1, binding=3)] iCam: vec4f32)
-  (#[location(0)] vec4f32, #[builtin(frag_depth)] f32) =
+  (#[location(0)] vec4f32, #[location(1)] f32, #[builtin(frag_depth)] f32) =
   let height = inst.z
   let bcenter = @[inst.x, height * 0.5, inst.y]
   let half = @[BRICK_W * 0.5, height * 0.5, BRICK_L * 0.5]
@@ -381,7 +443,10 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
     let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
     let clip = world_to_clip(pos, iResolution, iCam.x)
     let col = lit(COBBLE_BASE * v3(0.8 + 0.4 * var), n)
-    let m = tonemap_aces(col) in
-    (@[m.x, m.y, m.z, 1.0], clip.z / clip.w)
+    let m = tonemap_aces(col)
+    let d = clip.z / clip.w in
+    -- location 0 color, location 1 depth target, builtin frag_depth (same value).
+    (@[m.x, m.y, m.z, 1.0], d, d)
   else
-    (@[0.0, 0.0, 0.0, 0.0], 1.0)
+    -- Miss: transparent, push depth to the far plane so the ground wins.
+    (@[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
