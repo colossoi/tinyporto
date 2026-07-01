@@ -22,6 +22,7 @@ import "shade"
 import "geom"
 import "paint"
 import "bricks"
+import "walls"
 
 ------------------------------------------------------------
 -- State update (Wyn-owned). One compute entry, `step`, advances ALL persistent
@@ -329,9 +330,30 @@ entry occ_reduce(otile: []u32,
     , otile)
 
 ------------------------------------------------------------
+-- Deferred G-buffer (Nine Phase 3, the "thin raster waist"). The scene fragments
+-- no longer light anything — they write a thin G-buffer (albedo, world normal,
+-- window depth) as MRT targets, and a fullscreen `resolve_fragment` reads it back
+-- and does the lighting + tonemap once, over the whole image. This unifies shading
+-- and is where AO / contact shadows belong. g_albedo.w is a valid mask (0 = sky).
+------------------------------------------------------------
+
+resource g_albedo: image2d {
+  format = rgba8unorm
+  size   = window
+  usages = [storage_read]
+}
+
+resource g_normal: image2d {
+  format = rgba16float
+  size   = window
+  usages = [storage_read]
+}
+
+------------------------------------------------------------
 -- Scene (one thin vertex + one fragment for the whole scene). The vertex pulls a
 -- finished vertex from `step`'s two geom streams and projects it; the fragment
--- shades it by `kind`. No geometry work here — `step` already built everything.
+-- writes the G-buffer for it by `kind`. No geometry work here — `step` already
+-- built everything; no lighting here — `resolve_fragment` does it.
 ------------------------------------------------------------
 
 -- Pull (pos.xyz, kind) and (nrm.xyz, attr) for vertex `vid` and project. kind,
@@ -355,20 +377,18 @@ def item_color(kind: f32) vec3f32 =
 
 -- Shade one ground fragment: material color from `kind`, a darker edging course
 -- near a stroke boundary (|attr| -> 1), lit by the (up) normal, then tonemapped.
--- Location 1 writes window-space depth (frag_coord.z) into the scene_depth MRT
--- target for the Hi-Z pyramid (Nine Phase 2); location 0 is the shaded color.
+-- G-buffer write for the ground: albedo (material color + stroke edging, pre-light)
+-- @0, world normal @1, window depth @2 (also feeds the Hi-Z pyramid). No lighting.
 #[fragment]
 entry scene_fragment(#[location(0)] kind: f32, #[location(1)] attr: f32,
                      #[location(2)] normal: vec3f32,
                      #[builtin(frag_coord)] fc: vec4f32)
-  (#[location(0)] vec4f32, #[location(1)] f32) =
+  (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32) =
   let nrm = normalize(normal)
   let base = item_color(kind)
   let edge = smoothstep(0.78, 1.0, f32.abs(attr))
-  let surf = mix(base, OUTLINE_COLOR, edge * 0.5)
-  let col = lit(surf, nrm)
-  let m = tonemap_aces(col) in
-  (@[m.x, m.y, m.z, 1.0], fc.z)
+  let surf = mix(base, OUTLINE_COLOR, edge * 0.5) in
+  (@[surf.x, surf.y, surf.z, 1.0], @[nrm.x, nrm.y, nrm.z, 1.0], fc.z)
 
 ------------------------------------------------------------
 -- Cobble setts: instanced proxy boxes (Tiny-Glade "tons of tiny instances").
@@ -414,7 +434,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
                     #[location(2)] var: f32, #[location(3)] yaw: f32,
                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
                     #[uniform(set=1, binding=3)] iCam: vec4f32)
-  (#[location(0)] vec4f32, #[location(1)] f32, #[builtin(frag_depth)] f32) =
+  (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
   let height = inst.z
   let bcenter = @[inst.x, height * 0.5, inst.y]
   let half = @[BRICK_W * 0.5, height * 0.5, BRICK_L * 0.5]
@@ -442,11 +462,134 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
     let nl = round_normal(pl, b, r)
     let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
     let clip = world_to_clip(pos, iResolution, iCam.x)
-    let col = lit(COBBLE_BASE * v3(0.8 + 0.4 * var), n)
-    let m = tonemap_aces(col)
+    let alb = COBBLE_BASE * v3(0.8 + 0.4 * var)
     let d = clip.z / clip.w in
-    -- location 0 color, location 1 depth target, builtin frag_depth (same value).
-    (@[m.x, m.y, m.z, 1.0], d, d)
+    -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
+    (@[alb.x, alb.y, alb.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)
   else
-    -- Miss: transparent, push depth to the far plane so the ground wins.
-    (@[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
+    -- Miss: invalid (a=0) so the resolve treats it as sky; depth to the far plane
+    -- so the already-drawn ground wins the LessEqual depth test.
+    (@[0.0, 0.0, 0.0, 0.0], @[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
+
+------------------------------------------------------------
+-- Brick buildings. `walls` is Nine's simple path again, applied to wall bricks:
+-- one candidate brick per grid slot (see walls.wyn for the running-bond layout),
+-- filtered to the visible ones (alive, in frustum, not occluded) and compacted, so
+-- the instanced draw runs over the live count. `brick_vertex`/`brick_fragment`
+-- raymarch each brick as a yawed rounded box into the G-buffer — the same six-tri
+-- last-LOD as the setts. These bricks are real occluders for the cobbles.
+------------------------------------------------------------
+
+#[compute]
+entry walls(wbidx: []u32,
+            #[uniform(set=1, binding=0)] iResolution: vec3f32,
+            #[uniform(set=1, binding=3)] iCam: vec4f32,
+            #[view(occ_depth, storage_read)] od: storage_image)
+  (?k. [k]vec4f32, [4]u32) =
+  let cand =
+    map(|s|
+      let brk = wall_brick(i32(s))
+      let center = @[brk.x, brk.y, brk.z]
+      let visible = brk.y > 0.0 && frustum_keep(center, iResolution, iCam.x)
+      let clip = world_to_clip(center, iResolution, iCam.x)
+      let occluded =
+        if clip.w <= 0.0 then false
+        else
+          let ndcz = clip.z / clip.w
+          let px = f32.max(0.0, f32.min(iResolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * iResolution.x))
+          let py = f32.max(0.0, f32.min(iResolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * iResolution.y))
+          let occ = image_load(od, @[i32(px) / OCC_TILE, i32(py) / OCC_TILE]).x in
+          occ < 0.9999 && ndcz > occ + 0.02
+      in
+      if visible && (!occluded) then brk else @[brk.x, 0.0 - 1.0, brk.z, brk.w]
+      , wbidx)
+  let inst = filter(|b| b.y > 0.0, cand)
+  let n = length(inst) in
+  (inst, [36u32, u32(n), 0u32, 0u32])
+
+#[vertex]
+entry brick_vertex(#[builtin(vertex_index)] vid: i32,
+                   #[builtin(instance_index)] iid: i32,
+                   #[uniform(set=1, binding=0)] iResolution: vec3f32,
+                   #[uniform(set=1, binding=3)] iCam: vec4f32,
+                   #[storage(set=1, binding=11, access=read)] wall_brick_inst: []vec4f32)
+  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec3f32,
+   #[location(2)] f32, #[location(3)] f32) =
+  let inst = wall_brick_inst[iid]
+  let center = @[inst.x, inst.y, inst.z]
+  let yaw = inst.w
+  let cw = f32.cos(yaw)
+  let sw = f32.sin(yaw)
+  let local = box_pos[vid]
+  let lx = local.x * (BRK_HX * 2.0)
+  let ly = (local.y - 0.5) * (BRK_HY * 2.0)
+  let lz = local.z * (BRK_HZ * 2.0)
+  let world = @[center.x + cw * lx - sw * lz, center.y + ly, center.z + sw * lx + cw * lz] in
+  (world_to_clip(world, iResolution, iCam.x), world, center, yaw, brick_hash(iid))
+
+-- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
+-- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
+#[fragment]
+entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3f32,
+                     #[location(2)] yaw: f32, #[location(3)] cv: f32,
+                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
+                     #[uniform(set=1, binding=3)] iCam: vec4f32)
+  (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
+  let rr = 0.012
+  let b = @[BRK_HX - rr, BRK_HY - rr, BRK_HZ - rr]
+  let cw = f32.cos(yaw)
+  let sw = f32.sin(yaw)
+  let rd = normalize(world - cam_eye(iCam.x))
+  let (t, hit) =
+    loop (t, hit) = (0.0, false) for _i < 24 do
+      if hit then (t, hit)
+      else
+        let rel = (world + rd * t) - bcenter
+        let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
+        let d = sd_round_box(pl, b, rr) in
+        if d < 0.0005 then (t, true) else (t + d, false)
+  let pos = world + rd * t in
+  if hit then
+    let rel = pos - bcenter
+    let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
+    let nl = round_normal(pl, b, rr)
+    let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
+    let clip = world_to_clip(pos, iResolution, iCam.x)
+    let alb = BRICK_BASE * v3(0.82 + 0.36 * cv)
+    let d = clip.z / clip.w in
+    (@[alb.x, alb.y, alb.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)
+  else
+    (@[0.0, 0.0, 0.0, 0.0], @[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
+
+------------------------------------------------------------
+-- Deferred resolve (Nine Phase 3). A single fullscreen triangle covers the frame;
+-- the fragment reads the G-buffer at its pixel, lights the albedo by the stored
+-- normal, tonemaps, and writes the surface. Sky pixels (albedo.w = 0) pass through
+-- unlit. Lighting lives here, once — the natural home for AO / contact shadows.
+------------------------------------------------------------
+
+-- Fullscreen triangle from the vertex index: (-1,-1), (3,-1), (-1,3) covers the
+-- whole clip rect with one primitive (no vertex buffer).
+#[vertex]
+entry blit_vertex(#[builtin(vertex_index)] vid: i32)
+  #[builtin(position)] vec4f32 =
+  let x = if vid == 1 then 3.0 else 0.0 - 1.0
+  let y = if vid == 2 then 3.0 else 0.0 - 1.0 in
+  @[x, y, 0.0, 1.0]
+
+#[fragment]
+entry resolve_fragment(#[builtin(frag_coord)] fc: vec4f32,
+                       #[view(g_albedo, storage_read)] ga: storage_image,
+                       #[view(g_normal, storage_read)] gn: storage_image)
+  #[location(0)] vec4f32 =
+  let p = @[i32(fc.x), i32(fc.y)]
+  let alb = image_load(ga, p)
+  let nrm = image_load(gn, p) in
+  if alb.w < 0.5 then
+    -- Sky: the scene cleared g_albedo to the sky color; pass it through unlit.
+    @[alb.x, alb.y, alb.z, 1.0]
+  else
+    let n = normalize(@[nrm.x, nrm.y, nrm.z])
+    let col = lit(@[alb.x, alb.y, alb.z], n)
+    let m = tonemap_aces(col) in
+    @[m.x, m.y, m.z, 1.0]

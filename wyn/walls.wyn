@@ -1,0 +1,70 @@
+-- walls.wyn — brick-building layout (the "wall generator that places bricks").
+--
+-- Hierarchy: a BUILDING is an axis-aligned rectangular footprint; each of its four
+-- sides is a WALL; each wall is laid with individual BRICKS in running bond. This
+-- module is pure geometry — given a global brick index it returns that brick's
+-- placement. Frustum/occlusion culling and rendering live in main.wyn.
+--
+-- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+
+-- Brick cell spacing (the running-bond grid) and the drawn half-extents. The brick
+-- is a bit smaller than its cell so neighbours leave a mortar gap, exactly like the
+-- cobble setts. Local frame: x = along the wall, y = up, z = wall thickness.
+def BRK_LEN: f32 = 0.24     -- cell length along the wall
+def BRK_CRS: f32 = 0.10     -- course height
+def BRK_HX:  f32 = 0.105    -- half length  (< BRK_LEN/2)
+def BRK_HY:  f32 = 0.043    -- half course  (< BRK_CRS/2)
+def BRK_HZ:  f32 = 0.060    -- half thickness
+def BRICK_BASE: vec3f32 = @[0.71, 0.36, 0.28]   -- terracotta
+
+-- Fixed per-wall brick budget (a grid of PER_COURSE x COURSES). Slots past the
+-- wall's real extent are marked dead and compacted away, like the cobble grid.
+def PER_COURSE: i32 = 12
+def COURSES:    i32 = 20
+def PER_WALL:   i32 = 240   -- PER_COURSE * COURSES
+def N_BUILD:    i32 = 2
+def N_WALL:     i32 = 8     -- N_BUILD * 4
+def WALL_BRICKS: i32 = 1920 -- N_WALL * PER_WALL
+
+-- Building footprints: (center x, center z, half width, half depth, height).
+def building_rect(b: i32) (f32, f32, f32, f32, f32) =
+  if b == 0 then (2.6, 0.0 - 1.0, 1.2, 0.8, 1.9)
+  else (0.0 - 2.6, 2.2, 0.9, 1.3, 2.4)
+
+-- Wall `w` (= building w/4, side w%4) as (A, B endpoints in xz, height, yaw). yaw
+-- is 0 for x-aligned sides and pi/2 for z-aligned, so a brick's long (x) axis runs
+-- along the wall. Sides wind around the rectangle so bricks lay A -> B.
+def wall(w: i32) (vec2f32, vec2f32, f32, f32) =
+  let b = w / 4
+  let side = w % 4
+  let (cx, cz, hw, hd, h) = building_rect(b)
+  let x0 = cx - hw
+  let x1 = cx + hw
+  let z0 = cz - hd
+  let z1 = cz + hd in
+  if side == 0 then (@[x0, z0], @[x1, z0], h, 0.0)
+  else if side == 1 then (@[x1, z0], @[x1, z1], h, 1.5707963)
+  else if side == 2 then (@[x1, z1], @[x0, z1], h, 0.0)
+  else (@[x0, z1], @[x0, z0], h, 1.5707963)
+
+-- Brick `i` (global index) -> its centre (xyz) + yaw, packed as a vec4. Running
+-- bond: odd courses shift half a brick. A dead slot (past the wall's brick count,
+-- or an offset brick that would overshoot the wall) returns y = -1 so the
+-- generator's `filter` drops it (valid bricks always have y >= BRK_CRS/2 > 0).
+def wall_brick(i: i32) vec4f32 =
+  let w = i / PER_WALL
+  let local = i % PER_WALL
+  let course = local / PER_COURSE
+  let col = local % PER_COURSE
+  let (a, bb, h, yaw) = wall(w)
+  let len = distance(a, bb)
+  let dir = @[(bb.x - a.x) / len, (bb.y - a.y) / len]
+  let n_per = i32(len / BRK_LEN)
+  let n_crs = i32(h / BRK_CRS)
+  let off = if (course % 2) == 1 then BRK_LEN * 0.5 else 0.0
+  let along = f32(col) * BRK_LEN + off + BRK_LEN * 0.5
+  let dead = col >= n_per || course >= n_crs || (along + BRK_HX) > len
+  let cx = a.x + dir.x * along
+  let cz = a.y + dir.y * along
+  let cy = f32(course) * BRK_CRS + BRK_CRS * 0.5 in
+  if dead then @[cx, 0.0 - 1.0, cz, yaw] else @[cx, cy, cz, yaw]

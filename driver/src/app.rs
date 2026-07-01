@@ -8,9 +8,11 @@
 
 use crate::generated::{
     cull_out_bytes, cull_stages, occ_reduce_out_bytes, occ_reduce_stages, step_out_bytes,
-    step_stages, CULL_BINDINGS, CULL_STAGE_COUNT, OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT,
-    SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS,
-    STEP_BINDINGS, STEP_STAGE_COUNT,
+    step_stages, walls_out_bytes, walls_stages, BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS,
+    BRICK_VERTEX_BINDINGS, CULL_BINDINGS, CULL_STAGE_COUNT, OCC_REDUCE_BINDINGS,
+    OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
+    SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, STEP_BINDINGS,
+    STEP_STAGE_COUNT, WALLS_BINDINGS, WALLS_STAGE_COUNT,
 };
 use crate::graph::*;
 
@@ -29,6 +31,10 @@ const BIDX_BYTES: u64 = BRICK_COUNT * 4;
 // dispatch domain (one invocation per coarse texel).
 const OCC_COUNT: u64 = 160 * 100;
 const OTILE_BYTES: u64 = OCC_COUNT * 4;
+// Wall-brick budget (must match walls.wyn: N_WALL * PER_WALL). `wbidx` is the iota
+// domain the `walls` generator maps over (one slot per candidate brick).
+const WALL_BRICKS: u64 = 1920;
+const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
 
 // `step`'s output sizes, by binding, from the generated calc (the seed sizes are
 // baked in). The driver pairs this with the binding table to size each output
@@ -48,12 +54,19 @@ const fn occ_out(binding: u32) -> u64 {
     occ_reduce_out_bytes(binding, OTILE_BYTES)
 }
 
+// `walls`' output sizes (compacted wall_brick records + draw args + filter scratch),
+// derived from the wall-brick iota size.
+const fn walls_out(binding: u32) -> u64 {
+    walls_out_bytes(binding, WBIDX_BYTES)
+}
+
 // Ordered compute stages per entry, dispatch sized from the seed counts. The
 // stage entry names and per-stage dispatch rules come from the descriptor (via
 // the generated `*_stages`); only the seed byte sizes are authored here.
 static STEP_STAGES: [ComputeStage; STEP_STAGE_COUNT] = step_stages(IIDX_BYTES, PIDX_BYTES, TIDX_BYTES);
 static CULL_STAGES: [ComputeStage; CULL_STAGE_COUNT] = cull_stages(BIDX_BYTES);
 static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OTILE_BYTES);
+static WALLS_STAGES: [ComputeStage; WALLS_STAGE_COUNT] = walls_stages(WBIDX_BYTES);
 
 pub const GRAPH: Graph = Graph {
     resources: &[
@@ -85,6 +98,18 @@ pub const GRAPH: Graph = Graph {
         Resource::Image { name: "scene_depth", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
         Resource::Image { name: "occ_depth", format: TexFormat::R32Float, size: ImgSize::Fixed { w: 160, h: 100 }, mips: 1 },
         Resource::Buffer(BufferDef { name: "otile", size: Some(OTILE_BYTES), init: BufInit::Iota, indirect: false }),
+        // Nine Phase 3 (deferred): the scene writes a thin G-buffer here (albedo +
+        // world normal); `resolve_fragment` reads it back and lights it. `blit_args`
+        // is the fullscreen-triangle draw (3 verts, 1 instance).
+        Resource::Image { name: "g_albedo", format: TexFormat::Rgba8Unorm, size: ImgSize::Window, mips: 1 },
+        Resource::Image { name: "g_normal", format: TexFormat::Rgba16Float, size: ImgSize::Window, mips: 1 },
+        Resource::Buffer(BufferDef { name: "blit_args", size: Some(16), init: BufInit::U32s(&[3, 1, 0, 0]), indirect: true }),
+        // Brick buildings: `wbidx` is the candidate-brick iota; `walls` compacts the
+        // visible bricks into wall_brick_inst and writes wall_brick_args (its live
+        // instance count). Bricks are drawn into the G-buffer as real occluders.
+        Resource::Buffer(BufferDef { name: "wbidx", size: Some(WBIDX_BYTES), init: BufInit::Iota, indirect: false }),
+        Resource::Buffer(BufferDef { name: "wall_brick_inst", size: None, init: BufInit::Zeroed, indirect: false }),
+        Resource::Buffer(BufferDef { name: "wall_brick_args", size: None, init: BufInit::Zeroed, indirect: true }),
     ],
 
     // Shader binding name -> resource name. Roles (prev/next/plain) are derived
@@ -118,6 +143,14 @@ pub const GRAPH: Graph = Graph {
         ("od", "occ_depth"),
         ("sd", "scene_depth"),
         ("otile", "otile"),
+        // G-buffer views read by the deferred resolve fragment.
+        ("ga", "g_albedo"),
+        ("gn", "g_normal"),
+        // Brick generator I/O + the instanced brick draw.
+        ("wbidx", "wbidx"),
+        ("walls_output_0", "wall_brick_inst"),
+        ("walls_output_1", "wall_brick_args"),
+        ("wall_brick_inst", "wall_brick_inst"),
     ],
 
     passes: &[
@@ -139,15 +172,26 @@ pub const GRAPH: Graph = Graph {
             stages: &CULL_STAGES,
             out_bytes: cull_out,
         }),
+        // Brick-building generator: lay + frustum/occlusion-cull + compact the wall
+        // bricks (Nine's simple path, same as `cull`). Reads last frame's occ_depth.
+        Pass::Compute(ComputePass {
+            label: "walls",
+            module: "main",
+            bindings: WALLS_BINDINGS,
+            stages: &WALLS_STAGES,
+            out_bytes: walls_out,
+        }),
         // Scene: the flat ground (materialized ribbon), then the instanced cobble
         // setts. Both depth-tested; the setts protrude and self-occlude.
         Pass::Render(RenderPass {
             label: "scene",
             depth: Some("depth"),
-            // Location 0: surface color. Location 1: window-space depth (R32Float),
-            // cleared to the far plane (1.0), for the Hi-Z pyramid.
+            // Deferred G-buffer (no surface write here): albedo @0 (a=0 sky mask, so
+            // the clear is the sky color at a=0), world normal @1, window depth @2
+            // (also the Hi-Z source, cleared to the far plane).
             color: &[
-                ColorTarget { target: None, format: None, clear: [0.74, 0.80, 0.86, 1.0] },
+                ColorTarget { target: Some("g_albedo"), format: Some(TexFormat::Rgba8Unorm), clear: [0.74, 0.80, 0.86, 0.0] },
+                ColorTarget { target: Some("g_normal"), format: Some(TexFormat::Rgba16Float), clear: [0.0, 0.0, 0.0, 0.0] },
                 ColorTarget { target: Some("scene_depth"), format: Some(TexFormat::R32Float), clear: [1.0, 1.0, 1.0, 1.0] },
             ],
             items: &[
@@ -171,6 +215,16 @@ pub const GRAPH: Graph = Graph {
                     draw_args: "sett_args",
                     depth_write: true,
                 },
+                RenderItem {
+                    label: "bricks",
+                    module: "main",
+                    vs: "brick_vertex",
+                    fs: "brick_fragment",
+                    vs_bindings: BRICK_VERTEX_BINDINGS,
+                    fs_bindings: BRICK_FRAGMENT_BINDINGS,
+                    draw_args: "wall_brick_args",
+                    depth_write: true,
+                },
             ],
         }),
         // Hi-Z reduce: min the scene depth (written by the pass above) into the
@@ -182,6 +236,23 @@ pub const GRAPH: Graph = Graph {
             bindings: OCC_REDUCE_BINDINGS,
             stages: &OCC_STAGES,
             out_bytes: occ_out,
+        }),
+        // Deferred resolve: one fullscreen triangle reads the G-buffer and lights it
+        // into the surface. No depth (it covers every pixel unconditionally).
+        Pass::Render(RenderPass {
+            label: "resolve",
+            depth: None,
+            color: &[ColorTarget { target: None, format: None, clear: [0.74, 0.80, 0.86, 1.0] }],
+            items: &[RenderItem {
+                label: "resolve",
+                module: "main",
+                vs: "blit_vertex",
+                fs: "resolve_fragment",
+                vs_bindings: BLIT_VERTEX_BINDINGS,
+                fs_bindings: RESOLVE_FRAGMENT_BINDINGS,
+                draw_args: "blit_args",
+                depth_write: false,
+            }],
         }),
     ],
 };

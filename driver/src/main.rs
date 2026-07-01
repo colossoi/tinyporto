@@ -486,10 +486,14 @@ fn make_storage_raw(device: &wgpu::Device, label: &str, size: u64, indirect: boo
 
 fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, size: u64, init: BufInit, indirect: bool) -> wgpu::Buffer {
     let buf = make_storage_raw(device, name, size, indirect);
-    if let BufInit::Iota = init {
-        let count = (size / 4) as u32;
-        let data: Vec<u32> = (0..count).collect();
-        queue.write_buffer(&buf, 0, bytemuck::cast_slice(&data));
+    match init {
+        BufInit::Iota => {
+            let count = (size / 4) as u32;
+            let data: Vec<u32> = (0..count).collect();
+            queue.write_buffer(&buf, 0, bytemuck::cast_slice(&data));
+        }
+        BufInit::U32s(vals) => queue.write_buffer(&buf, 0, bytemuck::cast_slice(vals)),
+        BufInit::Zeroed => {}
     }
     buf
 }
