@@ -3,7 +3,7 @@
 
 import "math"   -- bare import: brings clamp01 etc. into scope unqualified
 
-def SUN_DIR: vec3f32 = @[0.0 - 0.5, 0.7, 0.35]
+def SUN_DIR: vec3f32 = @[0.0 - 0.5, 0.52, 0.35]
 def SUN_COLOR: vec3f32 = @[2.0, 1.95, 1.85]
 def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
 

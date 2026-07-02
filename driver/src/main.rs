@@ -21,7 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -915,9 +915,15 @@ impl ApplicationHandler for App {
         if self.renderer.is_some() {
             return;
         }
+        // The graph bakes fixed window-sized compute grids (pxl/otile/occ) and the
+        // window-sized images are not rebuilt on resize, so the surface must be
+        // exactly the graph size. Request a PHYSICAL size (DPI-independent, unlike
+        // LogicalSize which inflates the surface on HiDPI and leaves the bottom rows
+        // unlit) and disable resizing (the resize path can't rebuild the grids).
         let attrs = WindowAttributes::default()
             .with_title("tiny porto")
-            .with_inner_size(LogicalSize::new(self.args.width, self.args.height));
+            .with_inner_size(PhysicalSize::new(self.args.width, self.args.height))
+            .with_resizable(false);
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

@@ -71,8 +71,29 @@ passing wgpu/naga) run it through the driver to catch validation errors.
 
 ---
 
+## Rendering limitations (not compiler bugs — deferred work)
+
+- **Sun shadow map casts from the camera-culled brick list.** The `sun_shadow`
+  pass rasterizes `wall_brick_inst`, which `walls` already frustum + occlusion
+  culled to the *camera*. So a building fully off-screen (or Hi-Z-culled) won't
+  cast into the view. Fine while all casters are on-screen; the correct fix is a
+  separate light-frustum caster cull feeding its own instance list. The shadow map
+  is also window-sized (reuses the shared depth buffer) rather than a dedicated
+  square hi-res target — a driver upgrade (fixed-size render target + its own depth
+  attachment) would sharpen it.
+
 ## Driver-side accommodations (not compiler bugs)
 
+- **The window is a fixed, non-resizable physical size** (`main.rs`, `resumed`).
+  The graph bakes window-sized compute grids (`pxl`/`otile`/occ) as compile-time
+  constants and the window-sized images/bind-groups aren't rebuilt on resize, so
+  the surface must equal the graph size. We request a **physical** size (not
+  logical — that inflates the surface on HiDPI, leaving the bottom rows unlit) and
+  disable resizing. *Deferred:* true dynamic resize (recompute window-relative
+  buffer sizes + rebuild the affected bind groups on every `Resized`).
+- **Storage-texture limit raised to the adapter max** (`gfx.rs`): the deferred
+  `light` pass binds 5 storage textures (G-buffer albedo/normal, scene depth, sun
+  shadow map, lit output), past WebGPU's default limit of 4.
 - **Storage-image layout access is widened to the resource's graph-wide union**
   (`image_union_access` in `driver/src/main.rs`): the compiler emits one module
   global per image with the union access, so every pipeline's layout must match.

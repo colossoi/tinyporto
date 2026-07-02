@@ -11,7 +11,8 @@
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
-import "camera"   -- world_to_clip / world_from_depth / linear_depth
+import "camera"   -- world_to_clip / world_from_depth / linear_depth / look_at / LOOKAT
+import "shade"    -- SUN_DIR / sun
 
 -- March tunables (world metres). Short range, so shadows ground bricks / cobbles /
 -- wall bases in contact without leaking long streaks across the scene.
@@ -43,3 +44,55 @@ def shadow_occluded(cq: vec4f32, surfd: f32) bool =
   let linq = linear_depth(cq.z / cq.w)
   let lins = linear_depth(surfd) in
   surfd < 0.99999 && linq > lins + SH_BIAS && (linq - lins) < SH_THICK
+
+------------------------------------------------------------
+-- Sun shadow map (directional cast shadows). An orthographic camera looks down the
+-- sun ray (-sun) over a box covering the built area; the caster pass rasterizes the
+-- wall bricks through world_to_light and stores the nearest light-space depth per
+-- texel. The deferred light pass reconstructs each pixel's world position, projects
+-- it the same way, and PCF-compares to that stored depth: farther than the nearest
+-- caster => the sun is blocked. These are the long, robust cast shadows; the
+-- contact march above stays for fine local grounding. Pure math only (the map read
+-- stays in the light entry — a `def` can't take a storage_image).
+------------------------------------------------------------
+
+def SUN_DIST: f32 = 20.0    -- light-camera distance from the origin, along +sun
+def SUN_HALF: f32 = 10.0    -- ortho half-extent (m); covers the cobble disc + throw
+def SUN_NEAR: f32 = 1.0
+def SUN_FAR:  f32 = 40.0
+def SUN_BIAS: f32 = 0.0015  -- depth-compare bias (ortho z units) against acne
+
+-- Light-camera eye: back off the origin toward the sun so it looks down -sun.
+def sun_eye: vec3f32 = LOOKAT + sun * SUN_DIST
+
+-- Orthographic projection (symmetric, RH, z in [0,1] for wgpu). Column-major
+-- (outer arrays = columns), matching camera.wyn's perspective/look_at convention.
+-- The box is square in world space; mapping it into the (rectangular) window-sized
+-- map just makes texel density anisotropic, which is self-consistent between the
+-- caster write and the receiver read, so it introduces no error.
+def sun_ortho: mat4f32 =
+  let h = SUN_HALF
+  let n = SUN_NEAR
+  let f = SUN_FAR in
+  @[[1.0 / h, 0.0,     0.0,               0.0],
+    [0.0,     1.0 / h, 0.0,               0.0],
+    [0.0,     0.0,     0.0 - 1.0 / (f - n), 0.0],
+    [0.0,     0.0,     0.0 - n / (f - n),   1.0]]
+
+def sun_view: mat4f32 = look_at(sun_eye, LOOKAT, @[0.0, 1.0, 0.0])
+
+-- World point -> light clip space (ortho, so w = 1 and xyz are already NDC).
+def world_to_light(p: vec3f32) vec4f32 =
+  sun_ortho * (sun_view * @[p.x, p.y, p.z, 1.0])
+
+-- Light-clip -> shadow-map (u, v) in [0,1] (v flipped to texture space, matching
+-- rasterization) plus whether the point is inside the map's covered volume.
+def sun_shadow_uv(lc: vec4f32) (f32, f32, bool) =
+  let u = lc.x * 0.5 + 0.5
+  let v = 1.0 - (lc.y * 0.5 + 0.5)
+  let inr = u > 0.0 && u < 1.0 && v > 0.0 && v < 1.0 && lc.z > 0.0 && lc.z < 1.0 in
+  (u, v, inr)
+
+-- Is a receiver at light-space depth `refz` lit, given the nearest caster depth
+-- `stored` in that texel? Lit when it's at or nearer than the caster (plus bias).
+def sun_lit(refz: f32, stored: f32) bool = refz - SUN_BIAS <= stored

@@ -19,6 +19,11 @@ async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::
     let mut limits = wgpu::Limits::default();
     limits.max_storage_buffers_per_shader_stage =
         adapter.limits().max_storage_buffers_per_shader_stage;
+    // The deferred `light` pass binds 5 storage textures (G-buffer albedo/normal,
+    // scene depth, sun shadow map, lit output) — past the default 4. Raise to the
+    // adapter's maximum, as with storage buffers above.
+    limits.max_storage_textures_per_shader_stage =
+        adapter.limits().max_storage_textures_per_shader_stage;
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("tinyporto-device"),

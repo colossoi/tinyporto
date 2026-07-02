@@ -9,11 +9,11 @@
 use crate::generated::{
     cull_out_bytes, cull_stages, occ_reduce_out_bytes, occ_reduce_stages, step_out_bytes,
     light_out_bytes, light_stages, step_stages, walls_out_bytes, walls_stages,
-    BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS, BRICK_VERTEX_BINDINGS, CULL_BINDINGS,
-    CULL_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS,
-    OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
-    SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, STEP_BINDINGS,
-    STEP_STAGE_COUNT, WALLS_BINDINGS, WALLS_STAGE_COUNT,
+    BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS,
+    BRICK_VERTEX_BINDINGS, CULL_BINDINGS, CULL_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT,
+    OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
+    SCENE_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS,
+    STEP_BINDINGS, STEP_STAGE_COUNT, WALLS_BINDINGS, WALLS_STAGE_COUNT,
 };
 use crate::graph::*;
 
@@ -108,6 +108,10 @@ pub const GRAPH: Graph = Graph {
         // reads to occlusion-test candidates. `otile` is occ_reduce's iota domain.
         Resource::Image { name: "scene_depth", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
         Resource::Image { name: "occ_depth", format: TexFormat::R32Float, size: ImgSize::Fixed { w: 160, h: 100 }, mips: 1 },
+        // Sun shadow map: the `sun_shadow` pass writes light-space depth here (R32Float
+        // color target, nearest kept by the shared depth buffer), and `light` samples
+        // it for directional cast shadows. Window-sized, mirroring scene_depth.
+        Resource::Image { name: "sun_depth", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
         Resource::Buffer(BufferDef { name: "otile", size: Some(OTILE_BYTES), init: BufInit::Iota, indirect: false }),
         // Nine Phase 3 (deferred): the scene writes a thin G-buffer here (albedo +
         // world normal); `resolve_fragment` reads it back and lights it. `blit_args`
@@ -161,6 +165,8 @@ pub const GRAPH: Graph = Graph {
         // G-buffer views read by the deferred resolve fragment.
         ("ga", "g_albedo"),
         ("gn", "g_normal"),
+        // Sun shadow map (`shm` in `light`; written as the sun_shadow color target).
+        ("shm", "sun_depth"),
         // Brick generator I/O + the instanced brick draw.
         ("wbidx", "wbidx"),
         ("walls_output_0", "wall_brick_inst"),
@@ -199,6 +205,25 @@ pub const GRAPH: Graph = Graph {
             bindings: WALLS_BINDINGS,
             stages: &WALLS_STAGES,
             out_bytes: walls_out,
+        }),
+        // Sun shadow map: rasterize the wall bricks through the sun's ortho light
+        // camera, storing nearest light-space depth into sun_depth. Reuses the shared
+        // window depth buffer (cleared here, then re-cleared by the scene pass). Runs
+        // after `walls` (needs wall_brick_inst) and before `light` (which samples it).
+        Pass::Render(RenderPass {
+            label: "sun_shadow",
+            depth: Some("depth"),
+            color: &[ColorTarget { target: Some("sun_depth"), format: Some(TexFormat::R32Float), clear: [1.0, 1.0, 1.0, 1.0] }],
+            items: &[RenderItem {
+                label: "brick_shadow",
+                module: "main",
+                vs: "brick_shadow_vertex",
+                fs: "shadow_fragment",
+                vs_bindings: BRICK_SHADOW_VERTEX_BINDINGS,
+                fs_bindings: SHADOW_FRAGMENT_BINDINGS,
+                draw_args: "wall_brick_args",
+                depth_write: true,
+            }],
         }),
         // Scene: the flat ground (materialized ribbon), then the instanced cobble
         // setts. Both depth-tested; the setts protrude and self-occlude.

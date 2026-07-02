@@ -261,6 +261,16 @@ resource occ_depth: image2d {
   usages = [storage_read, storage_write]
 }
 
+-- Sun shadow map: the caster pass writes light-space depth here (as an R32Float
+-- color target, nearest kept by the depth test — the same write+sample pattern as
+-- scene_depth); the deferred `light` pass reads it back for directional cast
+-- shadows. Window-sized so it reuses the shared depth buffer with no driver work.
+resource sun_depth: image2d {
+  format = r32float
+  size   = window
+  usages = [storage_read]
+}
+
 ------------------------------------------------------------
 -- Cull (Nine's simple path). One record per running-bond cell is built, then
 -- `filter` keeps only the visible ones (in the cobble region, the view frustum,
@@ -578,6 +588,38 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
     (@[0.0, 0.0, 0.0, 0.0], @[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
 
 ------------------------------------------------------------
+-- Sun shadow map — caster pass. The same wall-brick proxy boxes, but projected
+-- through the sun's orthographic light camera (world_to_light) into the sun_depth
+-- map. The fragment writes its light-space depth (frag_coord.z); the depth test
+-- keeps the nearest caster per texel. `light` reads this back to cast long
+-- directional shadows. Casters are the (camera-culled) wall bricks in
+-- wall_brick_inst — off-screen buildings won't cast until a light-frustum caster
+-- cull exists (see COMPILER-NOTES.md); both buildings are on-screen here.
+------------------------------------------------------------
+
+#[vertex]
+entry brick_shadow_vertex(#[builtin(vertex_index)] vid: i32,
+                          #[builtin(instance_index)] iid: i32,
+                          #[storage(set=1, binding=11, access=read)] wall_brick_inst: []vec4f32)
+  #[builtin(position)] vec4f32 =
+  let inst = wall_brick_inst[iid]
+  let center = @[inst.x, inst.y, inst.z]
+  let yaw = inst.w
+  let cw = f32.cos(yaw)
+  let sw = f32.sin(yaw)
+  let local = box_pos[vid]
+  let lx = local.x * (BRK_HX * 2.0)
+  let ly = (local.y - 0.5) * (BRK_HY * 2.0)
+  let lz = local.z * (BRK_HZ * 2.0)
+  let world = @[center.x + cw * lx - sw * lz, center.y + ly, center.z + sw * lx + cw * lz] in
+  world_to_light(world)
+
+-- Depth-only caster shade: store this fragment's light-space depth (frag_coord.z)
+-- into the R32Float sun_depth target; the depth test already kept the nearest.
+#[fragment]
+entry shadow_fragment(#[builtin(frag_coord)] fc: vec4f32) #[location(0)] f32 = fc.z
+
+------------------------------------------------------------
 -- Deferred lighting (Nine Phase 3, the compute stage). One invocation per pixel
 -- reads the thin G-buffer, estimates screen-space ambient occlusion from the depth
 -- neighbourhood, lights the albedo by the stored normal (sun + AO-attenuated sky),
@@ -598,6 +640,7 @@ entry light(pxl: []u32,
             #[view(g_albedo, storage_read)]  ga: storage_image,
             #[view(g_normal, storage_read)]  gn: storage_image,
             #[view(scene_depth, storage_read)] sd: storage_image,
+            #[view(sun_depth, storage_read)]  shm: storage_image,
             #[view(lit, storage_write)]       lt: storage_image)
   []u32 =
   map(|s|
@@ -634,14 +677,34 @@ entry light(pxl: []u32,
         -- from this pixel's reconstructed, surface-lifted world position; a step
         -- that projects behind a nearer recorded surface blocks the sun.
         let p = world_from_depth(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], zoom, cd) + n * SH_LIFT
-        let sh =
-          loop sh = 0.0 for k < 20 do
-            if sh > 0.5 then sh
+        let shc =
+          loop shc = 0.0 for k < 20 do
+            if shc > 0.5 then shc
             else
               let cq = world_to_clip(shadow_point(p, sunv, k), resl, zoom)
               let (sx, sy, valid) = shadow_pixel(cq, rx, ry, w, h)
               let surfd = if valid then image_load(sd, @[sx, sy]).x else 1.0 in
-              if shadow_occluded(cq, surfd) then 1.0 else sh
+              if shadow_occluded(cq, surfd) then 1.0 else shc
+        -- Sun shadow map: project this pixel into the light camera and PCF-compare
+        -- its light-space depth to the nearest recorded caster (3x3 tap, softened).
+        let lc = world_to_light(p)
+        let (su, sv, inr) = sun_shadow_uv(lc)
+        let tx = i32(su * rx)
+        let ty = i32(sv * ry)
+        let shm_frac =
+          if !inr then 0.0
+          else
+            let occ2 =
+              loop occ2 = 0.0 for kk < 9 do
+                let stx = tx + (kk % 3 - 1)
+                let sty = ty + (kk / 3 - 1)
+                let inb = stx >= 0 && stx < w && sty >= 0 && sty < h
+                let stored = if inb then image_load(shm, @[stx, sty]).x else 1.0 in
+                if sun_lit(lc.z, stored) then occ2 else occ2 + 1.0
+              in occ2 / 9.0
+        -- Combine: a pixel is shadowed if EITHER the long sun cast or the local
+        -- contact march blocks the sun.
+        let sh = f32.max(shc, shm_frac)
         let col = lit_ao_sh(@[alb.x, alb.y, alb.z], n, ao, sh)
         let m = tonemap_aces(col) in
         @[m.x, m.y, m.z, 1.0]
