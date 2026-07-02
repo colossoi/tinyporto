@@ -7,7 +7,7 @@ def SUN_DIR: vec3f32 = @[0.0 - 0.5, 0.52, 0.35]
 def SUN_COLOR: vec3f32 = @[2.0, 1.95, 1.85]
 def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
 
-def SAND_COLOR: vec3f32 = @[0.80, 0.71, 0.55]
+def SAND_COLOR: vec3f32 = @[0.24, 0.16, 0.10]
 def WATER_COLOR: vec3f32 = @[0.10, 0.34, 0.46]
 def WATER_DEEP: vec3f32 = @[0.05, 0.20, 0.30]
 -- 1950s Venetian render / ochre plaster for the flat-roofed buildings.

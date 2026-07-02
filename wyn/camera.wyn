@@ -14,7 +14,7 @@ def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]
 def DIST_FAR:  f32 = 170.0
 def DIST_NEAR: f32 = 16.0
 def ELEV_FAR:  f32 = 0.0 - 0.95
-def ELEV_NEAR: f32 = 0.0 - 0.20
+def ELEV_NEAR: f32 = 0.0 - 0.10
 def cam_dist(zoom: f32) f32 = mix(DIST_FAR, DIST_NEAR, zoom)
 def cam_elev(zoom: f32) f32 = mix(ELEV_FAR, ELEV_NEAR, zoom)
 

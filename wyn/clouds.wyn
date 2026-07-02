@@ -1,0 +1,77 @@
+-- Volumetric sky clouds. A value-noise fbm density field is marched along the
+-- view ray in a fixed horizontal band and composited front-to-back
+-- (Beer-Lambert) over a gradient sky. The noise / fbm are ported from the
+-- Shadertoy "Clouds" (https://www.shadertoy.com/view/lss3zr); the density field is
+-- reshaped from the original's origin-centred blob into a high sky layer so the
+-- clouds sit above the diorama rather than around it.
+--
+-- The clouds are STATIC in world space (they don't drift), so this needs no time
+-- input. Pure: view ray in (see camera.get_ray), colour out; no resources.
+
+module clouds = {
+
+  -- Noise basis matrix (column-major: outer arrays are columns).
+  def basis: mat3f32 =
+    @[[ 0.00,  0.80,  0.60],
+      [-0.80,  0.36, -0.48],
+      [-0.60, -0.48,  0.64]]
+
+  def hash(n: f32) f32 = f32.fract(f32.sin(n) * 43758.5453)
+
+  -- 3D value noise.
+  def noise(x: vec3f32) f32 =
+    let p  = vec.floor(x)
+    let f0 = vec.fract(x)
+    let f  = f0 * f0 * (3.0 - 2.0 * f0)
+    let n  = p.x + p.y * 57.0 + 113.0 * p.z in
+    mix(mix(mix(hash(n +   0.0), hash(n +   1.0), f.x),
+            mix(hash(n +  57.0), hash(n +  58.0), f.x), f.y),
+        mix(mix(hash(n + 113.0), hash(n + 114.0), f.x),
+            mix(hash(n + 170.0), hash(n + 171.0), f.x), f.y), f.z)
+
+  -- Fractal Brownian motion (3 octaves).
+  def fbm(p0: vec3f32) f32 =
+    let f0 = 0.5 * noise(p0)
+    let p1 = basis * p0 * 2.02
+    let f1 = f0 + 0.25 * noise(p1)
+    let p2 = basis * p1 * 2.03 in
+    f1 + 0.125 * noise(p2)
+
+  -- A cloud layer at infinity, addressed by ray DIRECTION. Dividing the horizontal
+  -- direction by (rd.y + HORIZ) projects it onto a plane whose apparent horizon sits
+  -- at rd.y = -HORIZ: features compress without bound approaching it, so clouds
+  -- foreshorten and read edge-on near the horizon just like a real cloud sheet — and
+  -- being at infinity they have zero parallax (fixed in world as the camera orbits).
+  -- HORIZ = 0 keeps clouds strictly above the true horizon, so the finite ground
+  -- plate (a plane at y=0, always below the horizon) can never intrude into them.
+  def HORIZ:   f32 = 0.0
+  def SCALE:   f32 = 0.55
+  def HORIZON: vec3f32 = @[0.74, 0.81, 0.88]
+  def ZENITH:  vec3f32 = @[0.45, 0.64, 0.87]
+  def VOID:    vec3f32 = @[0.55, 0.47, 0.38]   -- dirt-toned haze below the cloud horizon
+  def LIT:     vec3f32 = @[1.00, 1.00, 1.00]
+  def DARK:    vec3f32 = @[0.72, 0.77, 0.85]
+
+  def sat(x: f32) f32 = f32.min(f32.max(x, 0.0), 1.0)
+
+  -- Cloud coverage at a projected plane coordinate. Two fbm octaves give big soft
+  -- masses broken by finer detail; the threshold makes them puffy, not overcast.
+  def coverage(uv: vec2f32) f32 =
+    let p    = @[uv.x, 0.0, uv.y]
+    let big  = fbm(p * SCALE)
+    let fine = fbm(p * (SCALE * 3.0)) in
+    sat((big + 0.40 * fine - 0.56) * 3.3)
+
+  -- Sky colour along a normalized view ray: a pale backdrop below the cloud horizon,
+  -- a horizon->zenith gradient above it, with the projected cloud sheet over it.
+  def sky(ro: vec3f32, rd: vec3f32) vec3f32 =
+    let e = rd.y + HORIZ in
+    if e <= 0.0 then VOID
+    else
+      let grad = mix(HORIZON, ZENITH, sat(rd.y * 2.0 + 0.2))
+      let uv   = @[rd.x, rd.z] * (1.0 / e)     -- planar projection; blows up at the horizon
+      let cov  = coverage(uv)
+      let fade = sat(e * 10.0)                  -- ease clouds in above the horizon
+      let shade = mix(DARK, LIT, sat(cov * 1.3)) in
+      mix(grad, shade, cov * fade)
+}

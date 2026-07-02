@@ -25,6 +25,7 @@ import "bricks"
 import "walls"
 import "shadow"
 import "gtao"
+import "clouds"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
 -- entry binds at (set=1, binding=0). Continuous state lives here; discrete input
@@ -746,7 +747,11 @@ entry light(pxl: []u32,
     let y = i / w
     let alb = image_load(ga, @[x, y])
     let out =
-      if alb.w < 0.5 then @[alb.x, alb.y, alb.z, 1.0]
+      if alb.w < 0.5 then
+        -- Sky: raymarch static volumetric clouds along this pixel's view ray.
+        let (sro, srd) = get_ray(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], zoom)
+        let sc = clouds.sky(sro, srd) in
+        @[sc.x, sc.y, sc.z, 1.0]
       else
         let gnv = image_load(gn, @[x, y])
         let n = normalize(@[gnv.x, gnv.y, gnv.z])
