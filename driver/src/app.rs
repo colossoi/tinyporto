@@ -7,13 +7,16 @@
 //! per-frame schedule.
 
 use crate::generated::{
-    cull_out_bytes, cull_stages, occ_reduce_out_bytes, occ_reduce_stages, step_out_bytes,
-    light_out_bytes, light_stages, step_stages, walls_out_bytes, walls_stages,
-    BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS,
-    BRICK_VERTEX_BINDINGS, CULL_BINDINGS, CULL_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT,
-    OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
-    SCENE_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS,
-    STEP_BINDINGS, STEP_STAGE_COUNT, WALLS_BINDINGS, WALLS_STAGE_COUNT,
+    cull_out_bytes, cull_stages, gtao_denoise_out_bytes, gtao_denoise_stages, gtao_depth_out_bytes,
+    gtao_depth_stages, gtao_main_out_bytes, gtao_main_stages, occ_reduce_out_bytes,
+    occ_reduce_stages, step_out_bytes, light_out_bytes, light_stages, step_stages, walls_out_bytes,
+    walls_stages, BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS,
+    BRICK_VERTEX_BINDINGS, CULL_BINDINGS, CULL_STAGE_COUNT, GTAO_DENOISE_BINDINGS,
+    GTAO_DENOISE_STAGE_COUNT, GTAO_DEPTH_BINDINGS, GTAO_DEPTH_STAGE_COUNT, GTAO_MAIN_BINDINGS,
+    GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS,
+    OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS,
+    SHADOW_FRAGMENT_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, STEP_BINDINGS,
+    STEP_STAGE_COUNT, WALLS_BINDINGS, WALLS_STAGE_COUNT,
 };
 use crate::graph::*;
 
@@ -70,6 +73,17 @@ const fn light_out(binding: u32) -> u64 {
     light_out_bytes(binding, PXL_BYTES)
 }
 
+// The GTAO passes' output sizes (each an unused per-pixel dispatch carrier).
+const fn gtao_depth_out(binding: u32) -> u64 {
+    gtao_depth_out_bytes(binding, PXL_BYTES)
+}
+const fn gtao_main_out(binding: u32) -> u64 {
+    gtao_main_out_bytes(binding, PXL_BYTES)
+}
+const fn gtao_denoise_out(binding: u32) -> u64 {
+    gtao_denoise_out_bytes(binding, PXL_BYTES)
+}
+
 // Ordered compute stages per entry, dispatch sized from the seed counts. The
 // stage entry names and per-stage dispatch rules come from the descriptor (via
 // the generated `*_stages`); only the seed byte sizes are authored here.
@@ -78,6 +92,9 @@ static CULL_STAGES: [ComputeStage; CULL_STAGE_COUNT] = cull_stages(BIDX_BYTES);
 static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OTILE_BYTES);
 static WALLS_STAGES: [ComputeStage; WALLS_STAGE_COUNT] = walls_stages(WBIDX_BYTES);
 static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_BYTES);
+static GTAO_DEPTH_STAGES: [ComputeStage; GTAO_DEPTH_STAGE_COUNT] = gtao_depth_stages(PXL_BYTES);
+static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_BYTES);
+static GTAO_DENOISE_STAGES: [ComputeStage; GTAO_DENOISE_STAGE_COUNT] = gtao_denoise_stages(PXL_BYTES);
 
 pub const GRAPH: Graph = Graph {
     resources: &[
@@ -112,6 +129,11 @@ pub const GRAPH: Graph = Graph {
         // color target, nearest kept by the shared depth buffer), and `light` samples
         // it for directional cast shadows. Window-sized, mirroring scene_depth.
         Resource::Image { name: "sun_depth", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
+        // GTAO working images (all window-sized, write+sample like `lit`): viewspace
+        // depth, the raw AO+edges term, and the denoised AO the light pass reads.
+        Resource::Image { name: "vdepth", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
+        Resource::Image { name: "ao_work", format: TexFormat::Rgba16Float, size: ImgSize::Window, mips: 1 },
+        Resource::Image { name: "ao_out", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
         Resource::Buffer(BufferDef { name: "otile", size: Some(OTILE_BYTES), init: BufInit::Iota, indirect: false }),
         // Nine Phase 3 (deferred): the scene writes a thin G-buffer here (albedo +
         // world normal); `resolve_fragment` reads it back and lights it. `blit_args`
@@ -167,6 +189,12 @@ pub const GRAPH: Graph = Graph {
         ("gn", "g_normal"),
         // Sun shadow map (`shm` in `light`; written as the sun_shadow color target).
         ("shm", "sun_depth"),
+        // GTAO views: vdepth (write `vd` / sample `vd`), ao_work (write `aw` / sample
+        // `aw`), ao_out (write `ao` in denoise / sample `gao` in light).
+        ("vd", "vdepth"),
+        ("aw", "ao_work"),
+        ("ao", "ao_out"),
+        ("gao", "ao_out"),
         // Brick generator I/O + the instanced brick draw.
         ("wbidx", "wbidx"),
         ("walls_output_0", "wall_brick_inst"),
@@ -281,9 +309,33 @@ pub const GRAPH: Graph = Graph {
             stages: &OCC_STAGES,
             out_bytes: occ_out,
         }),
+        // GTAO: linearize scene depth to viewspace, integrate horizon AO, denoise.
+        // Runs after the scene pass (needs scene_depth) and before `light`, which
+        // reads the denoised ao_out.
+        Pass::Compute(ComputePass {
+            label: "gtao_depth",
+            module: "main",
+            bindings: GTAO_DEPTH_BINDINGS,
+            stages: &GTAO_DEPTH_STAGES,
+            out_bytes: gtao_depth_out,
+        }),
+        Pass::Compute(ComputePass {
+            label: "gtao_main",
+            module: "main",
+            bindings: GTAO_MAIN_BINDINGS,
+            stages: &GTAO_MAIN_STAGES,
+            out_bytes: gtao_main_out,
+        }),
+        Pass::Compute(ComputePass {
+            label: "gtao_denoise",
+            module: "main",
+            bindings: GTAO_DENOISE_BINDINGS,
+            stages: &GTAO_DENOISE_STAGES,
+            out_bytes: gtao_denoise_out,
+        }),
         // Deferred lighting: one compute invocation per pixel reads the G-buffer,
-        // estimates SSAO from the depth neighbourhood, and writes the final `lit`
-        // image (sun + AO-attenuated sky, tonemapped).
+        // folds in the GTAO term, and writes the final `lit` image (sun + shadows +
+        // AO-attenuated sky, tonemapped).
         Pass::Compute(ComputePass {
             label: "light",
             module: "main",

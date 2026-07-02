@@ -45,6 +45,10 @@ struct Args {
     /// Render a scripted scenario offscreen to this PNG and exit (no window).
     #[arg(long)]
     screenshot: Option<std::path::PathBuf>,
+    /// Camera zoom for the screenshot scenario, in [0,1] (0 = far/top-down,
+    /// 1 = near/flat). Matches the interactive scroll zoom.
+    #[arg(long, default_value_t = 0.4)]
+    zoom: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +118,9 @@ struct Res<'a> {
     pp: &'a HashMap<&'static str, [wgpu::Buffer; 2]>,
     views: &'a HashMap<&'static str, wgpu::TextureView>,
     samplers: &'a HashMap<&'static str, wgpu::Sampler>,
+    /// On-GPU pixel format of each image resource, keyed by name — lets a sampled
+    /// `texture2d` binding declare the correct `filterable` sample type.
+    img_formats: &'a HashMap<&'static str, TexFormat>,
 }
 
 impl Renderer {
@@ -147,6 +154,7 @@ impl Renderer {
         let mut pingpong: HashMap<&'static str, [wgpu::Buffer; 2]> = HashMap::new();
         let mut images: HashMap<&'static str, wgpu::Texture> = HashMap::new();
         let mut image_views: HashMap<&'static str, wgpu::TextureView> = HashMap::new();
+        let mut img_formats: HashMap<&'static str, TexFormat> = HashMap::new();
         let mut samplers: HashMap<&'static str, wgpu::Sampler> = HashMap::new();
         let mut sys: Vec<(&'static str, SysUniform)> = Vec::new();
         let mut has_depth = false;
@@ -176,6 +184,7 @@ impl Renderer {
                     let tex = create_image(device, name, format, w, h, mips, usage);
                     image_views.insert(name, tex.create_view(&wgpu::TextureViewDescriptor::default()));
                     images.insert(name, tex);
+                    img_formats.insert(name, format);
                 }
                 Resource::Sampler { name } => {
                     samplers.insert(name, make_sampler(device, name));
@@ -194,7 +203,13 @@ impl Renderer {
         let depth_view =
             has_depth.then(|| create_depth(device, gfx.config.width, gfx.config.height));
 
-        let res = Res { buffers: &buffers, pp: &pingpong, views: &image_views, samplers: &samplers };
+        let res = Res {
+            buffers: &buffers,
+            pp: &pingpong,
+            views: &image_views,
+            samplers: &samplers,
+            img_formats: &img_formats,
+        };
 
         // Passes (preserve order).
         let mut passes = Vec::new();
@@ -366,7 +381,7 @@ impl Renderer {
 
     /// Headless: render a scripted scenario into an offscreen texture and write it
     /// to `path` as a PNG. Used to eyeball the pipeline without a window.
-    fn screenshot(&mut self, path: &std::path::Path) -> Result<()> {
+    fn screenshot(&mut self, path: &std::path::Path, zoom: f32) -> Result<()> {
         let (w, h) = (self.gfx.config.width, self.gfx.config.height);
         let tex = self.gfx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
@@ -391,6 +406,7 @@ impl Renderer {
                 mouse_x: (0.25 + 0.50 * t) * w as f32,
                 mouse_y: (0.5 - 0.18 * (t * std::f32::consts::PI).sin()) * h as f32,
                 held: f + 4 < total, // release near the end
+                zoom,
                 ..Input::default()
             };
             self.update_uniforms(&input);
@@ -691,8 +707,10 @@ fn resolve<'a>(b: &Binding, parity: usize, res: Res<'a>) -> &'a wgpu::Buffer {
     }
 }
 
-/// The wgpu layout binding type for one resolved binding.
-fn layout_type(kind: BindingKind) -> wgpu::BindingType {
+/// The wgpu layout binding type for one resolved binding. `filterable` applies
+/// only to sampled `texture2d` bindings — it must be false for unfilterable
+/// formats (R32Float depth), which are read via `texture_load`.
+fn layout_type(kind: BindingKind, filterable: bool) -> wgpu::BindingType {
     match kind {
         BindingKind::Uniform => wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
@@ -709,7 +727,7 @@ fn layout_type(kind: BindingKind) -> wgpu::BindingType {
             }
         }
         BindingKind::Texture => wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            sample_type: wgpu::TextureSampleType::Float { filterable },
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },
@@ -745,7 +763,12 @@ fn build_sets(
             .map(|b| wgpu::BindGroupLayoutEntry {
                 binding: b.binding,
                 visibility,
-                ty: layout_type(b.kind),
+                // Sampled textures over unfilterable formats (R32Float) must declare
+                // a non-filterable sample type; look up the bound resource's format.
+                ty: layout_type(
+                    b.kind,
+                    res.img_formats.get(b.resource).map_or(true, |f| f.filterable()),
+                ),
                 count: None,
             })
             .collect();
@@ -1005,7 +1028,7 @@ fn main() -> Result<()> {
     if let Some(path) = args.screenshot.clone() {
         let gfx = Gfx::new_headless(args.width, args.height)?;
         let mut renderer = Renderer::new(gfx, &app::GRAPH)?;
-        return renderer.screenshot(&path);
+        return renderer.screenshot(&path, args.zoom);
     }
 
     let event_loop = EventLoop::new()?;

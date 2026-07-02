@@ -24,6 +24,7 @@ import "paint"
 import "bricks"
 import "walls"
 import "shadow"
+import "gtao"
 
 ------------------------------------------------------------
 -- State update (Wyn-owned). One compute entry, `step`, advances ALL persistent
@@ -270,6 +271,21 @@ resource sun_depth: image2d {
   size   = window
   usages = [storage_read]
 }
+
+------------------------------------------------------------
+-- GTAO (XeGTAO) ambient occlusion. Three per-pixel compute passes:
+-- gtao_depth linearizes scene_depth to viewspace depth
+-- (vdepth); gtao_main integrates horizon visibility + packs denoise edges into
+-- ao_work; gtao_denoise runs one edge-aware blur to ao_out, which `light` folds in.
+-- We call gtao.wyn's convenience wrappers, which keep the slice/step loops inside
+-- library defs (so no loops live in our `map` bodies) and fetch depth with
+-- texture_load (integer, no sampler). Working images are write+sample (like `lit`):
+-- written via storage in one pass, read as a sampled texture2d in the next.
+------------------------------------------------------------
+
+resource vdepth:  image2d { format = r32float     size = window  usages = [storage_write, sampled] }
+resource ao_work: image2d { format = rgba16float  size = window  usages = [storage_write, sampled] }
+resource ao_out:  image2d { format = r32float     size = window  usages = [storage_write, sampled] }
 
 ------------------------------------------------------------
 -- Cull (Nine's simple path). One record per running-bond cell is built, then
@@ -619,6 +635,65 @@ entry brick_shadow_vertex(#[builtin(vertex_index)] vid: i32,
 #[fragment]
 entry shadow_fragment(#[builtin(frag_coord)] fc: vec4f32) #[location(0)] f32 = fc.z
 
+-- Perspective constants for GTAO, built once from our fixed viewport + camera FOV
+-- (vertical 20°) and clip planes. Frame 0: no temporal accumulation (we have no TAA),
+-- so the per-pixel noise is static and the denoise pass cleans it up spatially.
+def gtao_consts: gtao.consts =
+  gtao.make_constants(@[1280.0, 800.0], f32.tan(f32.radians(10.0)),
+                      CLIP_NEAR, CLIP_FAR, 0u32, gtao.default_settings)
+
+-- Pass 1: linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
+-- to CLIP_FAR so it stays finite and never reads as an occluder.
+#[compute]
+entry gtao_depth(pxl: []u32,
+                 #[view(scene_depth, storage_read)] sd: storage_image,
+                 #[view(vdepth, storage_write)]     vd: storage_image)
+  []u32 =
+  map(|t|
+    let i = i32(t)
+    let x = i % 1280
+    let y = i / 1280
+    let ndc = image_load(sd, @[x, y]).x
+    let vz = if ndc > 0.99999 then CLIP_FAR
+             else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts))
+    let _ = image_store(vd, @[x, y], @[vz, 0.0, 0.0, 1.0]) in
+    0u32
+    , pxl)
+
+-- Pass 2: GTAO main (High preset = 3 slices x 3 steps), normals reconstructed from
+-- vdepth. Writes the raw visibility term (.x) + packed denoise edges (.y) to ao_work.
+-- The slice/step loops live inside gtao.main_pass_single, not here.
+#[compute]
+entry gtao_main(pxl: []u32,
+                #[view(vdepth, sampled)]        vd: texture2d,
+                #[view(ao_work, storage_write)] aw: storage_image)
+  []u32 =
+  map(|t|
+    let i = i32(t)
+    let x = i % 1280
+    let y = i / 1280
+    let nrm = gtao.compute_viewspace_normal(@[x, y], vd, gtao_consts)
+    let noise = gtao.spatiotemporal_noise(@[u32(x), u32(y)], 0u32)
+    let (vis, edg) = gtao.main_pass_single(@[x, y], 3, 3, noise, nrm, gtao_consts, vd)
+    let _ = image_store(aw, @[x, y], @[vis, edg, 0.0, 1.0]) in
+    0u32
+    , pxl)
+
+-- Pass 3: one edge-aware denoise blur (final_apply) -> ao_out (visibility in .x).
+#[compute]
+entry gtao_denoise(pxl: []u32,
+                   #[view(ao_work, sampled)]      aw: texture2d,
+                   #[view(ao_out, storage_write)] ao: storage_image)
+  []u32 =
+  map(|t|
+    let i = i32(t)
+    let x = i % 1280
+    let y = i / 1280
+    let (v, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true)
+    let _ = image_store(ao, @[x, y], @[v, v, v, 1.0]) in
+    0u32
+    , pxl)
+
 ------------------------------------------------------------
 -- Deferred lighting (Nine Phase 3, the compute stage). One invocation per pixel
 -- reads the thin G-buffer, estimates screen-space ambient occlusion from the depth
@@ -641,6 +716,7 @@ entry light(pxl: []u32,
             #[view(g_normal, storage_read)]  gn: storage_image,
             #[view(scene_depth, storage_read)] sd: storage_image,
             #[view(sun_depth, storage_read)]  shm: storage_image,
+            #[view(ao_out, sampled)]          gao: texture2d,
             #[view(lit, storage_write)]       lt: storage_image)
   []u32 =
   map(|s|
@@ -661,17 +737,8 @@ entry light(pxl: []u32,
         let gnv = image_load(gn, @[x, y])
         let n = normalize(@[gnv.x, gnv.y, gnv.z])
         let cd = image_load(sd, @[x, y]).x
-        -- SSAO: fraction of a small ring of depth neighbours nearer than this pixel
-        -- (occluders in a crevice / contact). Out-of-frame taps don't occlude.
-        let occ =
-          loop occ = 0.0 for k < 8 do
-            let ang = f32(k) * 0.7853982
-            let nx = x + i32(5.0 * f32.cos(ang))
-            let ny = y + i32(5.0 * f32.sin(ang))
-            let inb = nx >= 0 && nx < w && ny >= 0 && ny < h
-            let nd = if inb then image_load(sd, @[nx, ny]).x else cd in
-            if nd > 0.0 && nd < cd - 0.00004 then occ + 1.0 else occ
-        let ao = occ / 8.0
+        -- Ambient occlusion from the GTAO pass, as an occlusion amount (1 - visibility).
+        let ao = 1.0 - texture_load(gao, @[x, y], 0).x
         -- Ray-marched contact shadow toward the sun (shadow.wyn owns the math;
         -- only the depth read stays here, since a `def` can't take an image). March
         -- from this pixel's reconstructed, surface-lifted world position; a step

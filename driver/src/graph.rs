@@ -84,6 +84,17 @@ pub enum TexFormat {
     R32Float,
 }
 
+impl TexFormat {
+    /// Whether a sampled view of this format supports linear filtering. The
+    /// single-/four-channel 32-bit float formats are unfilterable on the default
+    /// feature set, so a sampled `texture2d` over them must declare
+    /// `Float { filterable: false }` (they are read via `texture_load`, not a
+    /// filtering sampler).
+    pub fn filterable(self) -> bool {
+        !matches!(self, TexFormat::R32Float | TexFormat::Rgba32Float)
+    }
+}
+
 /// How a compute shader touches a `storage_image` view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ImgAccess {
