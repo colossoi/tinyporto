@@ -16,12 +16,8 @@ pub enum FrameSource {
     Resolution,
     /// `f32` camera zoom in [0,1].
     Zoom,
-    /// `vec2f32` cursor position in pixels.
-    Mouse,
-    /// `f32` left button (1.0 held / 0.0 up).
-    MouseHeld,
-    /// `vec4u32` one-frame key pulses: (x = Tab, y = toggle, …).
-    Keys,
+    /// `u32` live modifier mask at frame time (bit0 shift, 1 ctrl, 2 alt, 3 super).
+    Mods,
 }
 
 /// One member of a uniform block the driver fills: which frame value goes in it.

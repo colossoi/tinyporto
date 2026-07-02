@@ -43,6 +43,10 @@ const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
 // window size / frame.resolution — see occ_depth's note on window-relative sizing).
 const PXL_COUNT: u64 = 1280 * 800;
 const PXL_BYTES: u64 = PXL_COUNT * 4;
+// Input event stream: EV_CAP events (must match `step`'s EV_CAP in main.wyn), one
+// vec4f32 (16 bytes) each. The host zero-pads unused slots to None each frame.
+pub const EV_CAP: usize = 32;
+const EVENTS_BYTES: u64 = EV_CAP as u64 * 16;
 
 // `step`'s output sizes, by binding, from the generated calc (the seed sizes are
 // baked in). The driver pairs this with the binding table to size each output
@@ -106,11 +110,12 @@ pub const GRAPH: Graph = Graph {
             members: &[
                 BlockMember { field: "resolution", source: FrameSource::Resolution },
                 BlockMember { field: "zoom", source: FrameSource::Zoom },
-                BlockMember { field: "mouse", source: FrameSource::Mouse },
-                BlockMember { field: "mouse_held", source: FrameSource::MouseHeld },
-                BlockMember { field: "keys", source: FrameSource::Keys },
+                BlockMember { field: "mods", source: FrameSource::Mods },
             ],
         },
+        // Input event stream: the host appends one vec4f32 per raw event and
+        // zero-pads to EV_CAP; `step` folds it. Written fresh each frame.
+        Resource::Buffer(BufferDef { name: "events", size: Some(EVENTS_BYTES), init: BufInit::Zeroed, indirect: false }),
         // Persistent state (ping-pong); sizes derived (they're `step` outputs).
         Resource::PingPong { name: "uistate", size: None },
         Resource::PingPong { name: "points", size: None },
@@ -173,6 +178,7 @@ pub const GRAPH: Graph = Graph {
         ("points_in", "points"),
         ("items_in", "items"),
         ("head_in", "head"),
+        ("events", "events"),
         ("frame", "frame"),
         ("step_output_0", "uistate"),
         ("step_output_1", "points"),

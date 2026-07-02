@@ -24,7 +24,6 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use gfx::Gfx;
@@ -51,21 +50,19 @@ struct Args {
     zoom: f32,
 }
 
+/// Continuous per-frame state written into the `frame` uniform block. Discrete
+/// input (keys, buttons, cursor motion) travels as the event stream instead.
 #[derive(Clone, Copy)]
 struct Input {
-    mouse_x: f32,
-    mouse_y: f32,
-    held: bool,
-    /// One-frame key pulses (set on keydown edge, cleared after each frame).
-    tab_pulse: bool,
-    line_pulse: bool,
     /// Accumulated scroll zoom in [0,1] (0 = far/top-down, 1 = near/flat).
     zoom: f32,
+    /// Live modifier mask (bit0 shift, 1 ctrl, 2 alt, 3 super).
+    mods: u32,
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self { mouse_x: 0.0, mouse_y: 0.0, held: false, tab_pulse: false, line_pulse: false, zoom: 0.4 }
+        Self { zoom: 0.4, mods: 0 }
     }
 }
 
@@ -256,6 +253,15 @@ impl Renderer {
         }
     }
 
+    /// Upload this frame's input events into the `events` buffer, zero-padding
+    /// unused slots to None (kind 0) and dropping any past EV_CAP.
+    fn upload_events(&self, events: &[[f32; 4]]) {
+        let mut buf = vec![[0.0f32; 4]; app::EV_CAP];
+        let n = events.len().min(app::EV_CAP);
+        buf[..n].copy_from_slice(&events[..n]);
+        self.gfx.queue.write_buffer(&self.buffers["events"], 0, bytemuck::cast_slice(&buf));
+    }
+
     fn update_uniforms(&self, input: &Input) {
         let q = &self.gfx.queue;
         let w = self.gfx.config.width as f32;
@@ -272,21 +278,11 @@ impl Renderer {
                     .unwrap_or_else(|| panic!("block '{name}' has no member '{}'", m.field));
                 let off = *offset as usize;
                 match m.source {
-                    // Discrete key pulses are u32 (the shader reads vec4u32).
-                    FrameSource::Keys => {
-                        let v: [u32; 4] = [input.tab_pulse as u32, input.line_pulse as u32, 0, 0];
-                        put(&mut bytes, off, bytemuck::cast_slice(&v));
-                    }
                     FrameSource::Resolution => {
                         put(&mut bytes, off, bytemuck::cast_slice(&[w, h, if h > 0.0 { w / h } else { 1.0 }]));
                     }
                     FrameSource::Zoom => put(&mut bytes, off, bytemuck::cast_slice(&[input.zoom])),
-                    FrameSource::Mouse => {
-                        put(&mut bytes, off, bytemuck::cast_slice(&[input.mouse_x, input.mouse_y]));
-                    }
-                    FrameSource::MouseHeld => {
-                        put(&mut bytes, off, bytemuck::cast_slice(&[if input.held { 1.0f32 } else { 0.0 }]));
-                    }
+                    FrameSource::Mods => put(&mut bytes, off, bytemuck::cast_slice(&[input.mods])),
                 }
             }
             q.write_buffer(&self.buffers[name], 0, &bytes);
@@ -409,18 +405,30 @@ impl Renderer {
 
         // Script a water-stroke drag across the middle of the screen, then release,
         // so the shot exercises capture -> tessellation -> ribbon, not just the base.
+        // Drive it as the same event stream the live path produces: a MouseDown on
+        // the first held frame, a MouseMove each held frame, a MouseUp on release.
         let total = 20u32;
         let mut frame_ms: Vec<f32> = Vec::new();
+        let mut prev_held = false;
         for f in 0..total {
             let t = f as f32 / (total - 1).max(1) as f32;
             // A curved sweep (one sine arch) so the ribbon shows the spline curving.
-            let input = Input {
-                mouse_x: (0.25 + 0.50 * t) * w as f32,
-                mouse_y: (0.5 - 0.18 * (t * std::f32::consts::PI).sin()) * h as f32,
-                held: f + 4 < total, // release near the end
-                zoom,
-                ..Input::default()
-            };
+            let mx = (0.25 + 0.50 * t) * w as f32;
+            let my = (0.5 - 0.18 * (t * std::f32::consts::PI).sin()) * h as f32;
+            let held = f + 4 < total; // release near the end
+            let mut events: Vec<[f32; 4]> = Vec::new();
+            if held && !prev_held {
+                events.push(encode_event(EV_MOUSEDOWN, 0, 0.0, mx, my));
+            }
+            if held {
+                events.push(encode_event(EV_MOUSEMOVE, 0, 0.0, mx, my));
+            }
+            if !held && prev_held {
+                events.push(encode_event(EV_MOUSEUP, 0, 0.0, mx, my));
+            }
+            prev_held = held;
+            let input = Input { zoom, ..Input::default() };
+            self.upload_events(&events);
             self.update_uniforms(&input);
             let t0 = Instant::now();
             let mut enc = self
@@ -498,6 +506,29 @@ impl Renderer {
 /// Copy `src` into `dst` starting at `off` (one uniform-block member).
 fn put(dst: &mut [u8], off: usize, src: &[u8]) {
     dst[off..off + src.len()].copy_from_slice(src);
+}
+
+// Input event kinds (must match `step`'s constants in main.wyn).
+const EV_KEYDOWN: u32 = 1;
+const EV_KEYUP: u32 = 2;
+const EV_MOUSEDOWN: u32 = 3;
+const EV_MOUSEUP: u32 = 4;
+const EV_MOUSEMOVE: u32 = 5;
+
+/// Encode one input event as a `vec4f32`: `.x = kind*256 + mods` (mods frozen at
+/// the event), `.y = code` (keycode / button index), `.z,.w = cursor pixels).
+fn encode_event(kind: u32, mods: u32, code: f32, x: f32, y: f32) -> [f32; 4] {
+    [(kind * 256 + mods) as f32, code, x, y]
+}
+
+/// Map a physical key to the shared keycode table `step` reads (None = ignored).
+fn keycode(pk: winit::keyboard::PhysicalKey) -> Option<f32> {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    match pk {
+        PhysicalKey::Code(KeyCode::Tab) => Some(1.0),  // KEY_TAB
+        PhysicalKey::Code(KeyCode::KeyL) => Some(2.0),  // KEY_L
+        _ => None,
+    }
 }
 
 fn make_uniform(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
@@ -946,6 +977,10 @@ fn build_item(
 struct App {
     args: Args,
     input: Input,
+    /// Raw input events since the last redraw; uploaded and cleared each frame.
+    events: Vec<[f32; 4]>,
+    /// Last cursor position (pixels), stamped onto button events.
+    mouse: (f32, f32),
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
 }
@@ -990,12 +1025,20 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(sz) => renderer.resize(sz.width, sz.height),
+            WindowEvent::ModifiersChanged(m) => {
+                let s = m.state();
+                self.input.mods = (s.shift_key() as u32)
+                    | ((s.control_key() as u32) << 1)
+                    | ((s.alt_key() as u32) << 2)
+                    | ((s.super_key() as u32) << 3);
+            }
             WindowEvent::CursorMoved { position, .. } => {
-                self.input.mouse_x = position.x as f32;
-                self.input.mouse_y = position.y as f32;
+                self.mouse = (position.x as f32, position.y as f32);
+                self.events.push(encode_event(EV_MOUSEMOVE, self.input.mods, 0.0, self.mouse.0, self.mouse.1));
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.input.held = state == ElementState::Pressed;
+                let kind = if state == ElementState::Pressed { EV_MOUSEDOWN } else { EV_MOUSEUP };
+                self.events.push(encode_event(kind, self.input.mods, 0.0, self.mouse.0, self.mouse.1));
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
@@ -1005,23 +1048,22 @@ impl ApplicationHandler for App {
                 self.input.zoom = (self.input.zoom + dy * 0.08).clamp(0.0, 1.0);
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
-                // Edge-detect keydown (ignore auto-repeat); set a one-frame pulse.
-                // The driver doesn't interpret these — Wyn's `ui` pass does.
-                if key_event.state == ElementState::Pressed && !key_event.repeat {
-                    match key_event.physical_key {
-                        PhysicalKey::Code(KeyCode::Tab) => self.input.tab_pulse = true,
-                        PhysicalKey::Code(KeyCode::KeyL) => self.input.line_pulse = true,
-                        _ => {}
+                // Forward keydown/up edges (ignore auto-repeat) as events carrying the
+                // live mods. The driver maps physical keys to codes but never assigns
+                // them meaning — `step` does.
+                if !key_event.repeat {
+                    if let Some(code) = keycode(key_event.physical_key) {
+                        let kind = if key_event.state == ElementState::Pressed { EV_KEYDOWN } else { EV_KEYUP };
+                        self.events.push(encode_event(kind, self.input.mods, code, 0.0, 0.0));
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
+                renderer.upload_events(&self.events);
+                self.events.clear();
                 if let Err(e) = renderer.render(&self.input) {
                     eprintln!("render error: {e:?}");
                 }
-                // Pulses last exactly one rendered frame.
-                self.input.tab_pulse = false;
-                self.input.line_pulse = false;
                 if self.args.frames != 0 && renderer.frame >= self.args.frames {
                     println!("rendered {} frames; exiting (--frames)", renderer.frame);
                     event_loop.exit();
@@ -1050,7 +1092,14 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App { args, input: Input::default(), window: None, renderer: None };
+    let mut app = App {
+        args,
+        input: Input::default(),
+        events: Vec::new(),
+        mouse: (0.0, 0.0),
+        window: None,
+        renderer: None,
+    };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
