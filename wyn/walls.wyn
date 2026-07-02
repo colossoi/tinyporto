@@ -27,7 +27,48 @@ def COURSES:    i32 = 20
 def PER_WALL:   i32 = 240   -- PER_COURSE * COURSES
 def N_BUILD:    i32 = 2
 def N_WALL:     i32 = 8     -- N_BUILD * 4
-def WALL_BRICKS: i32 = 1920 -- N_WALL * PER_WALL
+def BRICK_SLOTS: i32 = 1920 -- N_WALL * PER_WALL (running-bond bricks)
+
+-- One placed block: a self-describing instance record shared by the running-bond
+-- bricks and the quoins. `kind` (0 brick, 1 quoin) selects the box size + colour;
+-- a dead slot is marked with center.y = -1 so the generator's `filter` drops it.
+type block = { center: vec3f32, yaw: f32, kind: u32 }
+
+-- Quoins (cornerstones): a straight, non-alternating vertical stack of larger
+-- limestone blocks at each of the buildings' four vertical corners, laid over the
+-- brick as an add-on course. They ride the SAME instanced pipeline as the bricks
+-- (one cull + one draw), appended after the brick slots and distinguished by `kind`.
+def N_CORNER:      i32 = 8       -- N_BUILD * 4 corners
+def QUOIN_CRS:     f32 = 0.19    -- quoin course height (~2 brick courses)
+def QUOIN_COURSES: i32 = 16
+def QUOIN_SLOTS:   i32 = 128     -- N_CORNER * QUOIN_COURSES
+def QUOIN_HX: f32 = 0.13         -- chunky, proud of the wall faces
+def QUOIN_HY: f32 = 0.085
+def QUOIN_HZ: f32 = 0.13
+def QUOIN_COLOR: vec3f32 = @[0.82, 0.80, 0.74]  -- limestone
+
+def WALL_BRICKS: i32 = 2048 -- BRICK_SLOTS + QUOIN_SLOTS (total candidates)
+
+-- Box half-extents for a block kind (0 brick, 1 quoin; taken as f32 so the
+-- fragment can pass its interpolated flag straight in). brick_vertex /
+-- brick_fragment / brick_shadow_vertex share this so both block types raymarch.
+def brick_half(kind: f32) vec3f32 =
+  if kind > 0.5 then @[QUOIN_HX, QUOIN_HY, QUOIN_HZ] else @[BRK_HX, BRK_HY, BRK_HZ]
+
+-- Quoin `qi` (0..QUOIN_SLOTS). Corner = qi/COURSES, course = qi%COURSES; an
+-- axis-aligned (yaw 0) box planted on the building corner, stacked straight up.
+-- Slots past the building height are dead (center.y = -1).
+def quoin(qi: i32) block =
+  let corner = qi / QUOIN_COURSES
+  let course = qi % QUOIN_COURSES
+  let b = corner / 4
+  let csel = corner % 4
+  let (cx, cz, hw, hd, h) = building_rect(b)
+  let qx = if csel == 1 || csel == 2 then cx + hw else cx - hw
+  let qz = if csel == 2 || csel == 3 then cz + hd else cz - hd
+  let n_crs = i32(h / QUOIN_CRS)
+  let qy = if course >= n_crs then 0.0 - 1.0 else f32(course) * QUOIN_CRS + QUOIN_CRS * 0.5 in
+  { center = @[qx, qy, qz], yaw = 0.0, kind = 1u32 }
 
 -- Building footprints: (center x, center z, half width, half depth, height).
 def building_rect(b: i32) (f32, f32, f32, f32, f32) =
@@ -50,11 +91,14 @@ def wall(w: i32) (vec2f32, vec2f32, f32, f32) =
   else if side == 2 then (@[x1, z1], @[x0, z1], h, 0.0)
   else (@[x0, z1], @[x0, z0], h, 1.5707963)
 
--- Brick `i` (global index) -> its centre (xyz) + yaw, packed as a vec4. Running
--- bond: odd courses shift half a brick. A dead slot (past the wall's brick count,
--- or an offset brick that would overshoot the wall) returns y = -1 so the
--- generator's `filter` drops it (valid bricks always have y >= BRK_CRS/2 > 0).
-def wall_brick(i: i32) vec4f32 =
+-- Candidate `i` (global index) -> its centre (xyz) + packed `w`. Indices past the
+-- brick slots are quoins. Running bond for bricks: odd courses shift half a brick.
+-- A dead slot (past the wall's brick count, or an offset brick that would overshoot
+-- the wall) returns y = -1 so the generator's `filter` drops it (valid blocks always
+-- have y >= BRK_CRS/2 > 0).
+def wall_brick(i: i32) block =
+  if i >= BRICK_SLOTS then quoin(i - BRICK_SLOTS)
+  else
   let w = i / PER_WALL
   let local = i % PER_WALL
   let course = local / PER_COURSE
@@ -78,5 +122,5 @@ def wall_brick(i: i32) vec4f32 =
   let pz = dir.x
   let cx = a.x + dir.x * along + px * jp
   let cz = a.y + dir.y * along + pz * jp
-  let cy = f32(course) * BRK_CRS + BRK_CRS * 0.5 + jv in
-  if dead then @[cx, 0.0 - 1.0, cz, yaw + jyaw] else @[cx, cy, cz, yaw + jyaw]
+  let cy = if dead then 0.0 - 1.0 else f32(course) * BRK_CRS + BRK_CRS * 0.5 + jv in
+  { center = @[cx, cy, cz], yaw = yaw + jyaw, kind = 0u32 }

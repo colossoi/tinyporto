@@ -37,7 +37,7 @@ const OCC_COUNT: u64 = 160 * 100;
 const OTILE_BYTES: u64 = OCC_COUNT * 4;
 // Wall-brick budget (must match walls.wyn: N_WALL * PER_WALL). `wbidx` is the iota
 // domain the `walls` generator maps over (one slot per candidate brick).
-const WALL_BRICKS: u64 = 1920;
+const WALL_BRICKS: u64 = 2048;
 const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
 // Deferred lighting dispatch: one invocation per window pixel (must match the
 // window size / frame.resolution — see occ_depth's note on window-relative sizing).
