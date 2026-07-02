@@ -1,0 +1,41 @@
+-- pack.wyn — uniform 1-D layout calculators: "how many fit, and where."
+--
+-- The recurring question across the whole project: given equal things of some size,
+-- a span to place them in, a gap between them, and a minimum clear margin at the
+-- ends, how many fit and where do they sit? Bricks in a course, courses in a wall,
+-- windows in a resizable wall, setts along an axis — all the same math.
+--
+-- The run is CENTRED: whatever space is left over after the things + gaps + minimum
+-- margins is split evenly onto the two ends, so `pad` (the actual clear at each end)
+-- is always >= the requested minimum. Callers place item i (0..count-1) at
+--   near_edge_i = pad + i*(size + gap)          (its centre at + size*0.5)
+--
+-- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+
+-- Count of things of extent `size` that fit across `span` with `gap` between them
+-- and at least `end` clear at each end. >= 0.
+def fit_count(size: f32, span: f32, gap: f32, end: f32) i32 =
+  let avail = span - 2.0 * end in         -- space for the run of things + inner gaps
+  if avail < size then 0i32
+  else i32(f32.floor((avail + gap) / (size + gap)))
+
+-- The run's total extent (things + inner gaps) for `n` things of `size` with `gap`
+-- between. 0 for n <= 0.
+def run_len(n: i32, size: f32, gap: f32) f32 =
+  if n <= 0i32 then 0.0 else f32(n) * size + f32(n - 1) * gap
+
+-- Symmetric case: (count, pad) where `pad` is the actual clear space at EACH end
+-- (leftover split evenly, so the run is centred; pad >= end).
+def fit(size: f32, span: f32, gap: f32, end: f32) (i32, f32) =
+  let n = fit_count(size, span, gap, end)
+  let used = run_len(n, size, gap) in
+  (n, (span - used) * 0.5)
+
+-- Per-end minimums: (count, pad_lo, pad_hi). Both minimums are reserved, then the
+-- remaining slack is split evenly so the run stays centred within the margins.
+def fit_ends(size: f32, span: f32, gap: f32, end_lo: f32, end_hi: f32) (i32, f32, f32) =
+  let avail = span - end_lo - end_hi
+  let n = if avail < size then 0i32 else i32(f32.floor((avail + gap) / (size + gap)))
+  let used = run_len(n, size, gap)
+  let slack = (span - used - end_lo - end_hi) * 0.5 in
+  (n, end_lo + slack, end_hi + slack)

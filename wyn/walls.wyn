@@ -8,6 +8,7 @@
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
 import "bricks"   -- brick_hash for the per-brick jitter
+import "pack"     -- fit(): how many courses/bricks/quoins fit a span
 
 -- Brick cell spacing (the running-bond grid) and the drawn half-extents. The brick
 -- is a bit smaller than its cell so neighbours leave a mortar gap, exactly like the
@@ -21,14 +22,19 @@ def BRK_SIZE_VAR: f32 = 0.011  -- per-brick half-size wobble (very slight)
 def BRICK_BASE:  vec3f32 = @[0.71, 0.36, 0.28]   -- terracotta
 def BRICK_BASE2: vec3f32 = @[0.60, 0.30, 0.24]   -- browner / darker fired clay
 
--- Fixed per-wall brick budget (a grid of PER_COURSE x COURSES). Slots past the
--- wall's real extent are marked dead and compacted away, like the cobble grid.
-def PER_COURSE: i32 = 12
-def COURSES:    i32 = 20
-def PER_WALL:   i32 = 240   -- PER_COURSE * COURSES
+-- The per-wall candidate grid (PER_COURSE x COURSES) is a hard cap — the dispatch
+-- size is a compile-time constant, so slots past a wall's real extent are marked dead
+-- and compacted away. Being a cap, it must cover the WORST case, so it's DERIVED by
+-- the same `fit` that lays the bricks over the design envelope (longest & tallest
+-- wall) — never hand-counted. Bump the envelope if a building grows past it.
+def MAX_WALL_LEN: f32 = 2.6   -- longest wall across all buildings
+def MAX_WALL_H:   f32 = 2.4   -- tallest
 def N_BUILD:    i32 = 2
-def N_WALL:     i32 = 8     -- N_BUILD * 4
-def BRICK_SLOTS: i32 = 1920 -- N_WALL * PER_WALL (running-bond bricks)
+def N_WALL:     i32 = 8       -- N_BUILD * 4
+def PER_COURSE: i32 = fit_count(BRK_HX * 2.0, MAX_WALL_LEN, BRK_LEN - BRK_HX * 2.0, 0.0)
+def COURSES:    i32 = fit_count(BRK_HY * 2.0, MAX_WALL_H,   BRK_CRS - BRK_HY * 2.0, 0.0)
+def PER_WALL:   i32 = PER_COURSE * COURSES
+def BRICK_SLOTS: i32 = N_WALL * PER_WALL
 
 -- One placed block: a self-describing instance record shared by the running-bond
 -- bricks, the quoins, and the per-wall grout slab. It carries its own box
@@ -42,12 +48,12 @@ type block = { center: vec3f32, yaw: f32, kind: u32, half: vec3f32 }
 -- brick as an add-on course. They ride the SAME instanced pipeline as the bricks
 -- (one cull + one draw), appended after the brick slots and distinguished by `kind`.
 def N_CORNER:      i32 = 8       -- N_BUILD * 4 corners
-def QUOIN_CRS:     f32 = 0.19    -- quoin course height (~2 brick courses)
-def QUOIN_COURSES: i32 = 16
+def QUOIN_TH:      f32 = 0.17    -- quoin block height (~2 brick courses)
+def QUOIN_GAP_V:   f32 = 0.02    -- mortar between quoin blocks
+def QUOIN_COURSES: i32 = 16      -- budget cap; tallest wall needs ~13
 def QUOIN_SLOTS:   i32 = 128     -- N_CORNER * QUOIN_COURSES
 def QUOIN_HX: f32 = 0.13         -- chunky, proud of the wall faces
 def QUOIN_HZ: f32 = 0.13
-def QUOIN_GAP: f32 = 0.9         -- quoin half-height as a fraction of its (stretched) course
 def QUOIN_COLOR: vec3f32 = @[0.82, 0.80, 0.74]  -- limestone
 
 -- Grout: one solid slab per wall, sat behind the bricks so the white mortar shows
@@ -63,17 +69,16 @@ def GROUT_COLOR: vec3f32 = @[0.90, 0.89, 0.87]  -- off-white mortar
 def GROUT_SLOTS: i32 = 8      -- one per wall (N_WALL)
 def wall_has_grout(w: i32) bool = true   -- flip per wall to make the slab optional
 
-def WALL_BRICKS: i32 = 2056 -- BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS (total candidates)
 
--- The wall's actual brick-field height: whole courses of BRK_CRS. Rounded (the +0.5)
--- so float error in h/BRK_CRS can't drop the top course. Bricks fill to this, and the
--- quoins and grout are sized off it too, so all three top out together.
-def wall_field_h(h: f32) f32 = f32(i32(h / BRK_CRS + 0.5)) * BRK_CRS
+-- The wall's vertical brick layout, from pack.fit: (course count, pad) where the
+-- brick field spans [pad, h - pad], centred. The SINGLE SOURCE OF TRUTH for a wall's
+-- height — bricks fill it, quoins stretch to it, grout spans it, so all three top out
+-- together. (Brick course = BRK_HY*2 tall + the mortar gap that makes up BRK_CRS.)
+def wall_courses(h: f32) (i32, f32) = fit(BRK_HY * 2.0, h, BRK_CRS - BRK_HY * 2.0, 0.0)
 
--- Quoin `qi` (0..QUOIN_SLOTS). Corner = qi/COURSES, course = qi%COURSES; an
--- axis-aligned (yaw 0) box on the building corner, stacked straight up. The course
--- count/height are stretched to fill the brick field EXACTLY (QUOIN_CRS is a target),
--- so the quoin stack reaches the same top as the bricks — never over or under.
+-- Quoin `qi` (0..QUOIN_SLOTS). Corner = qi/COURSES, course = qi%COURSES; an axis-
+-- aligned (yaw 0) box on the building corner, stacked to fill the brick field EXACTLY
+-- — its course height stretches so the stack reaches the same top as the bricks.
 def quoin(qi: i32) block =
   let corner = qi / QUOIN_COURSES
   let course = qi % QUOIN_COURSES
@@ -82,28 +87,27 @@ def quoin(qi: i32) block =
   let (cx, cz, hw, hd, h) = building_rect(b)
   let qx = if csel == 1 || csel == 2 then cx + hw else cx - hw
   let qz = if csel == 2 || csel == 3 then cz + hd else cz - hd
-  let fh = wall_field_h(h)
-  let n = i32(fh / QUOIN_CRS + 0.5)             -- quoin courses that fit the field
-  let crs = fh / f32(n)                          -- stretched course height (reaches fh exactly)
-  let qy = if course >= n then 0.0 - 1.0 else f32(course) * crs + crs * 0.5 in
+  let (_, pad) = wall_courses(h)
+  let fh = h - 2.0 * pad                                    -- brick-field height
+  let n = i32(f32.max(1.0, f32.floor(fh / (QUOIN_TH + QUOIN_GAP_V) + 0.5)))  -- courses to fill it
+  let pitch = fh / f32(n)                                   -- stretched to reach the top exactly
+  let qy = if course >= n then 0.0 - 1.0 else pad + f32(course) * pitch + pitch * 0.5 in
   { center = @[qx, qy, qz], yaw = 0.0, kind = 1u32,
-    half = @[QUOIN_HX, crs * 0.5 * QUOIN_GAP, QUOIN_HZ] }
+    half = @[QUOIN_HX, (pitch - QUOIN_GAP_V) * 0.5, QUOIN_HZ] }
 
--- Grout `gi` (0..GROUT_SLOTS) = wall gi: a slab in the wall's local frame (x along,
--- z thickness) so `yaw` orients it like the bricks. Its height matches the actual
--- brick field (n_crs courses, NOT the nominal wall height h — those differ once
--- h/BRK_CRS truncates), inset by GROUT_EXTENT so the top course overhangs it.
+-- Grout `gi` (0..GROUT_SLOTS) = wall gi: a slab spanning the brick field, in the
+-- wall's local frame (x along, z thickness) so `yaw` orients it like the bricks.
+-- GROUT_EXTENT insets its face, GROUT_DEPTH recesses its thickness.
 def grout(gi: i32) block =
   let (a, bb, h, yaw) = wall(gi)
   let len = distance(a, bb)
-  let field_h = wall_field_h(h)                   -- top of the last brick course
+  let (_, pad) = wall_courses(h)
   let mx = (a.x + bb.x) * 0.5
   let mz = (a.y + bb.y) * 0.5
-  let cy = field_h * 0.5
-  let my = if wall_has_grout(gi) then cy else 0.0 - 1.0 in
+  let my = if wall_has_grout(gi) then h * 0.5 else 0.0 - 1.0 in
   { center = @[mx, my, mz], yaw = yaw, kind = 2u32,
     half = @[f32.max(len * 0.5 - GROUT_EXTENT, 0.0),
-             f32.max(field_h * 0.5 - GROUT_EXTENT, 0.0),
+             f32.max(h * 0.5 - pad - GROUT_EXTENT, 0.0),
              BRK_HZ * GROUT_DEPTH] }
 
 -- Building footprints: (center x, center z, half width, half depth, height).
@@ -143,8 +147,8 @@ def wall_brick(i: i32) block =
   let (a, bb, h, yaw) = wall(w)
   let len = distance(a, bb)
   let dir = @[(bb.x - a.x) / len, (bb.y - a.y) / len]
-  let n_per = i32(len / BRK_LEN)
-  let n_crs = i32(h / BRK_CRS + 0.5)
+  let (n_per, pad_x) = fit(BRK_HX * 2.0, len, BRK_LEN - BRK_HX * 2.0, 0.0)  -- bricks per course
+  let (n_crs, pad_y) = wall_courses(h)                                       -- courses (shared)
   let off = if (course % 2) == 1 then BRK_LEN * 0.5 else 0.0
   -- Per-brick jitter, keyed on the STABLE index i (so a brick's look survives
   -- compaction). Wall bricks are neatly laid — only a faint hand-laid wobble.
@@ -154,12 +158,12 @@ def wall_brick(i: i32) block =
   let jv = (brick_hash(i * 4 + 3) - 0.5) * 0.007
   let jyaw = (brick_hash(i * 4 + 5) - 0.5) * 0.05
   let js = (brick_hash(i * 4 + 6) - 0.5) * BRK_SIZE_VAR  -- per-brick size wobble
-  let along = f32(col) * BRK_LEN + off + BRK_LEN * 0.5 + ja
+  let along = pad_x + f32(col) * BRK_LEN + off + BRK_HX + ja
   let dead = col >= n_per || course >= n_crs || (along + BRK_HX) > len
   let px = 0.0 - dir.y
   let pz = dir.x
   let cx = a.x + dir.x * along + px * jp
   let cz = a.y + dir.y * along + pz * jp
-  let cy = if dead then 0.0 - 1.0 else f32(course) * BRK_CRS + BRK_CRS * 0.5 + jv in
+  let cy = if dead then 0.0 - 1.0 else pad_y + f32(course) * BRK_CRS + BRK_HY + jv in
   { center = @[cx, cy, cz], yaw = yaw + jyaw, kind = 0u32,
     half = @[BRK_HX + js, BRK_HY + js * 0.4, BRK_HZ] }

@@ -8,26 +8,20 @@
 
 -- Sett palette.
 def COBBLE_BASE: vec3f32 = @[0.46, 0.43, 0.40]   -- grey stone
-def COBBLE_EDGE: vec3f32 = @[0.24, 0.26, 0.33]   -- cool slate edging course
-def MORTAR_COLOR: vec3f32 = @[0.28, 0.26, 0.24]
 
 -- Sett dimensions (meters), from a 10"x7"x4" cobble reference.
 def BRICK_W: f32 = 0.25     -- x footprint
 def BRICK_L: f32 = 0.18     -- z footprint
 def BRICK_H: f32 = 0.05     -- protrusion above ground (chunky stone, so the rounding reads)
 def MORTAR:  f32 = 0.015    -- joint width
-def ROUND:   f32 = 0.028    -- corner radius (must be < min half-extent; min is H/2=0.03)
 
 def CELLX: f32 = 0.265      -- BRICK_W + MORTAR
 def CELLZ: f32 = 0.195      -- BRICK_L + MORTAR
 
--- Width of the perimeter edging band (~2 courses = a double course).
-def EDGE_BAND: f32 = 0.40
-
--- Running-bond grid covering the ~40 m ground (centered on origin).
+-- Running-bond grid covering the ~40 m ground (centered on origin). The total sett
+-- count (BCOLS*BROWS = 36960) is the driver's `bidx` seed length — kept in sync there.
 def BCOLS: i32 = 168
 def BROWS: i32 = 220
-def BRICK_COUNT: i32 = 36960   -- BCOLS * BROWS (must match the brick seed length)
 
 -- World-space (x,z) center of sett i. Odd rows shift half a cell (running bond).
 def brick_center(i: i32) vec2f32 =
@@ -118,17 +112,3 @@ def box_pos: [36]vec3f32 =
    -- -Z  (a,e,f)(a,f,b)
    @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5],
    @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5], @[0.5, 0.0, 0.0 - 0.5]]
-
-def box_nrm: [36]vec3f32 =
-  [@[0.0, 1.0, 0.0], @[0.0, 1.0, 0.0], @[0.0, 1.0, 0.0],
-   @[0.0, 1.0, 0.0], @[0.0, 1.0, 0.0], @[0.0, 1.0, 0.0],
-   @[0.0, 0.0 - 1.0, 0.0], @[0.0, 0.0 - 1.0, 0.0], @[0.0, 0.0 - 1.0, 0.0],
-   @[0.0, 0.0 - 1.0, 0.0], @[0.0, 0.0 - 1.0, 0.0], @[0.0, 0.0 - 1.0, 0.0],
-   @[1.0, 0.0, 0.0], @[1.0, 0.0, 0.0], @[1.0, 0.0, 0.0],
-   @[1.0, 0.0, 0.0], @[1.0, 0.0, 0.0], @[1.0, 0.0, 0.0],
-   @[0.0 - 1.0, 0.0, 0.0], @[0.0 - 1.0, 0.0, 0.0], @[0.0 - 1.0, 0.0, 0.0],
-   @[0.0 - 1.0, 0.0, 0.0], @[0.0 - 1.0, 0.0, 0.0], @[0.0 - 1.0, 0.0, 0.0],
-   @[0.0, 0.0, 1.0], @[0.0, 0.0, 1.0], @[0.0, 0.0, 1.0],
-   @[0.0, 0.0, 1.0], @[0.0, 0.0, 1.0], @[0.0, 0.0, 1.0],
-   @[0.0, 0.0, 0.0 - 1.0], @[0.0, 0.0, 0.0 - 1.0], @[0.0, 0.0, 0.0 - 1.0],
-   @[0.0, 0.0, 0.0 - 1.0], @[0.0, 0.0, 0.0 - 1.0], @[0.0, 0.0, 0.0 - 1.0]]

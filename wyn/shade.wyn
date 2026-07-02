@@ -9,7 +9,6 @@ def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
 
 def SAND_COLOR: vec3f32 = @[0.24, 0.16, 0.10]
 def WATER_COLOR: vec3f32 = @[0.10, 0.34, 0.46]
-def WATER_DEEP: vec3f32 = @[0.05, 0.20, 0.30]
 -- 1950s Venetian render / ochre plaster for the flat-roofed buildings.
 def BUILDING_COLOR: vec3f32 = @[0.78, 0.42, 0.30]
 -- Wall / fence painted ground: sage hedge green (distinct in hue from both

@@ -2,11 +2,10 @@
 -- Ported/adapted from mountains.wyn, in world meters with ground at y = 0.
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
--- View tuning. Telephoto FOV gives the "tiny diorama" compression; DIST is the
--- orbit radius in meters, picked so a ~40 m ground patch frames nicely.
+-- View tuning. The telephoto FOV gives the "tiny diorama" compression; the orbit
+-- target / distance / angles are per-frame state the host drives (see `orbit`).
 def FOV: f32 = 20.0
-def AZIMUTH: f32 = 0.6
-def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]
+def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]   -- sun-shadow map centre (shadow.wyn's sun camera aims here)
 
 -- The orbit camera state the host drives: a focal `target` on/near the ground, an
 -- `az` (azimuth, horizontal orbit), an `elev` (pitch; negative keeps the eye above
