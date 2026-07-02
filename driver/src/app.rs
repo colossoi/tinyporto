@@ -35,9 +35,10 @@ const BIDX_BYTES: u64 = BRICK_COUNT * 4;
 // dispatch domain (one invocation per coarse texel).
 const OCC_COUNT: u64 = 160 * 100;
 const OTILE_BYTES: u64 = OCC_COUNT * 4;
-// Wall-brick budget (must match walls.wyn: N_WALL * PER_WALL). `wbidx` is the iota
-// domain the `walls` generator maps over (one slot per candidate brick).
-const WALL_BRICKS: u64 = 2056;
+// Wall-brick budget (must match walls.wyn: BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS =
+// N_WALL*PER_COURSE*COURSES + 128 + 8 = 8*13*24 + 136 = 2632). `wbidx` is the iota
+// domain the `walls` generator maps over (one slot per candidate block).
+const WALL_BRICKS: u64 = 2632;
 const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
 // Deferred lighting dispatch: one invocation per window pixel (must match the
 // window size / frame.resolution — see occ_depth's note on window-relative sizing).

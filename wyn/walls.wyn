@@ -24,14 +24,18 @@ def BRICK_BASE2: vec3f32 = @[0.60, 0.30, 0.24]   -- browner / darker fired clay
 
 -- The per-wall candidate grid (PER_COURSE x COURSES) is a hard cap — the dispatch
 -- size is a compile-time constant, so slots past a wall's real extent are marked dead
--- and compacted away. Being a cap, it must cover the WORST case, so it's DERIVED by
--- the same `fit` that lays the bricks over the design envelope (longest & tallest
--- wall) — never hand-counted. Bump the envelope if a building grows past it.
+-- and compacted away. Being a cap, it must cover the WORST case (the longest & tallest
+-- wall in the design envelope), so both dimensions are DERIVED, never hand-counted:
+--   COURSES    = fit_count — courses are centred in the wall height (see wall_courses).
+--   PER_COURSE = flush pitch-cells covering the longest wall + the running-bond
+--                half-cell offset + 1 slack — bricks are laid flush to both ends
+--                (clipped part-bricks close each course), not centred.
+-- Bump the envelope if a building grows past it.
 def MAX_WALL_LEN: f32 = 2.6   -- longest wall across all buildings
 def MAX_WALL_H:   f32 = 2.4   -- tallest
 def N_BUILD:    i32 = 2
 def N_WALL:     i32 = 8       -- N_BUILD * 4
-def PER_COURSE: i32 = fit_count(BRK_HX * 2.0, MAX_WALL_LEN, BRK_LEN - BRK_HX * 2.0, 0.0)
+def PER_COURSE: i32 = i32(f32.ceil((MAX_WALL_LEN + BRK_LEN * 0.5) / BRK_LEN)) + 1
 def COURSES:    i32 = fit_count(BRK_HY * 2.0, MAX_WALL_H,   BRK_CRS - BRK_HY * 2.0, 0.0)
 def PER_WALL:   i32 = PER_COURSE * COURSES
 def BRICK_SLOTS: i32 = N_WALL * PER_WALL
@@ -131,11 +135,11 @@ def wall(w: i32) (vec2f32, vec2f32, f32, f32) =
   else if side == 2 then (@[x1, z1], @[x0, z1], h, 0.0)
   else (@[x0, z1], @[x0, z0], h, 1.5707963)
 
--- Candidate `i` (global index) -> its centre (xyz) + packed `w`. Indices past the
--- brick slots are quoins. Running bond for bricks: odd courses shift half a brick.
--- A dead slot (past the wall's brick count, or an offset brick that would overshoot
--- the wall) returns y = -1 so the generator's `filter` drops it (valid blocks always
--- have y >= BRK_CRS/2 > 0).
+-- Candidate `i` (global index) -> a placed `block`. Indices past the brick slots are
+-- quoins, then grout. Running bond for bricks: odd courses shift half a cell, and the
+-- end cells clip to part-bricks. A dead slot (a course past the wall top, or a clipped
+-- sliver) returns center.y = -1 so the generator's `filter` drops it (valid blocks
+-- always have y >= BRK_CRS/2 > 0).
 def wall_brick(i: i32) block =
   if i >= BRICK_SLOTS + QUOIN_SLOTS then grout(i - BRICK_SLOTS - QUOIN_SLOTS)
   else if i >= BRICK_SLOTS then quoin(i - BRICK_SLOTS)
@@ -147,8 +151,7 @@ def wall_brick(i: i32) block =
   let (a, bb, h, yaw) = wall(w)
   let len = distance(a, bb)
   let dir = @[(bb.x - a.x) / len, (bb.y - a.y) / len]
-  let (n_per, pad_x) = fit(BRK_HX * 2.0, len, BRK_LEN - BRK_HX * 2.0, 0.0)  -- bricks per course
-  let (n_crs, pad_y) = wall_courses(h)                                       -- courses (shared)
+  let (n_crs, pad_y) = wall_courses(h)                    -- courses (shared with quoins/grout)
   let off = if (course % 2) == 1 then BRK_LEN * 0.5 else 0.0
   -- Per-brick jitter, keyed on the STABLE index i (so a brick's look survives
   -- compaction). Wall bricks are neatly laid — only a faint hand-laid wobble.
@@ -158,12 +161,21 @@ def wall_brick(i: i32) block =
   let jv = (brick_hash(i * 4 + 3) - 0.5) * 0.007
   let jyaw = (brick_hash(i * 4 + 5) - 0.5) * 0.05
   let js = (brick_hash(i * 4 + 6) - 0.5) * BRK_SIZE_VAR  -- per-brick size wobble
-  let along = pad_x + f32(col) * BRK_LEN + off + BRK_HX + ja
-  let dead = col >= n_per || course >= n_crs || (along + BRK_HX) > len
+  -- Flush running bond: the brick's cell sits on a fixed pitch from the wall start
+  -- (offset shifts odd courses left half a cell), then is CLIPPED to [0, len]. The
+  -- clip turns the poking end cells into the part-bricks that close each course, so
+  -- every course fills the wall edge to edge under the quoins.
+  let s0 = f32(col) * BRK_LEN - off + ja                 -- nominal near edge along the wall
+  let s1 = s0 + BRK_HX * 2.0                              -- nominal far edge (full brick length)
+  let cs = f32.max(s0, 0.0)
+  let ce = f32.min(s1, len)
+  let bw = ce - cs                                        -- clipped length (a part-brick at the ends)
+  let along = (cs + ce) * 0.5                             -- centre of the clipped cell
+  let dead = course >= n_crs || bw < 0.03                -- past the top, or a sliver
   let px = 0.0 - dir.y
   let pz = dir.x
   let cx = a.x + dir.x * along + px * jp
   let cz = a.y + dir.y * along + pz * jp
   let cy = if dead then 0.0 - 1.0 else pad_y + f32(course) * BRK_CRS + BRK_HY + jv in
   { center = @[cx, cy, cz], yaw = yaw + jyaw, kind = 0u32,
-    half = @[BRK_HX + js, BRK_HY + js * 0.4, BRK_HZ] }
+    half = @[f32.max(bw * 0.5 + js, 0.008), BRK_HY + js * 0.4, BRK_HZ] }

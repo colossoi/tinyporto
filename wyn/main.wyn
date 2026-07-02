@@ -614,9 +614,9 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
                      #[location(5)] hf: vec3f32,
                      #[uniform(set=1, binding=0)] frame: frame_globals)
   (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
-  -- Blocks carry their own half-extents. A single small corner radius (crisp).
-  -- kind 0 brick, 1 quoin, 2 grout.
-  let rr = 0.010
+  -- Blocks carry their own half-extents. A tiny corner radius keeps the edges
+  -- crisp (just enough to catch a highlight). kind 0 brick, 1 quoin, 2 grout.
+  let rr = 0.004
   let b = @[hf.x - rr, hf.y - rr, hf.z - rr]
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
