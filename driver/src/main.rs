@@ -1045,18 +1045,22 @@ impl ApplicationHandler for App {
                     self.cam.orbit(dx, dy, sw, sh);
                 } else if self.mmb {
                     self.cam.pan(sw, sh, prev, self.mouse);
+                } else {
+                    // Forward motion to Wyn's paint stream only when not manipulating the
+                    // camera, so a right/middle drag never grows a stroke.
+                    self.events.push(encode_event(EV_MOUSEMOVE, self.mods, 0.0, self.mouse.0, self.mouse.1));
                 }
-                // Always forward motion to Wyn's stream; painting acts on it only under LMB.
-                self.events.push(encode_event(EV_MOUSEMOVE, self.mods, 0.0, self.mouse.0, self.mouse.1));
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {
-                    // Left = build/paint: goes to Wyn as an event.
-                    MouseButton::Left => {
+                    // Left = build/paint: goes to Wyn as an event, but not while a
+                    // camera button is held (no painting during orbit/pan).
+                    MouseButton::Left if !(self.rmb || self.mmb) => {
                         let kind = if down { EV_MOUSEDOWN } else { EV_MOUSEUP };
                         self.events.push(encode_event(kind, self.mods, 0.0, self.mouse.0, self.mouse.1));
                     }
+                    MouseButton::Left => {}
                     // Right = orbit (driver-owned camera): anchor the cursor pivot on press.
                     MouseButton::Right => {
                         self.rmb = down;
