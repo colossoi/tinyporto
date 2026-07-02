@@ -26,6 +26,7 @@ import "walls"
 import "shadow"
 import "gtao"
 import "clouds"
+import "hiz"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
 -- entry binds at (set=1, binding=0). Continuous state lives here; discrete input
@@ -343,18 +344,24 @@ entry cull(bidx: []u32,
       let center = @[base.x + jx, base.y + jz]
       let c3 = @[center.x, BRICK_H * 0.5, center.y]
       let o = cam(frame)
-      let visible = magnitude(center) < 8.0 && frustum_keep(c3, frame.resolution, o)
-      -- Occlusion: project the sett centre and compare its depth to the nearest
-      -- surface recorded in its coarse tile. Behind it (by a bias) => occluded.
-      let clip = world_to_clip(c3, frame.resolution, o)
+      -- 0.25 ≈ the sett proxy's bounding radius (footprint + tilt), generous.
+      let visible = magnitude(center) < 8.0 && frustum_keep(c3, 0.25, frame.resolution, o)
+      -- Occlusion (hiz.wyn owns the math): the nearest recorded surface must beat the
+      -- sett across its whole tile neighbourhood, so a partly-visible sett is never
+      -- dropped. Only the neighbourhood image sampling stays here (image ops can't
+      -- cross a def boundary).
+      let (ndcz, tx, ty, infront) = occ_tile(world_to_clip(c3, frame.resolution, o), frame.resolution, OCC_TILE)
       let occluded =
-        if clip.w <= 0.0 then false
+        if !infront then false
         else
-          let ndcz = clip.z / clip.w
-          let px = f32.max(0.0, f32.min(frame.resolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * frame.resolution.x))
-          let py = f32.max(0.0, f32.min(frame.resolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * frame.resolution.y))
-          let occ = image_load(od, @[i32(px) / OCC_TILE, i32(py) / OCC_TILE]).x in
-          occ < 0.9999 && ndcz > occ + 0.02
+          let mo =
+            loop mo = 0.0 for k < 9 do
+              let cx = clampi(tx + (k % 3 - 1), 0, OCC_W - 1)
+              let cy = clampi(ty + (k / 3 - 1), 0, OCC_H - 1)
+              let v = image_load(od, @[cx, cy]).x in
+              f32.max(mo, v)
+            in
+          occ_hidden(ndcz, mo)
       let keep = visible && (!occluded)
       let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
       -- Roundness spread: some cobbles fairly crisp, some rounded.
@@ -551,19 +558,25 @@ entry walls(wbidx: []u32,
       let brk = wall_brick(i32(s))
       let center = brk.center
       let o = cam(frame)
-      let visible = center.y > 0.0 && frustum_keep(center, frame.resolution, o)
-      let clip = world_to_clip(center, frame.resolution, o)
+      let visible = center.y > 0.0 && frustum_keep(center, magnitude(brk.half), frame.resolution, o)
+      -- Occlusion (hiz.wyn): nearest surface must beat the brick across its whole tile
+      -- neighbourhood, so a partly-occluded brick is never fully dropped. Only the
+      -- neighbourhood image sampling stays here.
+      let (ndcz, tx, ty, infront) = occ_tile(world_to_clip(center, frame.resolution, o), frame.resolution, OCC_TILE)
       let occluded =
-        if clip.w <= 0.0 then false
+        if !infront then false
         else
-          let ndcz = clip.z / clip.w
-          let px = f32.max(0.0, f32.min(frame.resolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * frame.resolution.x))
-          let py = f32.max(0.0, f32.min(frame.resolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * frame.resolution.y))
-          let occ = image_load(od, @[i32(px) / OCC_TILE, i32(py) / OCC_TILE]).x in
-          occ < 0.9999 && ndcz > occ + 0.02
+          let mo =
+            loop mo = 0.0 for k < 9 do
+              let cx = clampi(tx + (k % 3 - 1), 0, OCC_W - 1)
+              let cy = clampi(ty + (k / 3 - 1), 0, OCC_H - 1)
+              let v = image_load(od, @[cx, cy]).x in
+              f32.max(mo, v)
+            in
+          occ_hidden(ndcz, mo)
       in
       if visible && (!occluded) then brk
-      else { center = @[center.x, 0.0 - 1.0, center.z], yaw = brk.yaw, kind = brk.kind }
+      else { center = @[center.x, 0.0 - 1.0, center.z], yaw = brk.yaw, kind = brk.kind, half = brk.half }
       , wbidx)
   let inst = filter(|b| b.center.y > 0.0, cand)
   let n = length(inst) in
@@ -575,12 +588,12 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
                    #[uniform(set=1, binding=0)] frame: frame_globals,
                    #[storage(set=1, binding=11, access=read)] wall_brick_inst: []block)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec3f32,
-   #[location(2)] f32, #[location(3)] f32, #[location(4)] f32) =
+   #[location(2)] f32, #[location(3)] f32, #[location(4)] f32, #[location(5)] vec3f32) =
   let inst = wall_brick_inst[iid]
   let center = inst.center
-  let kind = f32.u32(inst.kind)     -- 0 brick, 1 quoin (passed on as f32 for the fragment)
+  let kind = f32.u32(inst.kind)     -- 0 brick, 1 quoin, 2 grout (passed on for the fragment)
   let yaw = inst.yaw
-  let hf = brick_half(kind)
+  let hf = inst.half
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
   let local = box_pos[vid]
@@ -591,19 +604,19 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
   -- Tone seed from the (stable, baked) brick centre — NOT iid, which is the
   -- compaction order and would make a brick's colour shimmer as culling changes.
   let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0)) in
-  (world_to_clip(world, frame.resolution, cam(frame)), world, center, yaw, cv, kind)
+  (world_to_clip(world, frame.resolution, cam(frame)), world, center, yaw, cv, kind, hf)
 
 -- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
 -- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
 #[fragment]
 entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3f32,
                      #[location(2)] yaw: f32, #[location(3)] cv: f32, #[location(4)] kind: f32,
+                     #[location(5)] hf: vec3f32,
                      #[uniform(set=1, binding=0)] frame: frame_globals)
   (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
-  -- Blocks are uniform: a single small corner radius (crisp), no per-block roundness
-  -- variation. Quoins are the larger corner stones (kind 1); bricks are kind 0.
+  -- Blocks carry their own half-extents. A single small corner radius (crisp).
+  -- kind 0 brick, 1 quoin, 2 grout.
   let rr = 0.010
-  let hf = brick_half(kind)
   let b = @[hf.x - rr, hf.y - rr, hf.z - rr]
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
@@ -627,7 +640,8 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
     -- also mix two fired-clay tones by a position hash; quoins are pale limestone
     -- with only a faint lightness wobble.
     let hue = brick_hash(i32(bcenter.x * 97.0 + bcenter.z * 57.0 + bcenter.y * 181.0 + 10000.0))
-    let alb = if kind > 0.5 then QUOIN_COLOR * v3(0.90 + 0.16 * cv)
+    let alb = if kind > 1.5 then GROUT_COLOR
+              else if kind > 0.5 then QUOIN_COLOR * v3(0.90 + 0.16 * cv)
               else mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * cv)
     let d = clip.z / clip.w in
     (@[alb.x, alb.y, alb.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)
@@ -652,7 +666,7 @@ entry brick_shadow_vertex(#[builtin(vertex_index)] vid: i32,
   let inst = wall_brick_inst[iid]
   let center = inst.center
   let yaw = inst.yaw
-  let hf = brick_half(f32.u32(inst.kind))
+  let hf = inst.half
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
   let local = box_pos[vid]

@@ -1,0 +1,27 @@
+-- hiz.wyn — coarse-depth (one-level Hi-Z) occlusion-test helpers.
+--
+-- `occ_reduce` stores the nearest surface depth per coarse tile; an instance is
+-- occluded only when the nearest surface beats it across its whole screen footprint
+-- (the max over the tile neighbourhood). The neighbourhood image sampling itself
+-- stays at the call site — a `def` can't take a `storage_image` (image ops must
+-- reference a global) — so this module holds only the PURE projection and the
+-- comparison; the caller loops the tiles and passes in the sampled max depth.
+--
+-- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+
+def clampi(v: i32, lo: i32, hi: i32) i32 = if v < lo then lo else if v > hi then hi else v
+
+-- Project a clip-space point to (ndc depth, coarse tile x, tile y, in front of eye?).
+-- `tile` is the coarse-grid tile size in pixels. Behind the eye => not in front.
+def occ_tile(clip: vec4f32, resolution: vec3f32, tile: i32) (f32, i32, i32, bool) =
+  if clip.w <= 0.0 then (0.0, 0i32, 0i32, false)
+  else
+    let ndcz = clip.z / clip.w
+    let px = f32.max(0.0, f32.min(resolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * resolution.x))
+    let py = f32.max(0.0, f32.min(resolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * resolution.y)) in
+    (ndcz, i32(px) / tile, i32(py) / tile, true)
+
+-- Hidden iff the nearest recorded surface beats the instance depth EVERYWHERE in its
+-- footprint (`max_occ` = max nearest-surface over the sampled tiles) — a real surface
+-- must exist (< 1.0) and sit in front of the instance by a small self-occlusion bias.
+def occ_hidden(ndcz: f32, max_occ: f32) bool = max_occ < 0.9999 && ndcz > max_occ + 0.02

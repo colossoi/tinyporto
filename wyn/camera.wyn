@@ -103,10 +103,14 @@ def world_from_depth(resolution: vec3f32, fragCoord: vec2f32, o: orbit, d: f32) 
   let t = linear_depth(d) / dot(rd, fwd) in
   ro + rd * t
 
--- Is world point `p` inside the view frustum? Projects to clip space and tests
--- the clip bounds with a margin (so a small prop straddling an edge isn't culled
--- by its center). Used to cull instances before drawing.
-def frustum_keep(p: vec3f32, resolution: vec3f32, o: orbit) bool =
+-- Does the bounding SPHERE of world-radius `r` around `p` touch the view frustum?
+-- Projects the centre to clip space and expands the clip x/y bounds by the sphere's
+-- projected radius — the exact size, not a fixed fudge — so an instance is kept
+-- whenever any part of it is on screen, whatever its size. Used to cull instances.
+def frustum_keep(p: vec3f32, r: f32, resolution: vec3f32, o: orbit) bool =
   let c = world_to_clip(p, resolution, o)
-  let w = c.w * 1.15 in
-  c.w > 0.0 && f32.abs(c.x) < w && f32.abs(c.y) < w && c.z > 0.0 - 0.1 && c.z < c.w + 0.1
+  let fy = 1.0 / f32.tan(f32.radians(FOV) * 0.5)   -- perspective() vertical scale
+  let aspect = resolution.x / resolution.y
+  let ex = c.w + (fy / aspect) * r                 -- clip x half-bound + projected radius
+  let ey = c.w + fy * r in
+  c.w > 0.0 && f32.abs(c.x) < ex && f32.abs(c.y) < ey && c.z > 0.0 - 0.1 - r && c.z < c.w + 0.1
