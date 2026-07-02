@@ -8,15 +8,11 @@ def FOV: f32 = 20.0
 def AZIMUTH: f32 = 0.6
 def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]
 
--- Zoom (in [0,1]) interpolates BOTH distance and elevation: zoomed out is far +
--- steep (top-down); zoomed in is near + flat (toward the horizon). Negative
--- elevation keeps the eye above the y=0 ground.
-def DIST_FAR:  f32 = 170.0
-def DIST_NEAR: f32 = 16.0
-def ELEV_FAR:  f32 = 0.0 - 0.95
-def ELEV_NEAR: f32 = 0.0 - 0.10
-def cam_dist(zoom: f32) f32 = mix(DIST_FAR, DIST_NEAR, zoom)
-def cam_elev(zoom: f32) f32 = mix(ELEV_FAR, ELEV_NEAR, zoom)
+-- The orbit camera state the host drives: a focal `target` on/near the ground, an
+-- `az` (azimuth, horizontal orbit), an `elev` (pitch; negative keeps the eye above
+-- the y=0 ground), and a `dist` (eye distance from the target). Distance and pitch
+-- are independent — the host maps scroll to `dist` and right-drag to `az`/`elev`.
+type orbit = { target: vec3f32, az: f32, elev: f32, dist: f32 }
 
 -- Pinhole ray through a pixel, camera-space (-z forward).
 def ray_dir(fov: f32, size: vec2f32, pos: vec2f32) vec3f32 =
@@ -34,17 +30,17 @@ def rotation(angle: vec2f32) mat3f32 =
     [s.y * s.x, c.x,       c.y * s.x],
     [s.y * c.x, 0.0 - s.x, c.y * c.x]]
 
--- World-space camera eye for `zoom`. The single source for the orbit position;
+-- World-space camera eye for an orbit. The single source for the orbit position;
 -- get_ray and world_to_clip both build their eye from it.
-def cam_eye(zoom: f32) vec3f32 =
-  LOOKAT + rotation(@[cam_elev(zoom), AZIMUTH]) * @[0.0, 0.0, cam_dist(zoom)]
+def cam_eye(o: orbit) vec3f32 =
+  o.target + rotation(@[o.elev, o.az]) * @[0.0, 0.0, o.dist]
 
 -- Primary ray for a fragment. Returns (ro, rd) in world space.
-def get_ray(resolution: vec3f32, fragCoord: vec2f32, zoom: f32) (vec3f32, vec3f32) =
-  let rot = rotation(@[cam_elev(zoom), AZIMUTH])
+def get_ray(resolution: vec3f32, fragCoord: vec2f32, o: orbit) (vec3f32, vec3f32) =
+  let rot = rotation(@[o.elev, o.az])
   let rd0 = ray_dir(FOV, resolution.xy, fragCoord)
   let rd = rot * rd0
-  let ro = LOOKAT + rot * @[0.0, 0.0, cam_dist(zoom)] in
+  let ro = o.target + rot * @[0.0, 0.0, o.dist] in
   (ro, rd)
 
 -- Intersect a ray with the y = 0 ground plane. Returns t (<0 if pointing away).
@@ -81,12 +77,12 @@ def look_at(eye: vec3f32, center: vec3f32, up: vec3f32) mat4f32 =
     [0.0 - dot(s, eye), 0.0 - dot(u, eye), dot(f, eye), 1.0]]
 
 -- World position -> clip space. Applies view then projection (no mat*mat).
-def world_to_clip(p: vec3f32, resolution: vec3f32, zoom: f32) vec4f32 =
+def world_to_clip(p: vec3f32, resolution: vec3f32, o: orbit) vec4f32 =
   let aspect = resolution.x / resolution.y
-  let eye = cam_eye(zoom)
-  let view = look_at(eye, LOOKAT, @[0.0, 1.0, 0.0])
+  let eye = cam_eye(o)
+  let vm = look_at(eye, o.target, @[0.0, 1.0, 0.0])
   let proj = perspective(FOV, aspect, CLIP_NEAR, CLIP_FAR) in
-  proj * (view * @[p.x, p.y, p.z, 1.0])
+  proj * (vm * @[p.x, p.y, p.z, 1.0])
 
 -- Linear view-forward distance (metres, +toward the scene) from a stored NDC depth
 -- d = clip.z / clip.w. The exact inverse of perspective()'s z map for our RH,
@@ -101,16 +97,16 @@ def linear_depth(d: f32) f32 =
 -- like get_ray) given its stored NDC depth `d`. Reconstructs the eye ray and walks
 -- it out to the linear distance the depth encodes. Inverse of the rasterized
 -- world_to_clip for on-surface points.
-def world_from_depth(resolution: vec3f32, fragCoord: vec2f32, zoom: f32, d: f32) vec3f32 =
-  let (ro, rd) = get_ray(resolution, fragCoord, zoom)
-  let fwd = normalize(LOOKAT - ro)
+def world_from_depth(resolution: vec3f32, fragCoord: vec2f32, o: orbit, d: f32) vec3f32 =
+  let (ro, rd) = get_ray(resolution, fragCoord, o)
+  let fwd = normalize(o.target - ro)
   let t = linear_depth(d) / dot(rd, fwd) in
   ro + rd * t
 
 -- Is world point `p` inside the view frustum? Projects to clip space and tests
 -- the clip bounds with a margin (so a small prop straddling an edge isn't culled
 -- by its center). Used to cull instances before drawing.
-def frustum_keep(p: vec3f32, resolution: vec3f32, zoom: f32) bool =
-  let c = world_to_clip(p, resolution, zoom)
+def frustum_keep(p: vec3f32, resolution: vec3f32, o: orbit) bool =
+  let c = world_to_clip(p, resolution, o)
   let w = c.w * 1.15 in
   c.w > 0.0 && f32.abs(c.x) < w && f32.abs(c.y) < w && c.z > 0.0 - 0.1 && c.z < c.w + 0.1

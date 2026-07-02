@@ -2,6 +2,7 @@
 //! frame-graph (`app::GRAPH`). No game concepts live here; see `graph.rs`.
 
 mod app;
+mod camera;
 mod gfx;
 mod graph;
 mod wync;
@@ -26,6 +27,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use camera::Camera;
 use gfx::Gfx;
 use graph::*;
 
@@ -44,30 +46,19 @@ struct Args {
     /// Render a scripted scenario offscreen to this PNG and exit (no window).
     #[arg(long)]
     screenshot: Option<std::path::PathBuf>,
-    /// Camera zoom for the screenshot scenario, in [0,1] (0 = far/top-down,
-    /// 1 = near/flat). Matches the interactive scroll zoom.
-    #[arg(long, default_value_t = 0.4)]
-    zoom: f32,
+    /// Screenshot orbit camera: eye distance from the target.
+    #[arg(long, default_value_t = 45.0)]
+    cam_dist: f32,
+    /// Screenshot orbit camera: elevation / pitch in radians (negative looks down).
+    #[arg(long, default_value_t = -0.35)]
+    cam_elev: f32,
+    /// Screenshot orbit camera: azimuth in radians.
+    #[arg(long, default_value_t = 0.6)]
+    cam_az: f32,
     /// Live modifier mask for the screenshot scenario (bit0 shift, 1 ctrl, 2 alt,
     /// 3 super) — exercises modifier-gated features headless (e.g. Ctrl = AO off).
     #[arg(long, default_value_t = 0)]
     mods: u32,
-}
-
-/// Continuous per-frame state written into the `frame` uniform block. Discrete
-/// input (keys, buttons, cursor motion) travels as the event stream instead.
-#[derive(Clone, Copy)]
-struct Input {
-    /// Accumulated scroll zoom in [0,1] (0 = far/top-down, 1 = near/flat).
-    zoom: f32,
-    /// Live modifier mask (bit0 shift, 1 ctrl, 2 alt, 3 super).
-    mods: u32,
-}
-
-impl Default for Input {
-    fn default() -> Self {
-        Self { zoom: 0.4, mods: 0 }
-    }
 }
 
 // ---- built (concrete GPU) passes ----
@@ -266,7 +257,7 @@ impl Renderer {
         self.gfx.queue.write_buffer(&self.buffers["events"], 0, bytemuck::cast_slice(&buf));
     }
 
-    fn update_uniforms(&self, input: &Input) {
+    fn update_uniforms(&self, cam: &Camera, mods: u32) {
         let q = &self.gfx.queue;
         let w = self.gfx.config.width as f32;
         let h = self.gfx.config.height as f32;
@@ -285,8 +276,11 @@ impl Renderer {
                     FrameSource::Resolution => {
                         put(&mut bytes, off, bytemuck::cast_slice(&[w, h, if h > 0.0 { w / h } else { 1.0 }]));
                     }
-                    FrameSource::Zoom => put(&mut bytes, off, bytemuck::cast_slice(&[input.zoom])),
-                    FrameSource::Mods => put(&mut bytes, off, bytemuck::cast_slice(&[input.mods])),
+                    FrameSource::Mods => put(&mut bytes, off, bytemuck::cast_slice(&[mods])),
+                    FrameSource::CamTarget => put(&mut bytes, off, bytemuck::cast_slice(&cam.target)),
+                    FrameSource::CamAz => put(&mut bytes, off, bytemuck::cast_slice(&[cam.az])),
+                    FrameSource::CamElev => put(&mut bytes, off, bytemuck::cast_slice(&[cam.elev])),
+                    FrameSource::CamDist => put(&mut bytes, off, bytemuck::cast_slice(&[cam.dist])),
                 }
             }
             q.write_buffer(&self.buffers[name], 0, &bytes);
@@ -368,8 +362,8 @@ impl Renderer {
         }
     }
 
-    fn render(&mut self, input: &Input) -> Result<()> {
-        self.update_uniforms(input);
+    fn render(&mut self, cam: &Camera, mods: u32) -> Result<()> {
+        self.update_uniforms(cam, mods);
         let surface = self.gfx.surface.as_ref().expect("window mode has a surface");
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
@@ -393,7 +387,7 @@ impl Renderer {
 
     /// Headless: render a scripted scenario into an offscreen texture and write it
     /// to `path` as a PNG. Used to eyeball the pipeline without a window.
-    fn screenshot(&mut self, path: &std::path::Path, zoom: f32, mods: u32) -> Result<()> {
+    fn screenshot(&mut self, path: &std::path::Path, cam: &Camera, mods: u32) -> Result<()> {
         let (w, h) = (self.gfx.config.width, self.gfx.config.height);
         let tex = self.gfx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
@@ -431,9 +425,8 @@ impl Renderer {
                 events.push(encode_event(EV_MOUSEUP, 0, 0.0, mx, my));
             }
             prev_held = held;
-            let input = Input { zoom, mods };
             self.upload_events(&events);
-            self.update_uniforms(&input);
+            self.update_uniforms(cam, mods);
             let t0 = Instant::now();
             let mut enc = self
                 .gfx
@@ -980,22 +973,20 @@ fn build_item(
 // `about_to_wait` keeps redraws flowing.
 struct App {
     args: Args,
-    input: Input,
-    /// Wheel accumulates into this target; `input.zoom` eases toward it each frame
-    /// so a scroll tick glides instead of snapping.
-    zoom_target: f32,
+    /// Orbit camera, driven by RMB (rotate), MMB (pan), wheel (zoom); eased itself.
+    cam: Camera,
+    /// Live modifier mask (bit0 shift, 1 ctrl, 2 alt, 3 super).
+    mods: u32,
+    /// Right / middle mouse held — right drives orbit, middle drives pan.
+    rmb: bool,
+    mmb: bool,
     /// Raw input events since the last redraw; uploaded and cleared each frame.
     events: Vec<[f32; 4]>,
-    /// Last cursor position (pixels), stamped onto button events.
+    /// Last cursor position (pixels), stamped onto button events / drag deltas.
     mouse: (f32, f32),
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
 }
-
-/// Per-frame easing factor for zoom (fraction of the remaining gap closed each
-/// frame). Lower = floatier/slower; higher = snappier. At ~60 fps this is a
-/// ~160 ms time constant.
-const ZOOM_SMOOTH: f32 = 0.1;
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -1034,30 +1025,55 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(renderer) = self.renderer.as_mut() else { return };
+        let (sw, sh) = (renderer.gfx.config.width as f32, renderer.gfx.config.height as f32);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(sz) => renderer.resize(sz.width, sz.height),
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
-                self.input.mods = (s.shift_key() as u32)
+                self.mods = (s.shift_key() as u32)
                     | ((s.control_key() as u32) << 1)
                     | ((s.alt_key() as u32) << 2)
                     | ((s.super_key() as u32) << 3);
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let prev = self.mouse;
                 self.mouse = (position.x as f32, position.y as f32);
-                self.events.push(encode_event(EV_MOUSEMOVE, self.input.mods, 0.0, self.mouse.0, self.mouse.1));
+                let (dx, dy) = (self.mouse.0 - prev.0, self.mouse.1 - prev.1);
+                // Right drag orbits (cursor-pivot), middle drag pans (grab the ground).
+                if self.rmb {
+                    self.cam.orbit(dx, dy, sw, sh);
+                } else if self.mmb {
+                    self.cam.pan(sw, sh, prev, self.mouse);
+                }
+                // Always forward motion to Wyn's stream; painting acts on it only under LMB.
+                self.events.push(encode_event(EV_MOUSEMOVE, self.mods, 0.0, self.mouse.0, self.mouse.1));
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                let kind = if state == ElementState::Pressed { EV_MOUSEDOWN } else { EV_MOUSEUP };
-                self.events.push(encode_event(kind, self.input.mods, 0.0, self.mouse.0, self.mouse.1));
+            WindowEvent::MouseInput { state, button, .. } => {
+                let down = state == ElementState::Pressed;
+                match button {
+                    // Left = build/paint: goes to Wyn as an event.
+                    MouseButton::Left => {
+                        let kind = if down { EV_MOUSEDOWN } else { EV_MOUSEUP };
+                        self.events.push(encode_event(kind, self.mods, 0.0, self.mouse.0, self.mouse.1));
+                    }
+                    // Right = orbit (driver-owned camera): anchor the cursor pivot on press.
+                    MouseButton::Right => {
+                        self.rmb = down;
+                        if down { self.cam.begin_orbit(sw, sh, self.mouse.0, self.mouse.1); }
+                        else { self.cam.end_orbit(); }
+                    }
+                    // Middle = pan.
+                    MouseButton::Middle => self.mmb = down,
+                    _ => {}
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
+                let notches = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
-                self.zoom_target = (self.zoom_target + dy * 0.08).clamp(0.0, 1.0);
+                self.cam.zoom(sw, sh, self.mouse.0, self.mouse.1, notches);
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 // Forward keydown/up edges (ignore auto-repeat) as events carrying the
@@ -1066,16 +1082,15 @@ impl ApplicationHandler for App {
                 if !key_event.repeat {
                     if let Some(code) = keycode(key_event.physical_key) {
                         let kind = if key_event.state == ElementState::Pressed { EV_KEYDOWN } else { EV_KEYUP };
-                        self.events.push(encode_event(kind, self.input.mods, code, 0.0, 0.0));
+                        self.events.push(encode_event(kind, self.mods, code, 0.0, 0.0));
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Ease zoom toward the wheel target before drawing.
-                self.input.zoom += (self.zoom_target - self.input.zoom) * ZOOM_SMOOTH;
+                self.cam.ease(); // glide the visible camera toward the input target
                 renderer.upload_events(&self.events);
                 self.events.clear();
-                if let Err(e) = renderer.render(&self.input) {
+                if let Err(e) = renderer.render(&self.cam, self.mods) {
                     eprintln!("render error: {e:?}");
                 }
                 if self.args.frames != 0 && renderer.frame >= self.args.frames {
@@ -1101,15 +1116,19 @@ fn main() -> Result<()> {
     if let Some(path) = args.screenshot.clone() {
         let gfx = Gfx::new_headless(args.width, args.height)?;
         let mut renderer = Renderer::new(gfx, &app::GRAPH)?;
-        return renderer.screenshot(&path, args.zoom, args.mods);
+        let mut cam = Camera::default();
+        cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
+        return renderer.screenshot(&path, &cam, args.mods);
     }
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         args,
-        input: Input::default(),
-        zoom_target: Input::default().zoom,
+        cam: Camera::default(),
+        mods: 0,
+        rmb: false,
+        mmb: false,
         events: Vec::new(),
         mouse: (0.0, 0.0),
         window: None,

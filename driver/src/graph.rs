@@ -14,10 +14,16 @@
 pub enum FrameSource {
     /// `vec3f32` = (width, height, width/height).
     Resolution,
-    /// `f32` camera zoom in [0,1].
-    Zoom,
     /// `u32` live modifier mask at frame time (bit0 shift, 1 ctrl, 2 alt, 3 super).
     Mods,
+    /// `vec3f32` orbit focal target (world).
+    CamTarget,
+    /// `f32` orbit azimuth (radians).
+    CamAz,
+    /// `f32` orbit elevation / pitch (radians).
+    CamElev,
+    /// `f32` orbit eye distance from the target.
+    CamDist,
 }
 
 /// One member of a uniform block the driver fills: which frame value goes in it.

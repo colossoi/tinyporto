@@ -109,8 +109,11 @@ pub const GRAPH: Graph = Graph {
             name: "frame",
             members: &[
                 BlockMember { field: "resolution", source: FrameSource::Resolution },
-                BlockMember { field: "zoom", source: FrameSource::Zoom },
                 BlockMember { field: "mods", source: FrameSource::Mods },
+                BlockMember { field: "cam_target", source: FrameSource::CamTarget },
+                BlockMember { field: "cam_az", source: FrameSource::CamAz },
+                BlockMember { field: "cam_elev", source: FrameSource::CamElev },
+                BlockMember { field: "cam_dist", source: FrameSource::CamDist },
             ],
         },
         // Input event stream: the host appends one vec4f32 per raw event and

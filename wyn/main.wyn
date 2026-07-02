@@ -32,15 +32,24 @@ import "clouds"
 -- (keys, mouse buttons, cursor motion, wheel) arrives as the `events` stream that
 -- `step` folds. Members:
 --   resolution  (width, height, aspect)
---   zoom        camera zoom in [0,1]
 --   mods        LIVE modifier mask at frame time (bit0 shift, 1 ctrl, 2 alt, 3
 --               super) — the "held right now" query, distinct from an event's own
 --               captured mods.
+--   cam_*       the orbit camera the host drives (target, azimuth, elevation,
+--               distance) — see camera.orbit.
 type frame_globals = {
   resolution: vec3f32,
-  zoom: f32,
   mods: u32,
+  cam_target: vec3f32,
+  cam_az: f32,
+  cam_elev: f32,
+  cam_dist: f32,
 }
+
+-- The orbit camera the host drives, unpacked from the frame block. Built locally
+-- wherever the camera is used (kept out of `map` lambdas as an outer capture).
+def cam(f: frame_globals) orbit =
+  { target = f.cam_target, az = f.cam_az, elev = f.cam_elev, dist = f.cam_dist }
 
 -- Input event stream. The host appends one `vec4f32` per raw event since the last
 -- frame and zero-pads the rest (kind 0 = None); `step` folds a fixed EV_CAP window,
@@ -72,9 +81,9 @@ def KEY_L:    i32 = 2
 
 -- Screen pixel -> ground-plane point (same ray as the rendered cursor). `py` is
 -- top-left pixel Y (as events carry it); flip to the bottom-left ray convention.
-def screen_to_ground(resolution: vec3f32, zoom: f32, px: f32, py: f32) vec2f32 =
+def screen_to_ground(resolution: vec3f32, o: orbit, px: f32, py: f32) vec2f32 =
   let mc = @[px, resolution.y - py]
-  let (ro, rd) = get_ray(resolution, mc, zoom) in
+  let (ro, rd) = get_ray(resolution, mc, o) in
   (ro + rd * v3(ground_t(ro, rd))).xz
 
 -- One frame's whole state update. Reads the previous state (ping-pong prev) and
@@ -92,7 +101,7 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            #[uniform(set=1, binding=0)] frame: frame_globals)
   ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
   let res = frame.resolution
-  let zoom = frame.zoom
+  let o = cam(frame)
   let pc = i32(head_in[0])
   let ic = i32(head_in[1])
 
@@ -131,7 +140,7 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
       let e = events[k]
       let kind = i32(e.x) / 256i32
       let code = i32(e.y)
-      let cur = screen_to_ground(res, zoom, e.z, e.w) in
+      let cur = screen_to_ground(res, o, e.z, e.w) in
       if kind == EV_MOUSEDOWN && code == BTN_LEFT then
         -- Press: start the strip, plant the first point.
         if ec < EMIT_CAP then (cur, z2, cur, 0.0, 1.0, 1.0, ec + 1i32, em with [ec] = cur)
@@ -333,10 +342,11 @@ entry cull(bidx: []u32,
       let jz = (brick_hash(i + 53) - 0.5) * 0.04
       let center = @[base.x + jx, base.y + jz]
       let c3 = @[center.x, BRICK_H * 0.5, center.y]
-      let visible = magnitude(center) < 8.0 && frustum_keep(c3, frame.resolution, frame.zoom)
+      let o = cam(frame)
+      let visible = magnitude(center) < 8.0 && frustum_keep(c3, frame.resolution, o)
       -- Occlusion: project the sett centre and compare its depth to the nearest
       -- surface recorded in its coarse tile. Behind it (by a bias) => occluded.
-      let clip = world_to_clip(c3, frame.resolution, frame.zoom)
+      let clip = world_to_clip(c3, frame.resolution, o)
       let occluded =
         if clip.w <= 0.0 then false
         else
@@ -423,7 +433,7 @@ entry scene_vertex(#[builtin(vertex_index)] vid: i32,
   (#[builtin(position)] vec4f32, #[location(0)] f32, #[location(1)] f32, #[location(2)] vec3f32) =
   let p = geom_pos[vid]
   let n = geom_nrm[vid] in
-  (world_to_clip(@[p.x, p.y, p.z], frame.resolution, frame.zoom), p.w, n.w, @[n.x, n.y, n.z])
+  (world_to_clip(@[p.x, p.y, p.z], frame.resolution, cam(frame)), p.w, n.w, @[n.x, n.y, n.z])
 
 def item_color(kind: f32) vec3f32 =
   if kind < 0.5 then SAND_COLOR
@@ -476,7 +486,7 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
   let lc = @[local.x * BRICK_W * sc, (local.y - 0.5) * height, local.z * BRICK_L * sc]
   let bcenter = @[center.x, height * 0.5, center.y]
   let world = bcenter + sett_orient(lc, right, up, fwd) in
-  (world_to_clip(world, frame.resolution, frame.zoom), world, inst, sett_var(center.x, center.y))
+  (world_to_clip(world, frame.resolution, cam(frame)), world, inst, sett_var(center.x, center.y))
 
 -- Sphere-trace the rounded box for this instance from the proxy front face. On a
 -- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
@@ -497,7 +507,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
   let r = inst.w * f32.min(half.x, f32.min(half.y, half.z))
   let b = @[half.x - r, half.y - r, half.z - r]
   -- Trace in box-local space: project the world offset onto the sett's basis.
-  let rd = normalize(world - cam_eye(frame.zoom))
+  let rd = normalize(world - cam_eye(cam(frame)))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 16 do
       if hit then (t, hit)
@@ -512,7 +522,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
     let pl = sett_unorient(rel, right, up, fwd)
     let nl = round_normal(pl, b, r)
     let n = sett_orient(nl, right, up, fwd)
-    let clip = world_to_clip(pos, frame.resolution, frame.zoom)
+    let clip = world_to_clip(pos, frame.resolution, cam(frame))
     let alb = COBBLE_BASE * v3(0.8 + 0.4 * var)
     let d = clip.z / clip.w in
     -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
@@ -540,8 +550,9 @@ entry walls(wbidx: []u32,
     map(|s|
       let brk = wall_brick(i32(s))
       let center = @[brk.x, brk.y, brk.z]
-      let visible = brk.y > 0.0 && frustum_keep(center, frame.resolution, frame.zoom)
-      let clip = world_to_clip(center, frame.resolution, frame.zoom)
+      let o = cam(frame)
+      let visible = brk.y > 0.0 && frustum_keep(center, frame.resolution, o)
+      let clip = world_to_clip(center, frame.resolution, o)
       let occluded =
         if clip.w <= 0.0 then false
         else
@@ -577,7 +588,7 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
   -- Tone seed from the (stable, baked) brick centre — NOT iid, which is the
   -- compaction order and would make a brick's colour shimmer as culling changes.
   let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0)) in
-  (world_to_clip(world, frame.resolution, frame.zoom), world, center, yaw, cv)
+  (world_to_clip(world, frame.resolution, cam(frame)), world, center, yaw, cv)
 
 -- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
 -- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
@@ -592,7 +603,7 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
   let b = @[BRK_HX - rr, BRK_HY - rr, BRK_HZ - rr]
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
-  let rd = normalize(world - cam_eye(frame.zoom))
+  let rd = normalize(world - cam_eye(cam(frame)))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 24 do
       if hit then (t, hit)
@@ -607,7 +618,7 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
     let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
     let nl = round_normal(pl, b, rr)
     let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
-    let clip = world_to_clip(pos, frame.resolution, frame.zoom)
+    let clip = world_to_clip(pos, frame.resolution, cam(frame))
     -- Per-brick variation: `cv` (from the stable centre) drives lightness; a second
     -- position hash mixes between two fired-clay tones for hue variation.
     let hue = brick_hash(i32(bcenter.x * 97.0 + bcenter.z * 57.0 + bcenter.y * 181.0 + 10000.0))
@@ -736,7 +747,7 @@ entry light(pxl: []u32,
     let rx = frame.resolution.x
     let ry = frame.resolution.y
     let resl = @[rx, ry, 0.0]
-    let zoom = frame.zoom
+    let o = cam(frame)
     -- Hold Ctrl (live modifier bit 1) to suppress ambient occlusion.
     let ao_off = (frame.mods & 2u32) != 0u32
     let sunv = sun
@@ -749,7 +760,7 @@ entry light(pxl: []u32,
     let out =
       if alb.w < 0.5 then
         -- Sky: raymarch static volumetric clouds along this pixel's view ray.
-        let (sro, srd) = get_ray(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], zoom)
+        let (sro, srd) = get_ray(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], o)
         let sc = clouds.sky(sro, srd) in
         @[sc.x, sc.y, sc.z, 1.0]
       else
@@ -763,12 +774,12 @@ entry light(pxl: []u32,
         -- only the depth read stays here, since a `def` can't take an image). March
         -- from this pixel's reconstructed, surface-lifted world position; a step
         -- that projects behind a nearer recorded surface blocks the sun.
-        let p = world_from_depth(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], zoom, cd) + n * SH_LIFT
+        let p = world_from_depth(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], o, cd) + n * SH_LIFT
         let shc =
           loop shc = 0.0 for k < 20 do
             if shc > 0.5 then shc
             else
-              let cq = world_to_clip(shadow_point(p, sunv, k), resl, zoom)
+              let cq = world_to_clip(shadow_point(p, sunv, k), resl, o)
               let (sx, sy, valid) = shadow_pixel(cq, rx, ry, w, h)
               let surfd = if valid then image_load(sd, @[sx, sy]).x else 1.0 in
               if shadow_occluded(cq, surfd) then 1.0 else shc
