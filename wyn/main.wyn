@@ -736,6 +736,8 @@ entry light(pxl: []u32,
     let ry = frame.resolution.y
     let resl = @[rx, ry, 0.0]
     let zoom = frame.zoom
+    -- Hold Ctrl (live modifier bit 1) to suppress ambient occlusion.
+    let ao_off = (frame.mods & 2u32) != 0u32
     let sunv = sun
     let w = i32(rx)
     let h = i32(ry)
@@ -749,8 +751,9 @@ entry light(pxl: []u32,
         let gnv = image_load(gn, @[x, y])
         let n = normalize(@[gnv.x, gnv.y, gnv.z])
         let cd = image_load(sd, @[x, y]).x
-        -- Ambient occlusion from the GTAO pass, as an occlusion amount (1 - visibility).
-        let ao = 1.0 - texture_load(gao, @[x, y], 0).x
+        -- Ambient occlusion from the GTAO pass, as an occlusion amount (1 - visibility);
+        -- zeroed while Ctrl is held.
+        let ao = if ao_off then 0.0 else 1.0 - texture_load(gao, @[x, y], 0).x
         -- Ray-marched contact shadow toward the sun (shadow.wyn owns the math;
         -- only the depth read stays here, since a `def` can't take an image). March
         -- from this pixel's reconstructed, surface-lifted world position; a step

@@ -48,6 +48,10 @@ struct Args {
     /// 1 = near/flat). Matches the interactive scroll zoom.
     #[arg(long, default_value_t = 0.4)]
     zoom: f32,
+    /// Live modifier mask for the screenshot scenario (bit0 shift, 1 ctrl, 2 alt,
+    /// 3 super) — exercises modifier-gated features headless (e.g. Ctrl = AO off).
+    #[arg(long, default_value_t = 0)]
+    mods: u32,
 }
 
 /// Continuous per-frame state written into the `frame` uniform block. Discrete
@@ -389,7 +393,7 @@ impl Renderer {
 
     /// Headless: render a scripted scenario into an offscreen texture and write it
     /// to `path` as a PNG. Used to eyeball the pipeline without a window.
-    fn screenshot(&mut self, path: &std::path::Path, zoom: f32) -> Result<()> {
+    fn screenshot(&mut self, path: &std::path::Path, zoom: f32, mods: u32) -> Result<()> {
         let (w, h) = (self.gfx.config.width, self.gfx.config.height);
         let tex = self.gfx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
@@ -427,7 +431,7 @@ impl Renderer {
                 events.push(encode_event(EV_MOUSEUP, 0, 0.0, mx, my));
             }
             prev_held = held;
-            let input = Input { zoom, ..Input::default() };
+            let input = Input { zoom, mods };
             self.upload_events(&events);
             self.update_uniforms(&input);
             let t0 = Instant::now();
@@ -977,6 +981,9 @@ fn build_item(
 struct App {
     args: Args,
     input: Input,
+    /// Wheel accumulates into this target; `input.zoom` eases toward it each frame
+    /// so a scroll tick glides instead of snapping.
+    zoom_target: f32,
     /// Raw input events since the last redraw; uploaded and cleared each frame.
     events: Vec<[f32; 4]>,
     /// Last cursor position (pixels), stamped onto button events.
@@ -984,6 +991,11 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
 }
+
+/// Per-frame easing factor for zoom (fraction of the remaining gap closed each
+/// frame). Lower = floatier/slower; higher = snappier. At ~60 fps this is a
+/// ~160 ms time constant.
+const ZOOM_SMOOTH: f32 = 0.1;
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -1045,7 +1057,7 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
-                self.input.zoom = (self.input.zoom + dy * 0.08).clamp(0.0, 1.0);
+                self.zoom_target = (self.zoom_target + dy * 0.08).clamp(0.0, 1.0);
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 // Forward keydown/up edges (ignore auto-repeat) as events carrying the
@@ -1059,6 +1071,8 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Ease zoom toward the wheel target before drawing.
+                self.input.zoom += (self.zoom_target - self.input.zoom) * ZOOM_SMOOTH;
                 renderer.upload_events(&self.events);
                 self.events.clear();
                 if let Err(e) = renderer.render(&self.input) {
@@ -1087,7 +1101,7 @@ fn main() -> Result<()> {
     if let Some(path) = args.screenshot.clone() {
         let gfx = Gfx::new_headless(args.width, args.height)?;
         let mut renderer = Renderer::new(gfx, &app::GRAPH)?;
-        return renderer.screenshot(&path, args.zoom);
+        return renderer.screenshot(&path, args.zoom, args.mods);
     }
 
     let event_loop = EventLoop::new()?;
@@ -1095,6 +1109,7 @@ fn main() -> Result<()> {
     let mut app = App {
         args,
         input: Input::default(),
+        zoom_target: Input::default().zoom,
         events: Vec::new(),
         mouse: (0.0, 0.0),
         window: None,
