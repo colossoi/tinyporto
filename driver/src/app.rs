@@ -40,7 +40,7 @@ const OTILE_BYTES: u64 = OCC_COUNT * 4;
 const WALL_BRICKS: u64 = 1920;
 const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
 // Deferred lighting dispatch: one invocation per window pixel (must match the
-// window size / iResolution — see occ_depth's note on window-relative sizing).
+// window size / frame.resolution — see occ_depth's note on window-relative sizing).
 const PXL_COUNT: u64 = 1280 * 800;
 const PXL_BYTES: u64 = PXL_COUNT * 4;
 
@@ -98,10 +98,19 @@ static GTAO_DENOISE_STAGES: [ComputeStage; GTAO_DENOISE_STAGE_COUNT] = gtao_deno
 
 pub const GRAPH: Graph = Graph {
     resources: &[
-        Resource::SysUniform { name: "iResolution", kind: SysUniform::Resolution },
-        Resource::SysUniform { name: "iMouse", kind: SysUniform::Mouse },
-        Resource::SysUniform { name: "iKeys", kind: SysUniform::Keys },
-        Resource::SysUniform { name: "iCam", kind: SysUniform::Cam },
+        // Per-frame globals, one std140 uniform block (see `frame_globals` in
+        // main.wyn). The driver fills each member by name at the descriptor's
+        // offset; member order here is free.
+        Resource::UniformBlock {
+            name: "frame",
+            members: &[
+                BlockMember { field: "resolution", source: FrameSource::Resolution },
+                BlockMember { field: "zoom", source: FrameSource::Zoom },
+                BlockMember { field: "mouse", source: FrameSource::Mouse },
+                BlockMember { field: "mouse_held", source: FrameSource::MouseHeld },
+                BlockMember { field: "keys", source: FrameSource::Keys },
+            ],
+        },
         // Persistent state (ping-pong); sizes derived (they're `step` outputs).
         Resource::PingPong { name: "uistate", size: None },
         Resource::PingPong { name: "points", size: None },
@@ -164,10 +173,7 @@ pub const GRAPH: Graph = Graph {
         ("points_in", "points"),
         ("items_in", "items"),
         ("head_in", "head"),
-        ("iResolution", "iResolution"),
-        ("iMouse", "iMouse"),
-        ("iCam", "iCam"),
-        ("iKeys", "iKeys"),
+        ("frame", "frame"),
         ("step_output_0", "uistate"),
         ("step_output_1", "points"),
         ("step_output_2", "items"),

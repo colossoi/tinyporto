@@ -103,10 +103,10 @@ struct Renderer {
     images: HashMap<&'static str, wgpu::Texture>,
     image_views: HashMap<&'static str, wgpu::TextureView>,
     samplers: HashMap<&'static str, wgpu::Sampler>,
-    sys: Vec<(&'static str, SysUniform)>,
+    /// Uniform blocks to fill each frame: (buffer name, members, std140 layout).
+    blocks: Vec<(&'static str, &'static [BlockMember], &'static UniformBlockLayout)>,
     depth_view: Option<wgpu::TextureView>,
     passes: Vec<BuiltPass>,
-    start: Instant,
     frame: u32,
 }
 
@@ -156,14 +156,20 @@ impl Renderer {
         let mut image_views: HashMap<&'static str, wgpu::TextureView> = HashMap::new();
         let mut img_formats: HashMap<&'static str, TexFormat> = HashMap::new();
         let mut samplers: HashMap<&'static str, wgpu::Sampler> = HashMap::new();
-        let mut sys: Vec<(&'static str, SysUniform)> = Vec::new();
+        let mut blocks: Vec<(&'static str, &'static [BlockMember], &'static UniformBlockLayout)> =
+            Vec::new();
         let mut has_depth = false;
         let (cw, ch) = (gfx.config.width, gfx.config.height);
         for res in graph.resources {
             match *res {
-                Resource::SysUniform { name, kind } => {
-                    buffers.insert(name, make_uniform(device, name));
-                    sys.push((name, kind));
+                Resource::UniformBlock { name, members } => {
+                    // Size the buffer from the descriptor's published std140 layout.
+                    let layout = generated::UNIFORM_BLOCKS
+                        .iter()
+                        .find(|l| l.name == name)
+                        .unwrap_or_else(|| panic!("no descriptor layout for uniform block '{name}'"));
+                    buffers.insert(name, make_uniform(device, name, layout.size));
+                    blocks.push((name, members, layout));
                 }
                 Resource::Buffer(def) => {
                     let buf = make_storage(device, &gfx.queue, def.name, size_of(def.name, def.size), def.init, def.indirect);
@@ -236,10 +242,9 @@ impl Renderer {
             images,
             image_views,
             samplers,
-            sys,
+            blocks,
             depth_view,
             passes,
-            start: Instant::now(),
             frame: 0,
         })
     }
@@ -255,29 +260,36 @@ impl Renderer {
         let q = &self.gfx.queue;
         let w = self.gfx.config.width as f32;
         let h = self.gfx.config.height as f32;
-        let t = self.start.elapsed().as_secs_f32();
-        for (name, kind) in &self.sys {
-            let buf = &self.buffers[name];
-            match kind {
-                // Discrete key pulses are written as u32 (the shader reads vec4u32).
-                SysUniform::Keys => {
-                    let data: [u32; 4] = [input.tab_pulse as u32, input.line_pulse as u32, 0, 0];
-                    q.write_buffer(buf, 0, bytemuck::cast_slice(&data));
-                }
-                _ => {
-                    let data: [f32; 4] = match kind {
-                        SysUniform::Resolution => [w, h, if h > 0.0 { w / h } else { 1.0 }, 0.0],
-                        SysUniform::Time => [t, 0.0, 0.0, 0.0],
-                        SysUniform::Mouse => {
-                            [input.mouse_x, input.mouse_y, if input.held { 1.0 } else { 0.0 }, 0.0]
-                        }
-                        SysUniform::Frame => [f32::from_bits(self.frame), 0.0, 0.0, 0.0],
-                        SysUniform::Cam => [input.zoom, 0.0, 0.0, 0.0],
-                        SysUniform::Keys => unreachable!(),
-                    };
-                    q.write_buffer(buf, 0, bytemuck::cast_slice(&data));
+        // Pack each uniform block once and upload it. Every member's bytes go at
+        // the std140 offset the descriptor published for its field name.
+        for (name, members, layout) in &self.blocks {
+            let mut bytes = vec![0u8; layout.size as usize];
+            for m in members.iter() {
+                let (_, offset, _) = layout
+                    .members
+                    .iter()
+                    .find(|(f, _, _)| *f == m.field)
+                    .unwrap_or_else(|| panic!("block '{name}' has no member '{}'", m.field));
+                let off = *offset as usize;
+                match m.source {
+                    // Discrete key pulses are u32 (the shader reads vec4u32).
+                    FrameSource::Keys => {
+                        let v: [u32; 4] = [input.tab_pulse as u32, input.line_pulse as u32, 0, 0];
+                        put(&mut bytes, off, bytemuck::cast_slice(&v));
+                    }
+                    FrameSource::Resolution => {
+                        put(&mut bytes, off, bytemuck::cast_slice(&[w, h, if h > 0.0 { w / h } else { 1.0 }]));
+                    }
+                    FrameSource::Zoom => put(&mut bytes, off, bytemuck::cast_slice(&[input.zoom])),
+                    FrameSource::Mouse => {
+                        put(&mut bytes, off, bytemuck::cast_slice(&[input.mouse_x, input.mouse_y]));
+                    }
+                    FrameSource::MouseHeld => {
+                        put(&mut bytes, off, bytemuck::cast_slice(&[if input.held { 1.0f32 } else { 0.0 }]));
+                    }
                 }
             }
+            q.write_buffer(&self.buffers[name], 0, &bytes);
         }
     }
 
@@ -483,10 +495,15 @@ impl Renderer {
 
 // ---- resource creation ----
 
-fn make_uniform(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
+/// Copy `src` into `dst` starting at `off` (one uniform-block member).
+fn put(dst: &mut [u8], off: usize, src: &[u8]) {
+    dst[off..off + src.len()].copy_from_slice(src);
+}
+
+fn make_uniform(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        size: 16,
+        size,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
@@ -853,7 +870,7 @@ fn build_item(
     graph: &Graph,
 ) -> BuiltItem {
     // Vertex + fragment share one pipeline layout: merge their binding tables,
-    // deduping shared (set, binding) slots (e.g. iResolution/iCam in both stages).
+    // deduping shared (set, binding) slots (e.g. the `frame` block in both stages).
     let mut binds = resolve_table(it.vs_bindings, graph, res.pp);
     for b in resolve_table(it.fs_bindings, graph, res.pp) {
         if !binds.iter().any(|x| x.set == b.set && x.binding == b.binding) {

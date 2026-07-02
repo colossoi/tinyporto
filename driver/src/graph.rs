@@ -6,21 +6,41 @@
 //! the driver-side model those generated tables resolve against: what resources
 //! exist, how a binding name maps to one, and the per-frame schedule.
 
-/// A driver-managed "system" value, fed automatically each frame.
+/// A per-frame value the driver computes and writes into one uniform-block
+/// member. Each maps to a member of the `frame_globals` block; the byte offset
+/// comes from the descriptor (`UniformBlockLayout`), so this only says *what*
+/// to write, never *where*.
 #[derive(Clone, Copy, Debug)]
-pub enum SysUniform {
+pub enum FrameSource {
     /// `vec3f32` = (width, height, width/height).
     Resolution,
-    #[allow(dead_code)]
-    Time,
-    /// `vec4f32` = (x, y, held?1:0, 0).
+    /// `f32` camera zoom in [0,1].
+    Zoom,
+    /// `vec2f32` cursor position in pixels.
     Mouse,
-    #[allow(dead_code)]
-    Frame,
+    /// `f32` left button (1.0 held / 0.0 up).
+    MouseHeld,
     /// `vec4u32` one-frame key pulses: (x = Tab, y = toggle, …).
     Keys,
-    /// `vec4f32` view state: (zoom in [0,1], …).
-    Cam,
+}
+
+/// One member of a uniform block the driver fills: which frame value goes in it.
+/// The std140 offset is looked up by `field` name from the generated
+/// `UniformBlockLayout`, so member order here need not match the block's.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockMember {
+    pub field: &'static str,
+    pub source: FrameSource,
+}
+
+/// The std140 layout of one uniform block, GENERATED from the descriptor
+/// (`build.rs`). `members` are (field name, byte offset, byte size); the driver
+/// packs each `BlockMember` at the offset matching its `field`.
+#[derive(Clone, Copy, Debug)]
+pub struct UniformBlockLayout {
+    pub name: &'static str,
+    pub size: u64,
+    pub members: &'static [(&'static str, u32, u32)],
 }
 
 /// How a storage buffer's initial contents are set.
@@ -48,8 +68,10 @@ pub struct BufferDef {
 /// A GPU resource the graph needs.
 #[derive(Clone, Copy, Debug)]
 pub enum Resource {
-    /// Small uniform buffer the driver fills each frame from `kind`.
-    SysUniform { name: &'static str, kind: SysUniform },
+    /// A uniform block the driver fills each frame: one buffer whose members are
+    /// packed from `members` at the offsets the descriptor publishes for `name`
+    /// (see `UniformBlockLayout`). Replaces N single-value system uniforms.
+    UniformBlock { name: &'static str, members: &'static [BlockMember] },
     /// A storage buffer (compute I/O, derived geometry, …).
     Buffer(BufferDef),
     /// Two storage buffers swapped each frame (persistent state). A binding reads

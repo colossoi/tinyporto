@@ -26,6 +26,23 @@ import "walls"
 import "shadow"
 import "gtao"
 
+-- Per-frame globals: one std140 #[uniform] block the host fills once and every
+-- entry binds at (set=1, binding=0), replacing four separate uniforms. Members
+-- are named, so the host writes them by name (no anonymous vec4 lanes):
+--   resolution  (width, height, aspect)
+--   zoom        camera zoom in [0,1]
+--   mouse       cursor position in pixels
+--   mouse_held  left button down (1.0) / up (0.0)
+--   keys        generic one-frame key pulses (x = Tab, y = overlay toggle) —
+--               the driver forwards raw pulses and never interprets them.
+type frame_globals = {
+  resolution: vec3f32,
+  zoom: f32,
+  mouse: vec2f32,
+  mouse_held: f32,
+  keys: vec4u32,
+}
+
 ------------------------------------------------------------
 -- State update (Wyn-owned). One compute entry, `step`, advances ALL persistent
 -- state each frame: UI [tool, overlay_on], the control points, the items, and the
@@ -49,7 +66,8 @@ type decision = { commit: f32, cx: f32, cz: f32,        -- control point to appe
 
 def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
            h_dx: f32, h_dz: f32, h_lx: f32, h_lz: f32, h_hd: f32,
-           iResolution: vec3f32, iMouse: vec4f32, iCam: vec4f32, tool: f32) decision =
+           resolution: vec3f32, mouse: vec2f32, mouse_held: f32, zoom: f32,
+           tool: f32) decision =
   let pc = i32(h_pc)
   let ic = i32(h_ic)
   let prev = h_prev > 0.5
@@ -59,9 +77,9 @@ def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
   let have_dir = h_hd > 0.5
 
   -- Mouse -> ground cursor (same ray as the rendered cursor).
-  let held = iMouse.z > 0.0
-  let mouseCoord = @[iMouse.x, iResolution.y - iMouse.y]
-  let (mro, mrd) = get_ray(iResolution, mouseCoord, iCam.x)
+  let held = mouse_held > 0.0
+  let mouseCoord = @[mouse.x, resolution.y - mouse.y]
+  let (mro, mrd) = get_ray(resolution, mouseCoord, zoom)
   let cursor = (mro + mrd * v3(ground_t(mro, mrd))).xz
 
   let kind = tool + 1.0
@@ -107,23 +125,20 @@ def decide(h_pc: f32, h_ic: f32, h_prev: f32, h_ax: f32, h_az: f32,
 #[compute]
 entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
-           #[uniform(set=1, binding=0)] iResolution: vec3f32,
-           #[uniform(set=1, binding=1)] iMouse: vec4f32,
-           #[uniform(set=1, binding=3)] iCam: vec4f32,
-           #[uniform(set=1, binding=7)] iKeys: vec4u32)
+           #[uniform(set=1, binding=0)] frame: frame_globals)
   ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
   -- UI: cycle tool on a Tab pulse; toggle the overlay on its pulse.
   let tool0 = uistate_in[0]
   let ovl0 = uistate_in[1]
-  let tool1 = if iKeys.x != 0u32 then f32((i32(tool0) + 1) % 3) else tool0
-  let ovl1 = if iKeys.y != 0u32 then 1.0 - ovl0 else ovl0
+  let tool1 = if frame.keys.x != 0u32 then f32((i32(tool0) + 1) % 3) else tool0
+  let ovl1 = if frame.keys.y != 0u32 then 1.0 - ovl0 else ovl0
   let uistate_out = [tool1, ovl1]
 
   -- Capture decision from the previous head + mouse. Painting uses the current
   -- tool (tool0); a Tab this frame takes effect next frame.
   let d = decide(head_in[0], head_in[1], head_in[2], head_in[3], head_in[4],
                  head_in[5], head_in[6], head_in[7], head_in[8], head_in[9],
-                 iResolution, iMouse, iCam, tool0)
+                 frame.resolution, frame.mouse, frame.mouse_held, frame.zoom, tool0)
   -- Capture only scalars in the map lambdas (the decision struct must not be
   -- captured, or the lambda stops inlining and can't index its buffer).
   let dcommit = d.commit
@@ -298,8 +313,7 @@ resource ao_out:  image2d { format = r32float     size = window  usages = [stora
 
 #[compute]
 entry cull(bidx: []u32,
-           #[uniform(set=1, binding=0)] iResolution: vec3f32,
-           #[uniform(set=1, binding=3)] iCam: vec4f32,
+           #[uniform(set=1, binding=0)] frame: frame_globals,
            #[view(occ_depth, storage_read)] od: storage_image)
   (?k. [k]vec4f32, [4]u32) =
   -- Build one candidate record per cell, then `filter` keeps only the visible ones
@@ -313,16 +327,16 @@ entry cull(bidx: []u32,
       let jz = (brick_hash(i + 53) - 0.5) * 0.04
       let center = @[base.x + jx, base.y + jz]
       let c3 = @[center.x, BRICK_H * 0.5, center.y]
-      let visible = magnitude(center) < 8.0 && frustum_keep(c3, iResolution, iCam.x)
+      let visible = magnitude(center) < 8.0 && frustum_keep(c3, frame.resolution, frame.zoom)
       -- Occlusion: project the sett centre and compare its depth to the nearest
       -- surface recorded in its coarse tile. Behind it (by a bias) => occluded.
-      let clip = world_to_clip(c3, iResolution, iCam.x)
+      let clip = world_to_clip(c3, frame.resolution, frame.zoom)
       let occluded =
         if clip.w <= 0.0 then false
         else
           let ndcz = clip.z / clip.w
-          let px = f32.max(0.0, f32.min(iResolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * iResolution.x))
-          let py = f32.max(0.0, f32.min(iResolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * iResolution.y))
+          let px = f32.max(0.0, f32.min(frame.resolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * frame.resolution.x))
+          let py = f32.max(0.0, f32.min(frame.resolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * frame.resolution.y))
           let occ = image_load(od, @[i32(px) / OCC_TILE, i32(py) / OCC_TILE]).x in
           occ < 0.9999 && ndcz > occ + 0.02
       let keep = visible && (!occluded)
@@ -397,14 +411,13 @@ resource lit: image2d {
 -- attr, and the world normal pass through as the only surface attributes.
 #[vertex]
 entry scene_vertex(#[builtin(vertex_index)] vid: i32,
-                   #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                   #[uniform(set=1, binding=3)] iCam: vec4f32,
+                   #[uniform(set=1, binding=0)] frame: frame_globals,
                    #[storage(set=1, binding=8, access=read)] geom_pos: []vec4f32,
                    #[storage(set=1, binding=9, access=read)] geom_nrm: []vec4f32)
   (#[builtin(position)] vec4f32, #[location(0)] f32, #[location(1)] f32, #[location(2)] vec3f32) =
   let p = geom_pos[vid]
   let n = geom_nrm[vid] in
-  (world_to_clip(@[p.x, p.y, p.z], iResolution, iCam.x), p.w, n.w, @[n.x, n.y, n.z])
+  (world_to_clip(@[p.x, p.y, p.z], frame.resolution, frame.zoom), p.w, n.w, @[n.x, n.y, n.z])
 
 def item_color(kind: f32) vec3f32 =
   if kind < 0.5 then SAND_COLOR
@@ -441,8 +454,7 @@ entry scene_fragment(#[location(0)] kind: f32, #[location(1)] attr: f32,
 #[vertex]
 entry sett_vertex(#[builtin(vertex_index)] vid: i32,
                   #[builtin(instance_index)] iid: i32,
-                  #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                  #[uniform(set=1, binding=3)] iCam: vec4f32,
+                  #[uniform(set=1, binding=0)] frame: frame_globals,
                   #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec4f32,
    #[location(2)] f32) =
@@ -458,7 +470,7 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
   let lc = @[local.x * BRICK_W * sc, (local.y - 0.5) * height, local.z * BRICK_L * sc]
   let bcenter = @[center.x, height * 0.5, center.y]
   let world = bcenter + sett_orient(lc, right, up, fwd) in
-  (world_to_clip(world, iResolution, iCam.x), world, inst, sett_var(center.x, center.y))
+  (world_to_clip(world, frame.resolution, frame.zoom), world, inst, sett_var(center.x, center.y))
 
 -- Sphere-trace the rounded box for this instance from the proxy front face. On a
 -- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
@@ -467,8 +479,7 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
 #[fragment]
 entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
                     #[location(2)] var: f32,
-                    #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                    #[uniform(set=1, binding=3)] iCam: vec4f32)
+                    #[uniform(set=1, binding=0)] frame: frame_globals)
   (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
   let height = inst.z
   let bcenter = @[inst.x, height * 0.5, inst.y]
@@ -480,7 +491,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
   let r = inst.w * f32.min(half.x, f32.min(half.y, half.z))
   let b = @[half.x - r, half.y - r, half.z - r]
   -- Trace in box-local space: project the world offset onto the sett's basis.
-  let rd = normalize(world - cam_eye(iCam.x))
+  let rd = normalize(world - cam_eye(frame.zoom))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 16 do
       if hit then (t, hit)
@@ -495,7 +506,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
     let pl = sett_unorient(rel, right, up, fwd)
     let nl = round_normal(pl, b, r)
     let n = sett_orient(nl, right, up, fwd)
-    let clip = world_to_clip(pos, iResolution, iCam.x)
+    let clip = world_to_clip(pos, frame.resolution, frame.zoom)
     let alb = COBBLE_BASE * v3(0.8 + 0.4 * var)
     let d = clip.z / clip.w in
     -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
@@ -516,22 +527,21 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
 
 #[compute]
 entry walls(wbidx: []u32,
-            #[uniform(set=1, binding=0)] iResolution: vec3f32,
-            #[uniform(set=1, binding=3)] iCam: vec4f32,
+            #[uniform(set=1, binding=0)] frame: frame_globals,
             #[view(occ_depth, storage_read)] od: storage_image)
   (?k. [k]vec4f32, [4]u32) =
   let cand =
     map(|s|
       let brk = wall_brick(i32(s))
       let center = @[brk.x, brk.y, brk.z]
-      let visible = brk.y > 0.0 && frustum_keep(center, iResolution, iCam.x)
-      let clip = world_to_clip(center, iResolution, iCam.x)
+      let visible = brk.y > 0.0 && frustum_keep(center, frame.resolution, frame.zoom)
+      let clip = world_to_clip(center, frame.resolution, frame.zoom)
       let occluded =
         if clip.w <= 0.0 then false
         else
           let ndcz = clip.z / clip.w
-          let px = f32.max(0.0, f32.min(iResolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * iResolution.x))
-          let py = f32.max(0.0, f32.min(iResolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * iResolution.y))
+          let px = f32.max(0.0, f32.min(frame.resolution.x - 1.0, (clip.x / clip.w * 0.5 + 0.5) * frame.resolution.x))
+          let py = f32.max(0.0, f32.min(frame.resolution.y - 1.0, (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * frame.resolution.y))
           let occ = image_load(od, @[i32(px) / OCC_TILE, i32(py) / OCC_TILE]).x in
           occ < 0.9999 && ndcz > occ + 0.02
       in
@@ -544,8 +554,7 @@ entry walls(wbidx: []u32,
 #[vertex]
 entry brick_vertex(#[builtin(vertex_index)] vid: i32,
                    #[builtin(instance_index)] iid: i32,
-                   #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                   #[uniform(set=1, binding=3)] iCam: vec4f32,
+                   #[uniform(set=1, binding=0)] frame: frame_globals,
                    #[storage(set=1, binding=11, access=read)] wall_brick_inst: []vec4f32)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec3f32,
    #[location(2)] f32, #[location(3)] f32) =
@@ -562,15 +571,14 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
   -- Tone seed from the (stable, baked) brick centre — NOT iid, which is the
   -- compaction order and would make a brick's colour shimmer as culling changes.
   let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0)) in
-  (world_to_clip(world, iResolution, iCam.x), world, center, yaw, cv)
+  (world_to_clip(world, frame.resolution, frame.zoom), world, center, yaw, cv)
 
 -- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
 -- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
 #[fragment]
 entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3f32,
                      #[location(2)] yaw: f32, #[location(3)] cv: f32,
-                     #[uniform(set=1, binding=0)] iResolution: vec3f32,
-                     #[uniform(set=1, binding=3)] iCam: vec4f32)
+                     #[uniform(set=1, binding=0)] frame: frame_globals)
   (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
   -- Wall bricks are uniform: a single small corner radius (crisp), no per-brick
   -- roundness variation. (Roundness variation lives on the cobbles instead.)
@@ -578,7 +586,7 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
   let b = @[BRK_HX - rr, BRK_HY - rr, BRK_HZ - rr]
   let cw = f32.cos(yaw)
   let sw = f32.sin(yaw)
-  let rd = normalize(world - cam_eye(iCam.x))
+  let rd = normalize(world - cam_eye(frame.zoom))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 24 do
       if hit then (t, hit)
@@ -593,7 +601,7 @@ entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3
     let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
     let nl = round_normal(pl, b, rr)
     let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
-    let clip = world_to_clip(pos, iResolution, iCam.x)
+    let clip = world_to_clip(pos, frame.resolution, frame.zoom)
     -- Per-brick variation: `cv` (from the stable centre) drives lightness; a second
     -- position hash mixes between two fired-clay tones for hue variation.
     let hue = brick_hash(i32(bcenter.x * 97.0 + bcenter.z * 57.0 + bcenter.y * 181.0 + 10000.0))
@@ -710,8 +718,7 @@ entry gtao_denoise(pxl: []u32,
 -- reference values bound outside the map (compiler panic; see COMPILER-NOTES.md).
 #[compute]
 entry light(pxl: []u32,
-            #[uniform(set=1, binding=0)] iResolution: vec3f32,
-            #[uniform(set=1, binding=3)] iCam: vec4f32,
+            #[uniform(set=1, binding=0)] frame: frame_globals,
             #[view(g_albedo, storage_read)]  ga: storage_image,
             #[view(g_normal, storage_read)]  gn: storage_image,
             #[view(scene_depth, storage_read)] sd: storage_image,
@@ -720,10 +727,10 @@ entry light(pxl: []u32,
             #[view(lit, storage_write)]       lt: storage_image)
   []u32 =
   map(|s|
-    let rx = iResolution.x
-    let ry = iResolution.y
+    let rx = frame.resolution.x
+    let ry = frame.resolution.y
     let resl = @[rx, ry, 0.0]
-    let zoom = iCam.x
+    let zoom = frame.zoom
     let sunv = sun
     let w = i32(rx)
     let h = i32(ry)

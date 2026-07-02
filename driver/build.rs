@@ -47,6 +47,22 @@ struct Binding {
     /// Pixel format for `storage_texture` bindings (e.g. "rgba32_float").
     #[serde(default)]
     format: Option<String>,
+    /// `size` means different things per binding type — a std140 byte count (u32)
+    /// for a `uniform` block, but a `{kind,width,height}` extent for a
+    /// `storage_texture`. Keep it opaque; only the uniform path reads it (as u64).
+    #[serde(default)]
+    size: Option<serde_json::Value>,
+    /// Flattened members of a record-typed `uniform` block (empty for scalars).
+    #[serde(default)]
+    members: Vec<UniformMember>,
+}
+
+/// One member of a uniform block: `name` at `offset`, `size` bytes (std140).
+#[derive(serde::Deserialize)]
+struct UniformMember {
+    name: String,
+    offset: u32,
+    size: u32,
 }
 
 impl Binding {
@@ -263,6 +279,38 @@ fn codegen_bindings(p: &Pipeline) -> TokenStream {
     }
 }
 
+/// Emit the `UNIFORM_BLOCKS` table: every record-typed uniform block across all
+/// pipelines (deduped by name), each with its std140 size and (field, offset,
+/// size) members. The driver packs its `frame_globals` fill against this.
+fn codegen_uniform_blocks(pipelines: &[Pipeline]) -> TokenStream {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut rows: Vec<TokenStream> = Vec::new();
+    for p in pipelines {
+        for b in &p.bindings {
+            if b.ty != "uniform" || b.members.is_empty() || !seen.insert(b.name.clone()) {
+                continue;
+            }
+            let name = &b.name;
+            let size = b.size.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
+            let members = b.members.iter().map(|m| {
+                let (mn, off, sz) = (&m.name, m.offset, m.size);
+                quote! { (#mn, #off, #sz) }
+            });
+            rows.push(quote! {
+                crate::graph::UniformBlockLayout {
+                    name: #name,
+                    size: #size,
+                    members: &[#(#members),*],
+                }
+            });
+        }
+    }
+    quote! {
+        /// std140 layouts of the record-typed uniform blocks, from the descriptor.
+        pub static UNIFORM_BLOCKS: &[crate::graph::UniformBlockLayout] = &[#(#rows),*];
+    }
+}
+
 fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo = manifest.parent().expect("driver crate has a parent").to_path_buf();
@@ -301,6 +349,7 @@ fn main() {
             codegen.extend(codegen_pipeline(p));
             codegen.extend(codegen_bindings(p));
         }
+        codegen.extend(codegen_uniform_blocks(&desc.pipelines));
     }
 
     let generated = quote! {
