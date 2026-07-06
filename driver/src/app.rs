@@ -169,6 +169,10 @@ pub const GRAPH: Graph = Graph {
         Resource::Buffer(BufferDef { name: "wbidx", size: Some(WBIDX_BYTES), init: BufInit::Iota, indirect: false }),
         Resource::Buffer(BufferDef { name: "wall_brick_inst", size: None, init: BufInit::Zeroed, indirect: false }),
         Resource::Buffer(BufferDef { name: "wall_brick_args", size: None, init: BufInit::Zeroed, indirect: true }),
+        // Shadow caster draws every candidate slot (brick_shadow_vertex regenerates each
+        // from its index, camera-independent); dead slots self-cull. Static draw args:
+        // 36 verts x WALL_BRICKS instances.
+        Resource::Buffer(BufferDef { name: "shadow_args", size: Some(16), init: BufInit::U32s(&[36, WALL_BRICKS as u32, 0, 0]), indirect: true }),
     ],
 
     // Shader binding name -> resource name. Roles (prev/next/plain) are derived
@@ -265,7 +269,7 @@ pub const GRAPH: Graph = Graph {
                 fs: "shadow_fragment",
                 vs_bindings: BRICK_SHADOW_VERTEX_BINDINGS,
                 fs_bindings: SHADOW_FRAGMENT_BINDINGS,
-                draw_args: "wall_brick_args",
+                draw_args: "shadow_args",
                 depth_write: true,
             }],
         }),

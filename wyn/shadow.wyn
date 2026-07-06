@@ -19,8 +19,10 @@ import "shade"    -- SUN_DIR / sun
 def SH_LIFT:  f32 = 0.02    -- lift the start point off its surface (anti-acne)
 def SH_START: f32 = 0.05    -- first step distance toward the sun
 def SH_STEP:  f32 = 0.06    -- per-step distance (20 steps ~= 1.2 m of reach)
-def SH_BIAS:  f32 = 0.02    -- min depth gap (m) before a step counts as occluded
-def SH_THICK: f32 = 1.5     -- max occluder thickness (m); beyond this, light leaks past
+def SH_BIAS:   f32 = 0.02   -- min depth gap (m) before a step counts as occluded
+def SH_RADIUS: f32 = 0.12   -- the recorded occluder must sit within this of the sun-ray
+                            -- sample in WORLD space; rejects a surface merely BESIDE the
+                            -- ray that only shares the sample's screen pixel (the artifact)
 
 -- The k-th sample point along the sun ray from an (already lifted) surface point.
 def shadow_point(p: vec3f32, sundir: vec3f32, k: i32) vec3f32 =
@@ -36,14 +38,16 @@ def shadow_pixel(cq: vec4f32, rx: f32, ry: f32, w: i32, h: i32) (i32, i32, bool)
     let inb = sx >= 0 && sx < w && sy >= 0 && sy < h in
     (sx, sy, inb)
 
--- Is the marched sample (clip point `cq`) occluded by the surface depth `surfd`
--- read at its pixel? Occluded when it sits behind the recorded surface by more than
--- SH_BIAS but within SH_THICK — a real, finite occluder, not the far background.
+-- Is the marched sun-ray sample `sp` (clip point `cq`) occluded? Two conditions:
+-- the recorded surface at its pixel must sit IN FRONT of it (a screen-space visible
+-- occluder), AND that surface's reconstructed world point `wp` must lie within
+-- SH_RADIUS of the sample — so a real occluder ON the ray blocks the sun, while a
+-- surface merely BESIDE the ray (same screen pixel, far-off world point) does not.
 -- A far-plane surfd (~1, i.e. sky) never occludes.
-def shadow_occluded(cq: vec4f32, surfd: f32) bool =
+def shadow_occluded(sp: vec3f32, wp: vec3f32, cq: vec4f32, surfd: f32) bool =
   let linq = linear_depth(cq.z / cq.w)
   let lins = linear_depth(surfd) in
-  surfd < 0.99999 && linq > lins + SH_BIAS && (linq - lins) < SH_THICK
+  surfd < 0.99999 && linq > lins + SH_BIAS && magnitude(wp - sp) < SH_RADIUS
 
 ------------------------------------------------------------
 -- Sun shadow map (directional cast shadows). An orthographic camera looks down the
