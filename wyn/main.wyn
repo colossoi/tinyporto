@@ -729,21 +729,8 @@ entry gtao_main(pxl: []u32,
     0u32
     , pxl)
 
--- Pass 3: one edge-aware denoise blur (final_apply) -> ao_out (visibility in .x).
-#[compute]
-entry gtao_denoise(pxl: []u32,
-                   #[view(ao_work, sampled)]      aw: texture2d,
-                   #[view(ao_out, storage_write)] ao: storage_image)
-  []u32 =
-  map(|t|
-    let i = i32(t)
-    let x = i % 1280
-    let y = i / 1280
-    let (v, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true)
-    let _ = image_store(ao, @[x, y], @[v, v, v, 1.0]) in
-    0u32
-    , pxl)
-
+-- The GTAO edge-aware denoise (final blur of ao_work) is NOT a separate pass — it
+-- reads only gtao_main's output, so `light` folds it in inline (see its `ao`).
 ------------------------------------------------------------
 -- Deferred lighting (Nine Phase 3, the compute stage). One invocation per pixel
 -- reads the thin G-buffer, estimates screen-space ambient occlusion from the depth
@@ -765,7 +752,7 @@ entry light(pxl: []u32,
             #[view(g_normal, storage_read)]  gn: storage_image,
             #[view(scene_depth, storage_read)] sd: storage_image,
             #[view(sun_depth, storage_read)]  shm: storage_image,
-            #[view(ao_out, sampled)]          gao: texture2d,
+            #[view(ao_work, sampled)]         aw: texture2d,
             #[view(lit, storage_write)]       lt: storage_image)
   []u32 =
   map(|s|
@@ -792,9 +779,12 @@ entry light(pxl: []u32,
         let gnv = image_load(gn, @[x, y])
         let n = normalize(@[gnv.x, gnv.y, gnv.z])
         let cd = image_load(sd, @[x, y]).x
-        -- Ambient occlusion from the GTAO pass, as an occlusion amount (1 - visibility);
-        -- zeroed while Ctrl is held.
-        let ao = if ao_off then 0.0 else 1.0 - texture_load(gao, @[x, y], 0).x
+        -- Ambient occlusion: the GTAO edge-aware denoise folded in here (it only reads
+        -- gtao_main's raw ao_work, so it needs no pass of its own), as an occlusion
+        -- amount (1 - visibility); zeroed while Ctrl is held.
+        let ao =
+          if ao_off then 0.0
+          else let (aov, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true) in 1.0 - aov
         -- Ray-marched contact shadow toward the sun (shadow.wyn owns the math;
         -- only the depth read stays here, since a `def` can't take an image). March
         -- from this pixel's reconstructed, surface-lifted world position; a step
