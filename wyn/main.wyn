@@ -146,11 +146,8 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
 -- degenerate one-level Hi-Z: a full mip pyramid + the two-pass prev-visible
 -- refinement is later work. cull reads the PREVIOUS frame's occ_depth (occ_reduce
 -- runs after the scene pass), a one-frame lag imperceptible for a slow orbit.
+-- (OCC_TILE / OCC_W / OCC_H — the coarse-grid dimensions — live in hiz.wyn.)
 ------------------------------------------------------------
-
-def OCC_TILE: i32 = 8    -- source pixels per coarse texel, per axis
-def OCC_W: i32 = 160     -- coarse grid = window (1280x800) / OCC_TILE
-def OCC_H: i32 = 100
 
 resource scene_depth: image2d {
   format = r32float
@@ -216,22 +213,9 @@ entry cull(bidx: []u32,
       let o = cam(frame)
       -- 0.25 ≈ the sett proxy's bounding radius (footprint + tilt), generous.
       let visible = magnitude(center) < 8.0 && frustum_keep(c3, 0.25, frame.resolution, o)
-      -- Occlusion (hiz.wyn owns the math): the nearest recorded surface must beat the
-      -- sett across its whole tile neighbourhood, so a partly-visible sett is never
-      -- dropped. Only the neighbourhood image sampling stays here (image ops can't
-      -- cross a def boundary).
-      let (ndcz, tx, ty, infront) = occ_tile(world_to_clip(c3, frame.resolution, o), frame.resolution, OCC_TILE)
-      let occluded =
-        if !infront then false
-        else
-          let mo =
-            loop mo = 0.0 for k < 9 do
-              let cx = clampi(tx + (k % 3 - 1), 0, OCC_W - 1)
-              let cy = clampi(ty + (k / 3 - 1), 0, OCC_H - 1)
-              let v = image_load(od, @[cx, cy]).x in
-              f32.max(mo, v)
-            in
-          occ_hidden(ndcz, mo)
+      -- Occlusion: hidden if the nearest recorded surface beats the sett across its
+      -- whole tile neighbourhood (hiz.wyn's occ_test), so a partly-visible sett stays.
+      let occluded = occ_test(od, world_to_clip(c3, frame.resolution, o), frame.resolution)
       let keep = visible && (!occluded)
       let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
       -- Roundness spread: some cobbles fairly crisp, some rounded.
@@ -429,22 +413,9 @@ entry walls(wbidx: []u32,
       let center = brk.center
       let o = cam(frame)
       let visible = center.y > 0.0 && frustum_keep(center, magnitude(brk.half), frame.resolution, o)
-      -- Occlusion (hiz.wyn): nearest surface must beat the brick across its whole tile
-      -- neighbourhood, so a partly-occluded brick is never fully dropped. Only the
-      -- neighbourhood image sampling stays here.
-      let (ndcz, tx, ty, infront) = occ_tile(world_to_clip(center, frame.resolution, o), frame.resolution, OCC_TILE)
-      let occluded =
-        if !infront then false
-        else
-          let mo =
-            loop mo = 0.0 for k < 9 do
-              let cx = clampi(tx + (k % 3 - 1), 0, OCC_W - 1)
-              let cy = clampi(ty + (k / 3 - 1), 0, OCC_H - 1)
-              let v = image_load(od, @[cx, cy]).x in
-              f32.max(mo, v)
-            in
-          occ_hidden(ndcz, mo)
-      in
+      -- Occlusion: hidden if the nearest recorded surface beats the brick across its
+      -- whole tile neighbourhood (hiz.wyn's occ_test), so a partly-occluded brick stays.
+      let occluded = occ_test(od, world_to_clip(center, frame.resolution, o), frame.resolution) in
       if visible && (!occluded) then brk
       else { center = @[center.x, 0.0 - 1.0, center.z], yaw = brk.yaw, kind = brk.kind, half = brk.half }
       , wbidx)

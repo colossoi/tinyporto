@@ -1,13 +1,16 @@
--- hiz.wyn — coarse-depth (one-level Hi-Z) occlusion-test helpers.
+-- hiz.wyn — coarse-depth (one-level Hi-Z) occlusion test.
 --
 -- `occ_reduce` stores the nearest surface depth per coarse tile; an instance is
 -- occluded only when the nearest surface beats it across its whole screen footprint
--- (the max over the tile neighbourhood). This module holds the PURE projection and
--- comparison; the caller (cull / walls) loops the tile neighbourhood and passes in
--- the sampled max depth. (That split is a design choice, not a constraint — a def
--- CAN take a storage_image and loop it directly; see shadow.wyn's marches.)
+-- (the max over its 3x3 tile neighbourhood). `occ_test` does that whole test —
+-- projection, the neighbourhood image read, and the compare — so `cull` and `walls`
+-- share one def. The coarse-grid dimensions live here too.
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+
+def OCC_TILE: i32 = 8    -- source pixels per coarse texel, per axis
+def OCC_W: i32 = 160     -- coarse grid = window (1280x800) / OCC_TILE
+def OCC_H: i32 = 100
 
 def clampi(v: i32, lo: i32, hi: i32) i32 = if v < lo then lo else if v > hi then hi else v
 
@@ -25,3 +28,19 @@ def occ_tile(clip: vec4f32, resolution: vec3f32, tile: i32) (f32, i32, i32, bool
 -- footprint (`max_occ` = max nearest-surface over the sampled tiles) — a real surface
 -- must exist (< 1.0) and sit in front of the instance by a small self-occlusion bias.
 def occ_hidden(ndcz: f32, max_occ: f32) bool = max_occ < 0.9999 && ndcz > max_occ + 0.02
+
+-- Full coarse occlusion test for an instance whose centre projects to clip point
+-- `clip`: hidden iff the nearest recorded surface (in `od`) beats it across its 3x3
+-- tile neighbourhood. A behind-eye point is never culled. Shared by cull / walls.
+def occ_test(od: storage_image, clip: vec4f32, resolution: vec3f32) bool =
+  let (ndcz, tx, ty, infront) = occ_tile(clip, resolution, OCC_TILE) in
+  if !infront then false
+  else
+    let mo =
+      loop mo = 0.0 for k < 9 do
+        let cx = clampi(tx + (k % 3 - 1), 0, OCC_W - 1)
+        let cy = clampi(ty + (k / 3 - 1), 0, OCC_H - 1)
+        let v = image_load(od, @[cx, cy]).x in
+        f32.max(mo, v)
+      in
+    occ_hidden(ndcz, mo)
