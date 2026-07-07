@@ -110,6 +110,10 @@ enum Length {
     Fixed { bytes: u64 },
     /// Sized from an input binding: (src_bytes / src_elem_bytes) * elem_bytes.
     LikeInput { binding: u32, elem_bytes: u64, src_elem_bytes: u64 },
+    /// One element per dispatched invocation (compiler scratch whose length tracks
+    /// the pass's grid): (dispatch_elems) * elem_bytes, where dispatch_elems is the
+    /// element count of the input binding this pass's dispatch derives from.
+    SameAsDispatch { elem_bytes: u64 },
 }
 
 #[derive(serde::Deserialize)]
@@ -140,6 +144,25 @@ enum Len {
 
 fn id(s: &str) -> Ident {
     Ident::new(s, Span::call_site())
+}
+
+/// The input binding a compute pipeline's dispatch grid derives from, as
+/// (binding, src_elem_bytes) — the domain a `same_as_dispatch` output tracks. All
+/// buffer-derived stages of a fused pipeline share one domain (e.g. `cull` runs
+/// every filter/scan/gather stage over `bidx`); panics if they disagree.
+fn dispatch_input(p: &Pipeline) -> (u32, u64) {
+    let mut found: Option<(u32, u64)> = None;
+    for s in &p.stages {
+        if let Some(DispatchSize::DerivedFrom { len: Len::InputBinding { binding, elem_bytes }, .. }) =
+            s.dispatch_size.as_ref()
+        {
+            match found {
+                Some((b, _)) => assert_eq!(b, *binding, "pipeline dispatch derives from >1 input binding"),
+                None => found = Some((*binding, *elem_bytes)),
+            }
+        }
+    }
+    found.expect("same_as_dispatch needs a buffer-derived dispatch")
 }
 
 /// The pipeline's canonical entry name — the stage every stage name is prefixed
@@ -254,6 +277,12 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
                 Length::Fixed { bytes } => quote! { #bytes },
                 Length::LikeInput { binding, elem_bytes, src_elem_bytes } => {
                     let src = input_param(p, *binding);
+                    params.insert(src.to_string());
+                    quote! { (#src / #src_elem_bytes) * #elem_bytes }
+                }
+                Length::SameAsDispatch { elem_bytes } => {
+                    let (binding, src_elem_bytes) = dispatch_input(p);
+                    let src = input_param(p, binding);
                     params.insert(src.to_string());
                     quote! { (#src / #src_elem_bytes) * #elem_bytes }
                 }
