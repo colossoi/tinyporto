@@ -28,8 +28,8 @@ def brick_center(i: i32) vec2f32 =
   let col = i % BCOLS in
   let row = i / BCOLS in
   let offx = if row % 2 == 1 then CELLX * 0.5 else 0.0 in
-  let x = (f32.i32(col) - f32.i32(BCOLS) * 0.5 + 0.5) * CELLX + offx in
-  let z = (f32.i32(row) - f32.i32(BROWS) * 0.5 + 0.5) * CELLZ in
+  let x = (f32(col) - f32(BCOLS) * 0.5 + 0.5) * CELLX + offx in
+  let z = (f32(row) - f32(BROWS) * 0.5 + 0.5) * CELLZ in
   @[x, z]
 
 -- Gradient of the rounded-box SDF at surface point p (box half-extents b,
@@ -52,7 +52,7 @@ def sd_round_box(p: vec3f32, b: vec3f32, r: f32) f32 =
 
 -- Per-sett deterministic value in [0,1) for color variation.
 def brick_hash(i: i32) f32 =
-  f32.fract(f32.sin(f32.i32(i) * 91.37) * 47453.31)
+  f32.fract(f32.sin(f32(i) * 91.37) * 47453.31)
 
 -- Stable per-sett seed from its world (x,z) centre. Keyed on position, NOT the
 -- compacted instance index (which reorders as culling changes each frame), so a

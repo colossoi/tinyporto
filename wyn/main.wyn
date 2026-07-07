@@ -461,7 +461,7 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
    #[location(2)] f32, #[location(3)] f32, #[location(4)] f32, #[location(5)] vec3f32) =
   let inst = wall_brick_inst[iid]
   let center = inst.center
-  let kind = f32.u32(inst.kind)     -- 0 brick, 1 quoin, 2 grout (passed on for the fragment)
+  let kind = f32(inst.kind)     -- 0 brick, 1 quoin, 2 grout (passed on for the fragment)
   let yaw = inst.yaw
   let hf = inst.half
   let cw = f32.cos(yaw)

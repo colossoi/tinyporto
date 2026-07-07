@@ -26,7 +26,7 @@ def SH_RADIUS: f32 = 0.12   -- the recorded occluder must sit within this of the
 
 -- The k-th sample point along the sun ray from an (already lifted) surface point.
 def shadow_point(p: vec3f32, sundir: vec3f32, k: i32) vec3f32 =
-  p + sundir * (SH_START + f32.i32(k) * SH_STEP)
+  p + sundir * (SH_START + f32(k) * SH_STEP)
 
 -- Project a clip-space sample to integer pixel coords. `valid` is false off-screen
 -- or behind the eye (w <= 0). Returns (x, y, valid).
