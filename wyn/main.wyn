@@ -28,6 +28,7 @@ import "shadow"
 import "gtao"
 import "clouds"
 import "hiz"
+import "water"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
 -- entry binds at (set=1, binding=0). Continuous state lives here; discrete input
@@ -46,6 +47,7 @@ type frame_globals = {
   cam_az: f32,
   cam_elev: f32,
   cam_dist: f32,
+  time: f32,          -- seconds since start; drives the water animation
 }
 
 -- The orbit camera the host drives, unpacked from the frame block. Built locally
@@ -218,7 +220,10 @@ entry cull(bidx: []u32,
       -- Occlusion: hidden if the nearest recorded surface beats the sett across its
       -- whole tile neighbourhood (hiz.wyn's occ_test), so a partly-visible sett stays.
       let occluded = occ_test(od, world_to_clip(c3, frame.resolution, o), frame.resolution)
-      let keep = visible && (!occluded)
+      -- Water converts cobble to canal: drop any sett within a hair of the water so no
+      -- partial setts comb over the quay edge.
+      let in_water = water_sdf(center) < 0.08
+      let keep = visible && (!occluded) && (!in_water)
       let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
       -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
       let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919) in
@@ -612,12 +617,23 @@ def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
     let gnv = image_load(gn, @[x, y])
     let n = normalize(@[gnv.x, gnv.y, gnv.z])
     let cd = image_load(sd, @[x, y]).x
-    let ao = if ao_off then 0.0
-             else let (aov, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true) in 1.0 - aov
-    let p = world_from_depth(resl, fragc, o, cd) + n * SH_LIFT
-    let shc = contact_shadow(sd, p, n, resl, o)
-    let shm_frac = sun_shadow_pcf(shm, p, rx, ry) in
-    shade_surface(@[alb.x, alb.y, alb.z], n, ao, shc, shm_frac)
+    let (_ro, rd) = get_ray(resl, fragc, o)
+    let pg = world_from_depth(resl, fragc, o, cd)           -- the flat-ground hit
+    -- Water (approach A): only a ground-level pixel (y ~ 0) can be canal. `s0` is its
+    -- signed distance to the water edge: < -QUAY_RIM traces the sunken water/quay per
+    -- pixel; the [-QUAY_RIM, 0) lip is lit as a wet-stone quay cap; >= 0 is dry land.
+    let s0 = if pg.y < 0.03 then water_sdf(@[pg.x, pg.z]) else 1.0 in
+    if s0 < 0.0 - QUAY_RIM then
+      let wc = shade_water(pg, rd, frame.time) in
+      @[wc.x, wc.y, wc.z, 1.0]
+    else
+      let base = if s0 < 0.0 then QUAY_COLOR else @[alb.x, alb.y, alb.z]
+      let ao = if ao_off then 0.0
+               else let (aov, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true) in 1.0 - aov
+      let p = pg + n * SH_LIFT
+      let shc = contact_shadow(sd, p, n, resl, o)
+      let shm_frac = sun_shadow_pcf(shm, p, rx, ry) in
+      shade_surface(base, n, ao, shc, shm_frac)
 
 -- The entry is just the dispatch: one invocation per pixel calls shade_frame and
 -- writes the result to `lit`. `lt` (the write target) is listed first so the

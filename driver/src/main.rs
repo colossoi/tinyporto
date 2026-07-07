@@ -59,6 +59,10 @@ struct Args {
     /// 3 super) — exercises modifier-gated features headless (e.g. Ctrl = AO off).
     #[arg(long, default_value_t = 0)]
     mods: u32,
+    /// Screenshot scene time (seconds) fed to `frame.time` — animates time-varying
+    /// effects (e.g. the water) for a still. The window path uses real elapsed time.
+    #[arg(long, default_value_t = 0.0)]
+    time: f32,
 }
 
 // ---- built (concrete GPU) passes ----
@@ -100,6 +104,7 @@ struct Renderer {
     depth_view: Option<wgpu::TextureView>,
     passes: Vec<BuiltPass>,
     frame: u32,
+    start: Instant,
 }
 
 /// Borrowed bundle of the physical GPU resources a bind group resolves against —
@@ -238,6 +243,7 @@ impl Renderer {
             depth_view,
             passes,
             frame: 0,
+            start: Instant::now(),
         })
     }
 
@@ -257,7 +263,7 @@ impl Renderer {
         self.gfx.queue.write_buffer(&self.buffers["events"], 0, bytemuck::cast_slice(&buf));
     }
 
-    fn update_uniforms(&self, cam: &Camera, mods: u32) {
+    fn update_uniforms(&self, cam: &Camera, mods: u32, time: f32) {
         let q = &self.gfx.queue;
         let w = self.gfx.config.width as f32;
         let h = self.gfx.config.height as f32;
@@ -281,6 +287,7 @@ impl Renderer {
                     FrameSource::CamAz => put(&mut bytes, off, bytemuck::cast_slice(&[cam.az])),
                     FrameSource::CamElev => put(&mut bytes, off, bytemuck::cast_slice(&[cam.elev])),
                     FrameSource::CamDist => put(&mut bytes, off, bytemuck::cast_slice(&[cam.dist])),
+                    FrameSource::Time => put(&mut bytes, off, bytemuck::cast_slice(&[time])),
                 }
             }
             q.write_buffer(&self.buffers[name], 0, &bytes);
@@ -363,7 +370,7 @@ impl Renderer {
     }
 
     fn render(&mut self, cam: &Camera, mods: u32) -> Result<()> {
-        self.update_uniforms(cam, mods);
+        self.update_uniforms(cam, mods, self.start.elapsed().as_secs_f32());
         let surface = self.gfx.surface.as_ref().expect("window mode has a surface");
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
@@ -387,7 +394,7 @@ impl Renderer {
 
     /// Headless: render a scripted scenario into an offscreen texture and write it
     /// to `path` as a PNG. Used to eyeball the pipeline without a window.
-    fn screenshot(&mut self, path: &std::path::Path, cam: &Camera, mods: u32) -> Result<()> {
+    fn screenshot(&mut self, path: &std::path::Path, cam: &Camera, mods: u32, time: f32) -> Result<()> {
         let (w, h) = (self.gfx.config.width, self.gfx.config.height);
         let tex = self.gfx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
@@ -426,7 +433,7 @@ impl Renderer {
             }
             prev_held = held;
             self.upload_events(&events);
-            self.update_uniforms(cam, mods);
+            self.update_uniforms(cam, mods, time);
             let t0 = Instant::now();
             let mut enc = self
                 .gfx
@@ -1122,7 +1129,7 @@ fn main() -> Result<()> {
         let mut renderer = Renderer::new(gfx, &app::GRAPH)?;
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
-        return renderer.screenshot(&path, &cam, args.mods);
+        return renderer.screenshot(&path, &cam, args.mods, args.time);
     }
 
     let event_loop = EventLoop::new()?;

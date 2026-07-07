@@ -24,6 +24,8 @@ pub enum FrameSource {
     CamElev,
     /// `f32` orbit eye distance from the target.
     CamDist,
+    /// `f32` seconds since start (drives time-varying effects, e.g. the water).
+    Time,
 }
 
 /// One member of a uniform block the driver fills: which frame value goes in it.

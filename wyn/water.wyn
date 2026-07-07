@@ -1,0 +1,148 @@
+-- water.wyn — the canal/harbour water field and its palette.
+--
+-- Venice-style water: the painter sweeps canals (channels) through the plaza. This
+-- module answers, for any ground point (x,z): is it water, and how far below the
+-- ground plane does the surface sit — as a signed distance field so the shoreline
+-- (a quay wall dropping to the water) and the sett culling both read from one source.
+--
+-- Until the painter drives it (later), `water_sdf` returns a hardcoded test canal so
+-- the geometry + shading can be developed against a fixed scene.
+--
+-- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+
+import "math"     -- v2 / v3 / dot / magnitude / mix
+import "clouds"   -- sky reflection off the water surface
+import "shade"    -- sun (specular glint)
+
+-- Water sits this far below the ground plane (y = 0); the shoreline is a quay wall
+-- of this height. Kept shallow — a shallow murky harbour, not a deep lake.
+def WATER_DEPTH: f32 = 0.6     -- water surface below the ground plane (quay height)
+def WATER_HW:    f32 = 1.6     -- canal half-width (metres)
+def QUAY_RIM:    f32 = 0.2     -- wet-stone lip inside the edge before the drop
+
+-- Murky municipal-harbour palette: low-saturation green-grey-brown, dark. Deep water
+-- reads near-opaque; the silty margin by the quay lifts a touch. The quay is wet stone.
+def WATER_DEEP:    vec3f32 = @[0.05, 0.09, 0.10]
+def WATER_SILT:    vec3f32 = @[0.13, 0.17, 0.16]
+def QUAY_COLOR:    vec3f32 = @[0.30, 0.29, 0.27]
+def FOAM_COLOR:    vec3f32 = @[0.62, 0.65, 0.64]   -- scummy off-white shoreline foam
+
+-- Hardcoded test canal centreline (two endpoints), replaced by the painter later.
+-- A straight canal at z = -3.8, clear of both building footprints.
+def CANAL_A: vec2f32 = @[0.0 - 8.0, 0.0 - 3.8]
+def CANAL_B: vec2f32 = @[8.0, 0.0 - 3.8]
+
+-- Distance from point `p` to the segment [a,b] (metres).
+def seg_dist(p: vec2f32, a: vec2f32, b: vec2f32) f32 =
+  let pa = p - a
+  let ba = b - a
+  let h = f32.min(1.0, f32.max(0.0, dot(pa, ba) / dot(ba, ba))) in
+  magnitude(pa - ba * v2(h))
+
+-- Signed distance (metres) from (x,z) to the water region edge in the ground plane:
+-- negative inside a canal, positive on land, ~0 at the quay line.
+def water_sdf(p: vec2f32) f32 = seg_dist(p, CANAL_A, CANAL_B) - WATER_HW
+
+def WATER_UP: vec3f32 = @[0.0, 1.0, 0.0]
+
+-- Reflect view direction `v` about surface normal `n`.
+def reflect3(v: vec3f32, n: vec3f32) vec3f32 = v - n * v3(2.0 * dot(v, n))
+
+-- Wave field ported from Alexander Alekseev's "Seascape" (Shadertoy Ms2SD1). Its
+-- `sea_octave` — a domain-warped, ridged abs(sin) crest raised to a choppiness power —
+-- gives sharp, organic waves that plain value-noise fbm cannot. A few octaves with
+-- amplitude falling FAST (0.22x) as frequency rises (1.9x) let the low-frequency swell
+-- dominate the slope, with two counter-drifting copies per octave (animated by `t`) for
+-- flow and a per-octave rotation to decorrelate. We use only the NORMAL of this height
+-- field (the water is a flat plane at -WATER_DEPTH), so no ray tracing — just its
+-- finite-difference gradient. Tunables are harbour-scaled (smaller, calmer than open sea).
+def SEA_CHOPPY: f32 = 3.0
+def SEA_FREQ:   f32 = 0.85
+def SEA_SPEED:  f32 = 0.45
+def SEA_HEIGHT: f32 = 0.11
+def SEA_ITER:   i32 = 4
+def WAVE_SCALE: f32 = 1.4       -- world metres -> wave uv
+def NORMAL_STR: f32 = 1.15      -- horizontal slope -> normal tilt
+
+def whash(p: vec2f32) f32 =
+  f32.fract(f32.sin(dot(p, @[127.1, 311.7])) * 43758.5453123)
+
+-- 2-D value noise in [-1, 1] (Seascape's `noise`).
+def wnoise(p: vec2f32) f32 =
+  let i = vec.floor(p)
+  let f = vec.fract(p)
+  let u = f * f * (v2(3.0) - f * v2(2.0))
+  let a = whash(i)
+  let b = whash(@[i.x + 1.0, i.y])
+  let c = whash(@[i.x, i.y + 1.0])
+  let d = whash(@[i.x + 1.0, i.y + 1.0]) in
+  0.0 - 1.0 + 2.0 * mix(mix(a, b, u.x), mix(c, d, u.x), u.y)
+
+-- One ridged, domain-warped wave octave (Seascape's `sea_octave`).
+def sea_octave(uv: vec2f32, choppy: f32) f32 =
+  let uv2 = uv + v2(wnoise(uv))
+  let wv = v2(1.0) - vec.abs(vec.sin(uv2))
+  let swv = vec.abs(vec.cos(uv2))
+  let wv2 = mix(wv, swv, wv) in
+  f32.pow(1.0 - f32.pow(wv2.x * wv2.y, 0.65), choppy)
+
+-- Summed wave height at wave-space (x,z) and time `t`.
+def sea_height(px: vec2f32, t: f32) f32 =
+  let seat = 1.0 + t * SEA_SPEED
+  let uv0 = @[px.x * 0.75, px.y]
+  let r = loop (i, uv, h, freq, amp, choppy) = (0, uv0, 0.0, SEA_FREQ, SEA_HEIGHT, SEA_CHOPPY) while i < SEA_ITER do
+    let d1 = sea_octave((uv + v2(seat)) * v2(freq), choppy)
+    let d2 = sea_octave((uv - v2(seat)) * v2(freq), choppy)
+    let h2 = h + (d1 + d2) * amp
+    let uvr = @[1.6 * uv.x + 1.2 * uv.y, 0.0 - 1.2 * uv.x + 1.6 * uv.y] in   -- octave_m rotate
+    (i + 1, uvr, h2, freq * 1.9, amp * 0.22, mix(choppy, 1.0, 0.2))
+  in r.2
+
+-- Ripple normal from the height-field gradient (finite difference), tilted off `up`.
+def water_normal(p: vec2f32, t: f32) vec3f32 =
+  let e = 0.06
+  let q  = @[p.x * WAVE_SCALE, p.y * WAVE_SCALE]
+  let h0 = sea_height(q, t)
+  let hx = sea_height(@[q.x + e, q.y], t)
+  let hz = sea_height(@[q.x, q.y + e], t) in
+  normalize(@[(h0 - hx) * NORMAL_STR, e, (h0 - hz) * NORMAL_STR])
+
+-- Horizontal gradient of the water field (points OUT of the canal); used to face the
+-- far quay wall the camera looks across at grazing angles.
+def water_grad(p: vec2f32) vec2f32 =
+  let e = 0.05
+  let s0 = water_sdf(p) in
+  @[(water_sdf(@[p.x + e, p.y]) - s0) / e, (water_sdf(@[p.x, p.y + e]) - s0) / e]
+
+-- Per-pixel canal shade (approach A): from the flat-ground hit `p0` (inside the water
+-- region) trace down the view ray `rd` into the sunken basin. On the water plane at
+-- y = -WATER_DEPTH: a murky body (silt near the edge, darkening to deep with the water
+-- path length, Beer), a rippled sky reflection (low Fresnel — murky water reflects
+-- little except at grazing) and a sharp sun glint on the wavelets. Overshooting the far
+-- edge gives the quay wall. Returns a display-range colour (sky/reflection are in range).
+def shade_water(p0: vec3f32, rd: vec3f32, t: f32) vec3f32 =
+  let t_floor = (0.0 - WATER_DEPTH - p0.y) / rd.y
+  let pf = p0 + rd * v3(t_floor)
+  let onwater = water_sdf(@[pf.x, pf.z]) < 0.0 in
+  if onwater then
+    let wn = water_normal(@[pf.x, pf.z], t)
+    let ndv = f32.max(0.03, 0.0 - dot(rd, wn))           -- 1 top-down .. 0 grazing
+    let m = 1.0 - ndv
+    let fres = 0.02 + 0.24 * (m * m * m * m * m)           -- low reflectivity (murky)
+    let rr = reflect3(rd, wn)
+    let sky = clouds.sky(pf, rr)
+    let spec = f32.pow(f32.max(0.0, dot(rr, sun)), 80.0) * 0.9   -- sun sparkle on ripples
+    let absorb = 1.0 - f32.exp(0.0 - t_floor * 2.5)       -- silt fades to deep with depth
+    let body = mix(WATER_SILT, WATER_DEEP, absorb)
+    let surf = mix(body, sky, fres) + v3(spec)
+    -- Scummy foam collar along the quay (hides the grazing-reflection seam too).
+    let foam = smoothstep(0.0 - 0.30, 0.0 - 0.05, water_sdf(@[pf.x, pf.z])) in
+    mix(surf, FOAM_COLOR, foam * 0.4)
+  else
+    -- Far quay wall: the ray crossed the canal and out before reaching the floor. Face
+    -- it with the (inward) horizontal water gradient and light it as stone, so it reads
+    -- as the far embankment rising from the water rather than a flat grey band.
+    let g = water_grad(@[pf.x, pf.z])
+    let nrm = normalize(@[0.0 - g.x, 0.4, 0.0 - g.y])       -- inward + a little up
+    let ndl = f32.max(0.0, dot(nrm, sun)) in
+    QUAY_COLOR * v3(0.4 + 0.6 * ndl)
