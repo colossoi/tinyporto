@@ -1,13 +1,18 @@
--- paint: domain constants for the ground painter — item kinds, tool footprints,
--- buffer capacities, and the tessellation budget. The generic spline/ribbon
--- algorithms live in curve.wyn; the capture + tessellation logic in main.wyn.
+-- paint: the ground painter — item kinds, tool footprints, buffer capacities, the
+-- tessellation budget, and the tessellation itself (item list -> flat triangle
+-- ribbon). The generic spline/ribbon primitives live in geom.wyn; the online
+-- capture fold lives in input.wyn; `step` (main.wyn) just drives them.
 --
 -- The world is an ordered list of parametric items (the source of truth):
 --   * water  (kind 1): a stroke (control-point polyline) swept by a big radius
 --   * fence  (kind 2): a stroke swept by a small half-width
 --   * building (kind 3): a single center point, fixed-size rectangle
--- Strokes capture control points online (Reumann-Witkam); `step` tessellates them
--- into a flat triangle ribbon. Nothing is drawn above the ground plane.
+-- Strokes capture control points online (Reumann-Witkam); ground_pos/ground_nrm
+-- tessellate them into a flat triangle ribbon. Nothing is drawn above the ground.
+--
+-- Library module: no `open`; f32.* qualified (see math.wyn for the idiom).
+
+import "geom"   -- rect_vertex / ribbon_vertex for the tessellation
 
 -- Buffer capacities. MUST match the driver's buffer sizes (driver/src/app.rs).
 def POINTS_CAP: i32 = 1024     -- total control points across all items
@@ -36,3 +41,73 @@ def TESS_VPS:   i32 = 24       -- verts per control-point span (CR_SUB quads * 6
 def TESS_VPI:   i32 = 744      -- verts per item ((TESS_MAXCP - 1) * TESS_VPS)
 def TESS_BASE:  i32 = 6        -- leading verts = the ground base quad (sand)
 def TESS_CAP:   i32 = 95238    -- TESS_BASE + ITEMS_CAP * TESS_VPI
+
+-- Ground geometry as two parallel streams: ground_pos = (pos.xyz, kind) and
+-- ground_nrm = (nrm.xyz, attr) for vertex `v`, built from the item list + points.
+-- Two index regions: [0, TESS_BASE) the sand base quad; [TESS_BASE, TESS_CAP) a
+-- fixed budget per item (centripetal-CR ribbon for strokes, one quad for buildings).
+-- Unused item slots collapse to a degenerate (zero) triangle. `attr` is the ribbon
+-- edge param; ground normals point up. The cobble setts are NOT here — they are
+-- instanced (see main.wyn's sett pipeline), the Tiny-Glade "tons of tiny instances".
+def ground_pos(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
+  if v < TESS_BASE then
+    let c = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in @[c.x, 0.0, c.y, 0.0]
+  else
+    let vi = v - TESS_BASE
+    let item = vi / TESS_VPI
+    let local = vi % TESS_VPI
+    let it = items[item]
+    let kind = it.x
+    let pstart = i32(it.y)
+    let pcount = i32(it.z)
+    let prm = it.w in
+    if kind < 0.5 then @[0.0, 0.0, 0.0, 0.0]
+    else if kind > 2.5 then
+      if local < 6 then
+        let c = rect_vertex(points[pstart], BUILD_HX, BUILD_HZ, local) in
+        @[c.x, 0.0, c.y, kind]
+      else @[0.0, 0.0, 0.0, 0.0]
+    else
+      let span = local / TESS_VPS
+      let rem = local % TESS_VPS
+      let sub = rem / 6
+      let corner = rem % 6 in
+      if span >= pcount - 1 then @[0.0, 0.0, 0.0, 0.0]
+      else
+        let p1 = points[pstart + span]
+        let p2 = points[pstart + span + 1]
+        let p0 = if span > 0 then points[pstart + span - 1] else p1
+        let p3 = if span + 2 < pcount then points[pstart + span + 2] else p2
+        let u0 = f32(sub) / f32(CR_SUB)
+        let u1 = f32(sub + 1) / f32(CR_SUB)
+        let (pos, _et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
+        @[pos.x, 0.0, pos.y, kind]
+
+def ground_nrm(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
+  if v < TESS_BASE then @[0.0, 1.0, 0.0, 0.0]
+  else
+    let vi = v - TESS_BASE
+    let item = vi / TESS_VPI
+    let local = vi % TESS_VPI
+    let it = items[item]
+    let kind = it.x
+    let pstart = i32(it.y)
+    let pcount = i32(it.z)
+    let prm = it.w in
+    if kind < 0.5 then @[0.0, 1.0, 0.0, 0.0]
+    else if kind > 2.5 then @[0.0, 1.0, 0.0, 1.0]
+    else
+      let span = local / TESS_VPS
+      let rem = local % TESS_VPS
+      let sub = rem / 6
+      let corner = rem % 6 in
+      if span >= pcount - 1 then @[0.0, 1.0, 0.0, 0.0]
+      else
+        let p1 = points[pstart + span]
+        let p2 = points[pstart + span + 1]
+        let p0 = if span > 0 then points[pstart + span - 1] else p1
+        let p3 = if span + 2 < pcount then points[pstart + span + 2] else p2
+        let u0 = f32(sub) / f32(CR_SUB)
+        let u1 = f32(sub + 1) / f32(CR_SUB)
+        let (_pos, et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
+        @[0.0, 1.0, 0.0, et]

@@ -21,6 +21,7 @@ import "camera"
 import "shade"
 import "geom"
 import "paint"
+import "input"
 import "bricks"
 import "walls"
 import "shadow"
@@ -52,22 +53,9 @@ type frame_globals = {
 def cam(f: frame_globals) orbit =
   { target = f.cam_target, az = f.cam_az, elev = f.cam_elev, dist = f.cam_dist }
 
--- Input event stream. The host appends one `vec4f32` per raw event since the last
--- frame and zero-pads the rest (kind 0 = None); `step` folds a fixed EV_CAP window,
--- skipping None slots. One event:
---   .x = kind*256 + mods   kind: 1 KeyDown 2 KeyUp 3 MouseDown 4 MouseUp 5 Move
---                          6 Wheel; mods = the modifier mask AT THE EVENT (frozen)
---   .y = code              keycode (KeyDown/Up) or button index (MouseDown/Up)
---   .z, .w = x, y          cursor position in pixels (wheel: dy in .z)
-def EV_CAP:   i32 = 32   -- events folded per frame (host caps to this)
-def EMIT_CAP: i32 = 16   -- control points a single frame may commit (array bound)
-def EV_KEYDOWN:   i32 = 1
-def EV_MOUSEDOWN: i32 = 3
-def EV_MOUSEUP:   i32 = 4
-def EV_MOUSEMOVE: i32 = 5
-def BTN_LEFT: i32 = 0
-def KEY_TAB:  i32 = 1    -- host-side keycode table (mirror of the driver's)
-def KEY_L:    i32 = 2
+-- The raw-event stream (`events`) and its decode constants, the screen->ground
+-- pick, and the per-frame UI / stroke-capture folds all live in input.wyn; `step`
+-- just calls fold_ui / fold_strokes below.
 
 ------------------------------------------------------------
 -- State update (Wyn-owned). One compute entry, `step`, advances ALL persistent
@@ -79,13 +67,6 @@ def KEY_L:    i32 = 2
 -- streamed output) and its small outputs by fixed-array literals; the compiler
 -- schedules whatever kernels that needs.
 ------------------------------------------------------------
-
--- Screen pixel -> ground-plane point (same ray as the rendered cursor). `py` is
--- top-left pixel Y (as events carry it); flip to the bottom-left ray convention.
-def screen_to_ground(resolution: vec3f32, o: orbit, px: f32, py: f32) vec2f32 =
-  let mc = @[px, resolution.y - py]
-  let (ro, rd) = get_ray(resolution, mc, o) in
-  (ro + rd * v3(ground_t(ro, rd))).xz
 
 -- One frame's whole state update. Reads the previous state (ping-pong prev) and
 -- the inputs; returns the next state. Output order: uistate, points, items, head.
@@ -113,53 +94,13 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   let kindv = tool0 + 1.0
   let param = if tool0 < 0.5 then WATER_R else if tool0 < 1.5 then FENCE_HW else 0.0
 
-  -- UI fold: a Tab KeyDown cycles the tool, an L KeyDown toggles the overlay.
-  -- Discrete key events in order; independent of the stroke fold below.
-  let (tool1, ovl1) =
-    loop (tool, ovl) = (tool0, ovl0) for k < EV_CAP do
-      let e = events[k]
-      let kind = i32(e.x) / 256i32
-      let code = i32(e.y) in
-      if kind == EV_KEYDOWN && code == KEY_TAB then (f32((i32(tool) + 1) % 3), ovl)
-      else if kind == EV_KEYDOWN && code == KEY_L then (tool, 1.0 - ovl)
-      else (tool, ovl)
+  -- UI fold (Tab cycles the tool, L toggles the overlay) and stroke-capture fold
+  -- (Reumann-Witkam control-point emission into `em`/`ec`) both live in input.wyn.
+  let (tool1, ovl1) = fold_ui(tool0, ovl0, events)
   let uistate_out = [tool1, ovl1]
 
-  -- Stroke fold: thread the Reumann-Witkam strip (anchor/dir/last/have_dir) + held
-  -- through the frame's mouse events IN ORDER, committing control points into a
-  -- fixed emit array `em` at a running count `ec`. MouseDown starts a stroke and
-  -- plants its first point (a building plants only this one); MouseMove advances the
-  -- RW strip; MouseUp snaps a final point. Every emit is guarded by the EMIT_CAP
-  -- array bound (a very fast drag past the cap loses its tail — a soft limit).
-  let z2 = @[0.0, 0.0]
   let (anchor, dir, last, hd, held, press, ec, em) =
-    loop (anchor, dir, last, hd, held, press, ec, em) =
-         (@[head_in[3], head_in[4]], @[head_in[5], head_in[6]], @[head_in[7], head_in[8]],
-          head_in[9], head_in[2], 0.0, 0i32,
-          [z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2])
-    for k < EV_CAP do
-      let e = events[k]
-      let kind = i32(e.x) / 256i32
-      let code = i32(e.y)
-      let cur = screen_to_ground(res, o, e.z, e.w) in
-      if kind == EV_MOUSEDOWN && code == BTN_LEFT then
-        -- Press: start the strip, plant the first point.
-        if ec < EMIT_CAP then (cur, z2, cur, 0.0, 1.0, 1.0, ec + 1i32, em with [ec] = cur)
-        else (cur, z2, cur, 0.0, 1.0, 1.0, ec, em)
-      else if kind == EV_MOUSEMOVE && held > 0.5 && (!is_building) then
-        if distance(cur, last) > STEP then
-          let (emit, pos, na, nd, nl, nhd) =
-            rw_advance(anchor, dir, last, hd > 0.5, cur, CORRIDOR, MAXCHORD)
-          let hdf = if nhd then 1.0 else 0.0 in
-          if emit && ec < EMIT_CAP then (na, nd, nl, hdf, held, press, ec + 1i32, em with [ec] = pos)
-          else (na, nd, nl, hdf, held, press, ec, em)
-        else (anchor, dir, last, hd, held, press, ec, em)
-      else if kind == EV_MOUSEUP && code == BTN_LEFT then
-        -- Release: snap a final point for a non-building stroke, then clear held.
-        if held > 0.5 && (!is_building) && distance(last, anchor) > 0.05 && ec < EMIT_CAP then
-          (anchor, dir, last, hd, 0.0, press, ec + 1i32, em with [ec] = last)
-        else (anchor, dir, last, hd, 0.0, press, ec, em)
-      else (anchor, dir, last, hd, held, press, ec, em)
+    fold_strokes(head_in, events, res, o, is_building)
 
   let new_pc = if pc + ec < POINTS_CAP then pc + ec else POINTS_CAP
   let new_ic = if press > 0.5 && ic < ITEMS_CAP then ic + 1i32 else ic
@@ -185,81 +126,11 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
     [f32(new_pc), f32(new_ic), held, anchor.x, anchor.y, dir.x, dir.y,
      last.x, last.y, hd, 0.0, 0.0]
 
-  -- Ground geometry, as two parallel streams: geom_pos = (pos.xyz, kind) and
-  -- geom_nrm = (nrm.xyz, attr). Two index regions, built from the PREVIOUS state:
-  -- [0, TESS_BASE) the sand base quad; [TESS_BASE, TESS_CAP) a fixed budget per
-  -- item (centripetal-CR ribbon for strokes, one quad for buildings). Unused item
-  -- slots collapse to a degenerate (zero) triangle. `attr` is the ribbon edge param;
-  -- ground normals point up. The cobble setts are NOT here — they are instanced
-  -- (see sett_inst / sett_vertex), the Tiny-Glade "tons of tiny instances" model.
-  let geom_pos =
-    map(|s|
-      let v = i32(s) in
-      if v < TESS_BASE then
-        let c = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in @[c.x, 0.0, c.y, 0.0]
-      else
-        let vi = v - TESS_BASE
-        let item = vi / TESS_VPI
-        let local = vi % TESS_VPI
-        let it = items_in[item]
-        let kind = it.x
-        let pstart = i32(it.y)
-        let pcount = i32(it.z)
-        let prm = it.w in
-        if kind < 0.5 then @[0.0, 0.0, 0.0, 0.0]
-        else if kind > 2.5 then
-          if local < 6 then
-            let c = rect_vertex(points_in[pstart], BUILD_HX, BUILD_HZ, local) in
-            @[c.x, 0.0, c.y, kind]
-          else @[0.0, 0.0, 0.0, 0.0]
-        else
-          let span = local / TESS_VPS
-          let rem = local % TESS_VPS
-          let sub = rem / 6
-          let corner = rem % 6 in
-          if span >= pcount - 1 then @[0.0, 0.0, 0.0, 0.0]
-          else
-            let p1 = points_in[pstart + span]
-            let p2 = points_in[pstart + span + 1]
-            let p0 = if span > 0 then points_in[pstart + span - 1] else p1
-            let p3 = if span + 2 < pcount then points_in[pstart + span + 2] else p2
-            let u0 = f32(sub) / f32(CR_SUB)
-            let u1 = f32(sub + 1) / f32(CR_SUB)
-            let (pos, _et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
-            @[pos.x, 0.0, pos.y, kind]
-      , tidx)
-
-  let geom_nrm =
-    map(|s|
-      let v = i32(s) in
-      if v < TESS_BASE then @[0.0, 1.0, 0.0, 0.0]
-      else
-        let vi = v - TESS_BASE
-        let item = vi / TESS_VPI
-        let local = vi % TESS_VPI
-        let it = items_in[item]
-        let kind = it.x
-        let pstart = i32(it.y)
-        let pcount = i32(it.z)
-        let prm = it.w in
-        if kind < 0.5 then @[0.0, 1.0, 0.0, 0.0]
-        else if kind > 2.5 then @[0.0, 1.0, 0.0, 1.0]
-        else
-          let span = local / TESS_VPS
-          let rem = local % TESS_VPS
-          let sub = rem / 6
-          let corner = rem % 6 in
-          if span >= pcount - 1 then @[0.0, 1.0, 0.0, 0.0]
-          else
-            let p1 = points_in[pstart + span]
-            let p2 = points_in[pstart + span + 1]
-            let p0 = if span > 0 then points_in[pstart + span - 1] else p1
-            let p3 = if span + 2 < pcount then points_in[pstart + span + 2] else p2
-            let u0 = f32(sub) / f32(CR_SUB)
-            let u1 = f32(sub + 1) / f32(CR_SUB)
-            let (_pos, et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
-            @[0.0, 1.0, 0.0, et]
-      , tidx)
+  -- Ground geometry, as two parallel streams over the PREVIOUS state: geom_pos =
+  -- (pos.xyz, kind) and geom_nrm = (nrm.xyz, attr). The per-vertex tessellation
+  -- (sand base quad + per-item CR ribbon / building quad) lives in paint.wyn.
+  let geom_pos = map(|s| ground_pos(i32(s), items_in, points_in), tidx)
+  let geom_nrm = map(|s| ground_nrm(i32(s), items_in, points_in), tidx)
 
   -- Non-indexed draw_indirect args for the ground: the whole geom buffer (base
   -- quad + all item slots; unused slots are degenerate).
@@ -304,19 +175,18 @@ resource sun_depth: image2d {
 }
 
 ------------------------------------------------------------
--- GTAO (XeGTAO) ambient occlusion. Three per-pixel compute passes:
--- gtao_depth linearizes scene_depth to viewspace depth
--- (vdepth); gtao_main integrates horizon visibility + packs denoise edges into
--- ao_work; gtao_denoise runs one edge-aware blur to ao_out, which `light` folds in.
--- We call gtao.wyn's convenience wrappers, which keep the slice/step loops inside
--- library defs (so no loops live in our `map` bodies) and fetch depth with
+-- GTAO (XeGTAO) ambient occlusion. Two per-pixel compute passes: gtao_depth
+-- linearizes scene_depth to viewspace depth (vdepth); gtao_main integrates horizon
+-- visibility + packs denoise edges into ao_work. The edge-aware denoise blur is not
+-- a pass of its own — it reads only gtao_main's ao_work, so `light` folds it in
+-- inline. We call gtao.wyn's convenience wrappers, which keep the slice/step loops
+-- inside library defs (so no loops live in our `map` bodies) and fetch depth with
 -- texture_load (integer, no sampler). Working images are write+sample (like `lit`):
 -- written via storage in one pass, read as a sampled texture2d in the next.
 ------------------------------------------------------------
 
 resource vdepth:  image2d { format = r32float     size = window  usages = [storage_write, sampled] }
 resource ao_work: image2d { format = rgba16float  size = window  usages = [storage_write, sampled] }
-resource ao_out:  image2d { format = r32float     size = window  usages = [storage_write, sampled] }
 
 ------------------------------------------------------------
 -- Cull (Nine's simple path). One record per running-bond cell is built, then
