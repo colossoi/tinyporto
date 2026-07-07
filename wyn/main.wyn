@@ -206,9 +206,11 @@ entry cull(bidx: []u32,
     map(|s|
       let i = i32(s)
       let base = brick_center(i)
-      let jx = (brick_hash(i + 13) - 0.5) * 0.04
-      let jz = (brick_hash(i + 53) - 0.5) * 0.04
-      let center = @[base.x + jx, base.y + jz]
+      -- No along-row (x) jitter: setts sit on the exact cell x so the clamped along-row
+      -- half-extent (sett_hx) can guarantee they never overlap along their length. A
+      -- small cross-row (z) jitter keeps the courses from reading as a rigid grid.
+      let jz = (brick_hash(i + 53) - 0.5) * 0.016
+      let center = @[base.x, base.y + jz]
       let c3 = @[center.x, BRICK_H * 0.5, center.y]
       let o = cam(frame)
       -- 0.25 ≈ the sett proxy's bounding radius (footprint + tilt), generous.
@@ -218,8 +220,8 @@ entry cull(bidx: []u32,
       let occluded = occ_test(od, world_to_clip(c3, frame.resolution, o), frame.resolution)
       let keep = visible && (!occluded)
       let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
-      -- Roundness spread: some cobbles fairly crisp, some rounded.
-      let roundfrac = 0.21 + 0.64 * brick_hash(i + 7919) in
+      -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
+      let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919) in
       @[center.x, center.y, height, roundfrac]
       , bidx)
   let inst = filter(|c| c.z > 0.0, cand)
@@ -343,8 +345,9 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
   let (right, up, fwd) = sett_basis(center.x, center.y)
   let sc = sett_scale(center.x, center.y)
   let local = box_pos[vid]
-  -- Centre the proxy box (y in [-h/2, h/2]) so it tilts about its middle.
-  let lc = @[local.x * BRICK_W * sc, (local.y - 0.5) * height, local.z * BRICK_L * sc]
+  -- Centre the proxy box (y in [-h/2, h/2]) so it tilts about its middle. The along-
+  -- row (x) half is clamped (sett_hx) so setts never overlap along their length.
+  let lc = @[local.x * (sett_hx(sc) * 2.0), (local.y - 0.5) * height, local.z * BRICK_L * sc]
   let bcenter = @[center.x, height * 0.5, center.y]
   let world = bcenter + sett_orient(lc, right, up, fwd) in
   (world_to_clip(world, frame.resolution, cam(frame)), world, inst, sett_var(center.x, center.y))
@@ -364,7 +367,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
   -- box matches the proxy. Roundness is `roundfrac` of the min half-extent.
   let sc = sett_scale(inst.x, inst.y)
   let (right, up, fwd) = sett_basis(inst.x, inst.y)
-  let half = @[BRICK_W * 0.5 * sc, height * 0.5, BRICK_L * 0.5 * sc]
+  let half = @[sett_hx(sc), height * 0.5, BRICK_L * 0.5 * sc]
   let r = inst.w * f32.min(half.x, f32.min(half.y, half.z))
   let b = @[half.x - r, half.y - r, half.z - r]
   -- Trace in box-local space: project the world offset onto the sett's basis.
@@ -384,7 +387,16 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
     let nl = round_normal(pl, b, r)
     let n = sett_orient(nl, right, up, fwd)
     let clip = world_to_clip(pos, frame.resolution, cam(frame))
-    let alb = COBBLE_BASE * v3(0.8 + 0.4 * var)
+    -- Per-sett colour from three independent hashes on the stable centre: hue (warm
+    -- greige <-> cool blue-grey), saturation (mute toward grey <-> enrich the undertone),
+    -- and lightness (`var`). Independent axes keep the field from reading uniform.
+    let seed = sett_seed(inst.x, inst.y)
+    let hued = mix(COBBLE_WARM, COBBLE_COOL, brick_hash(seed + 17))
+    let g = (hued.x + hued.y + hued.z) * 0.3333
+    let sat = 0.7 + 0.8 * brick_hash(seed + 29)          -- <1 mutes to grey, >1 enriches
+    -- Wide per-sett lightness (~2.8:1) so it reads through the sun + tonemap; skewed
+    -- a touch dark (mean < 1) so the brightest setts don't blow out to white.
+    let alb = mix(v3(g), hued, sat) * v3(0.5 + 0.9 * var)
     let d = clip.z / clip.w in
     -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
     (@[alb.x, alb.y, alb.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)

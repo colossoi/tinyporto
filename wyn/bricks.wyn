@@ -6,17 +6,21 @@
 -- (see round_normal); a later pass upgrades to a per-pixel rounded-box ray
 -- march so the silhouette rounds too (the Tiny Glade trick).
 
--- Sett palette.
-def COBBLE_BASE: vec3f32 = @[0.46, 0.43, 0.40]   -- grey stone
+-- Sett palette. Cobble is a mid-tone neutral ranging from warm earthy greige to
+-- architectural grey with a soft blue undertone. Each sett draws an independent hash
+-- for hue (mix of these two), saturation (grey <-> full undertone), and lightness, so
+-- the field reads varied rather than washed out and uniform (see sett_fragment).
+def COBBLE_WARM: vec3f32 = @[0.55, 0.46, 0.36]   -- warm earthy greige
+def COBBLE_COOL: vec3f32 = @[0.38, 0.43, 0.52]   -- architectural grey, soft blue undertone
 
 -- Sett dimensions (meters), from a 10"x7"x4" cobble reference.
-def BRICK_W: f32 = 0.25     -- x footprint
-def BRICK_L: f32 = 0.18     -- z footprint
+def BRICK_W: f32 = 0.24     -- x footprint: the LONG axis, along the row
+def BRICK_L: f32 = 0.15     -- z footprint: the short axis / width (setts read ~1.6:1)
 def BRICK_H: f32 = 0.05     -- protrusion above ground (chunky stone, so the rounding reads)
-def MORTAR:  f32 = 0.015    -- joint width
+def MORTAR:  f32 = 0.004    -- nominal joint (the z pitch adds it to BRICK_L)
 
-def CELLX: f32 = 0.265      -- BRICK_W + MORTAR
-def CELLZ: f32 = 0.195      -- BRICK_L + MORTAR
+def CELLX: f32 = 0.255      -- along-row cell pitch (long axis + a tight joint)
+def CELLZ: f32 = 0.175      -- cross-row pitch (short axis + a tight joint)
 
 -- Running-bond grid covering the ~40 m ground (centered on origin). The total sett
 -- count (BCOLS*BROWS = 36960) is the driver's `bidx` seed length — kept in sync there.
@@ -60,8 +64,16 @@ def brick_hash(i: i32) f32 =
 -- they vary in footprint and orientation.
 def sett_seed(cx: f32, cz: f32) i32 = i32(cx * 53.0 + cz * 131.0 + 20000.0)
 def sett_scale(cx: f32, cz: f32) f32 = 0.93 + 0.18 * brick_hash(sett_seed(cx, cz) + 7)
-def sett_yaw(cx: f32, cz: f32) f32 = (brick_hash(sett_seed(cx, cz) + 31) - 0.5) * 0.225
+def sett_yaw(cx: f32, cz: f32) f32 = (brick_hash(sett_seed(cx, cz) + 31) - 0.5) * 0.15
 def sett_var(cx: f32, cz: f32) f32 = brick_hash(sett_seed(cx, cz) + 3)
+
+-- Along-row (local x) half-extent, clamped so a sett never crosses its cell's x-lane.
+-- Cull places setts on the exact cell x (no along-row jitter), so this clamp makes it
+-- impossible for two setts to overlap ALONG their length, whatever their scale/yaw.
+-- SETT_JOINT is the min half-gap kept at the lane edge (covers the small yaw skew).
+-- The cross (z) half stays BRICK_L*0.5*sc, so setts still vary in width and size.
+def SETT_JOINT: f32 = 0.008
+def sett_hx(sc: f32) f32 = f32.min(BRICK_W * 0.5 * sc, CELLX * 0.5 - SETT_JOINT)
 
 -- Per-sett orientation as an orthonormal basis (right, up, fwd). `up` is a slightly
 -- random top normal, so the stone leans in SOME direction (a normal captures tilt
