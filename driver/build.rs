@@ -129,10 +129,13 @@ enum DispatchSize {
     DerivedFrom { len: Len, workgroup_size: u32 },
 }
 
+/// The domain a `DerivedFrom` dispatch is sized from. A storage-buffer input
+/// (`ceil(len_elems / wg)`) or a storage image (`ceil(width*height / wg)`).
 #[derive(serde::Deserialize)]
-struct Len {
-    binding: u32,
-    elem_bytes: u64,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Len {
+    InputBinding { binding: u32, elem_bytes: u64 },
+    StorageImage { set: u32, binding: u32 },
 }
 
 fn id(s: &str) -> Ident {
@@ -169,6 +172,18 @@ fn input_param(p: &Pipeline, b: u32) -> Ident {
     id(&format!("{name}_bytes"))
 }
 
+/// Name (`<name>_pixels`) of the pixel-count parameter for the storage-image
+/// binding at (`set`, `binding`) — the domain an image-derived dispatch sizes from.
+fn image_pixels_param(p: &Pipeline, set: u32, b: u32) -> Ident {
+    let name = p
+        .bindings
+        .iter()
+        .find(|x| x.ty == "storage_texture" && x.set == set && x.binding == b)
+        .map(|x| x.name.as_str())
+        .unwrap_or_else(|| panic!("descriptor: no storage_texture at set {set} binding {b}"));
+    id(&format!("{name}_pixels"))
+}
+
 /// Translate one compute pipeline into `<entry>_stages` + `<entry>_out_bytes`
 /// functions, with the descriptor's rules inlined as arithmetic. Non-compute
 /// pipelines have nothing to compute, so they generate nothing. A compute entry
@@ -199,10 +214,22 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
             let dims = match ds {
                 DispatchSize::Fixed { x, y, z } => quote! { [#x, #y, #z] },
                 DispatchSize::DerivedFrom { len, workgroup_size } => {
-                    let param = input_param(p, len.binding);
-                    disp_params.insert(param.to_string());
-                    let (elem, wg) = (len.elem_bytes, workgroup_size);
-                    quote! { [((#param / #elem) as u32).div_ceil(#wg), 1, 1] }
+                    let wg = *workgroup_size;
+                    match len {
+                        // Buffer input: dispatch ceil(input_len_elems / wg).
+                        Len::InputBinding { binding, elem_bytes } => {
+                            let param = input_param(p, *binding);
+                            disp_params.insert(param.to_string());
+                            quote! { [((#param / #elem_bytes) as u32).div_ceil(#wg), 1, 1] }
+                        }
+                        // Storage image: dispatch ceil(width*height / wg). The pixel
+                        // count arrives as a `<name>_pixels` arg (see image_pixels_param).
+                        Len::StorageImage { set, binding } => {
+                            let param = image_pixels_param(p, *set, *binding);
+                            disp_params.insert(param.to_string());
+                            quote! { [(#param as u32).div_ceil(#wg), 1, 1] }
+                        }
+                    }
                 }
             };
             quote! { crate::graph::ComputeStage { entry: #entry, groups: #dims } }

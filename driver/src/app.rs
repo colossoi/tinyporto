@@ -31,19 +31,17 @@ const TIDX_BYTES: u64 = TESS_CAP * 4;
 const PIDX_BYTES: u64 = POINTS_CAP * 4;
 const IIDX_BYTES: u64 = ITEMS_CAP * 4;
 const BIDX_BYTES: u64 = BRICK_COUNT * 4;
-// Coarse occlusion grid (Hi-Z simple): window (1280x800) / 8. `otile` is its iota
-// dispatch domain (one invocation per coarse texel).
+// Coarse occlusion grid (Hi-Z simple): window (1280x800) / 8. `occ_reduce`
+// dispatches one invocation per coarse texel (sized from occ_depth's pixel count).
 const OCC_COUNT: u64 = 160 * 100;
-const OTILE_BYTES: u64 = OCC_COUNT * 4;
 // Wall-brick budget (must match walls.wyn: BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS =
 // N_WALL*PER_COURSE*COURSES + 128 + 8 = 8*13*24 + 136 = 2632). `wbidx` is the iota
 // domain the `walls` generator maps over (one slot per candidate block).
 const WALL_BRICKS: u64 = 2632;
 const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
-// Deferred lighting dispatch: one invocation per window pixel (must match the
-// window size / frame.resolution — see occ_depth's note on window-relative sizing).
+// Window pixel count — the dispatch domain for the per-pixel compute passes
+// (gtao_depth/main, light), each sized from its window-sized write image.
 const PXL_COUNT: u64 = 1280 * 800;
-const PXL_BYTES: u64 = PXL_COUNT * 4;
 // Input event stream: EV_CAP events (must match `step`'s EV_CAP in main.wyn), one
 // vec4f32 (16 bytes) each. The host zero-pads unused slots to None each frame.
 pub const EV_CAP: usize = 32;
@@ -62,9 +60,9 @@ const fn cull_out(binding: u32) -> u64 {
     cull_out_bytes(binding, BIDX_BYTES)
 }
 
-// `occ_reduce`'s output size (its unused dispatch-carrier buffer), from the iota.
+// `occ_reduce` writes only occ_depth (an image, not a buffer) — no sized outputs.
 const fn occ_out(binding: u32) -> u64 {
-    occ_reduce_out_bytes(binding, OTILE_BYTES)
+    occ_reduce_out_bytes(binding)
 }
 
 // `walls`' output sizes (compacted wall_brick records + draw args + filter scratch),
@@ -73,17 +71,16 @@ const fn walls_out(binding: u32) -> u64 {
     walls_out_bytes(binding, WBIDX_BYTES)
 }
 
-// `light`'s output size (its unused per-pixel dispatch-carrier buffer).
+// `light` / GTAO passes write only images (lit / vdepth / ao_work) — no sized
+// buffer outputs, so their out-size calcs take just the binding.
 const fn light_out(binding: u32) -> u64 {
-    light_out_bytes(binding, PXL_BYTES)
+    light_out_bytes(binding)
 }
-
-// The GTAO passes' output sizes (each an unused per-pixel dispatch carrier).
 const fn gtao_depth_out(binding: u32) -> u64 {
-    gtao_depth_out_bytes(binding, PXL_BYTES)
+    gtao_depth_out_bytes(binding)
 }
 const fn gtao_main_out(binding: u32) -> u64 {
-    gtao_main_out_bytes(binding, PXL_BYTES)
+    gtao_main_out_bytes(binding)
 }
 
 // Ordered compute stages per entry, dispatch sized from the seed counts. The
@@ -91,11 +88,11 @@ const fn gtao_main_out(binding: u32) -> u64 {
 // the generated `*_stages`); only the seed byte sizes are authored here.
 static STEP_STAGES: [ComputeStage; STEP_STAGE_COUNT] = step_stages(IIDX_BYTES, PIDX_BYTES, TIDX_BYTES);
 static CULL_STAGES: [ComputeStage; CULL_STAGE_COUNT] = cull_stages(BIDX_BYTES);
-static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OTILE_BYTES);
+static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OCC_COUNT);
 static WALLS_STAGES: [ComputeStage; WALLS_STAGE_COUNT] = walls_stages(WBIDX_BYTES);
-static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_BYTES);
-static GTAO_DEPTH_STAGES: [ComputeStage; GTAO_DEPTH_STAGE_COUNT] = gtao_depth_stages(PXL_BYTES);
-static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_BYTES);
+static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_COUNT);
+static GTAO_DEPTH_STAGES: [ComputeStage; GTAO_DEPTH_STAGE_COUNT] = gtao_depth_stages(PXL_COUNT);
+static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_COUNT);
 
 pub const GRAPH: Graph = Graph {
     resources: &[
@@ -147,16 +144,14 @@ pub const GRAPH: Graph = Graph {
         // depth, the raw AO+edges term, and the denoised AO the light pass reads.
         Resource::Image { name: "vdepth", format: TexFormat::R32Float, size: ImgSize::Window, mips: 1 },
         Resource::Image { name: "ao_work", format: TexFormat::Rgba16Float, size: ImgSize::Window, mips: 1 },
-        Resource::Buffer(BufferDef { name: "otile", size: Some(OTILE_BYTES), init: BufInit::Iota, indirect: false }),
         // Nine Phase 3 (deferred): the scene writes a thin G-buffer here (albedo +
         // world normal); `resolve_fragment` reads it back and lights it. `blit_args`
         // is the fullscreen-triangle draw (3 verts, 1 instance).
         Resource::Image { name: "g_albedo", format: TexFormat::Rgba8Unorm, size: ImgSize::Window, mips: 1 },
         Resource::Image { name: "g_normal", format: TexFormat::Rgba16Float, size: ImgSize::Window, mips: 1 },
-        // Deferred lighting: `light` writes the final `lit` image (over `pxl`, one
-        // per pixel); the resolve fragment copies it to the surface.
+        // Deferred lighting: `light` writes the final `lit` image (one invocation per
+        // window pixel); the resolve fragment copies it to the surface.
         Resource::Image { name: "lit", format: TexFormat::Rgba16Float, size: ImgSize::Window, mips: 1 },
-        Resource::Buffer(BufferDef { name: "pxl", size: Some(PXL_BYTES), init: BufInit::Iota, indirect: false }),
         Resource::Buffer(BufferDef { name: "blit_args", size: Some(16), init: BufInit::U32s(&[3, 1, 0, 0]), indirect: true }),
         // Brick buildings: `wbidx` is the candidate-brick iota; `walls` compacts the
         // visible bricks into wall_brick_inst and writes wall_brick_args (its live
@@ -198,7 +193,6 @@ pub const GRAPH: Graph = Graph {
         // Hi-Z occlusion image views (`sd`/`od` are the shader param names).
         ("od", "occ_depth"),
         ("sd", "scene_depth"),
-        ("otile", "otile"),
         // G-buffer views read by the deferred resolve fragment.
         ("ga", "g_albedo"),
         ("gn", "g_normal"),
@@ -213,9 +207,8 @@ pub const GRAPH: Graph = Graph {
         ("walls_output_0", "wall_brick_inst"),
         ("walls_output_1", "wall_brick_args"),
         ("wall_brick_inst", "wall_brick_inst"),
-        // Deferred lighting I/O: `light` writes `lit` (view `lt`) over `pxl`; the
-        // resolve fragment reads it.
-        ("pxl", "pxl"),
+        // Deferred lighting output: `light` writes `lit` (view `lt`); the resolve
+        // fragment reads it.
         ("lt", "lit"),
     ],
 

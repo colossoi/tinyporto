@@ -230,25 +230,23 @@ entry cull(bidx: []u32,
 
 -- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
 -- block of scene_depth under it. Runs after the scene pass; cull reads it next
--- frame. The `[]u32` output is a required dispatch-domain carrier (unused).
+-- frame. The write target `od` is listed first so the dispatch is sized from it
+-- (occ_depth = OCC_W x OCC_H), not the window-sized scene_depth it reads.
 #[compute]
-entry occ_reduce(otile: []u32,
-                 #[view(scene_depth, storage_read)] sd: storage_image,
-                 #[view(occ_depth, storage_write)]  od: storage_image)
-  []u32 =
-  map(|s|
-    let i = i32(s)
-    let tx = i % OCC_W
-    let ty = i / OCC_W
-    let m =
-      loop m = 1.0 for k < 64 do
-        let sx = tx * OCC_TILE + (k % OCC_TILE)
-        let sy = ty * OCC_TILE + (k / OCC_TILE)
-        let v = image_load(sd, @[sx, sy]) in
-        f32.min(m, v.x)
-    let _ = image_store(od, @[tx, ty], @[m, m, m, m]) in
-    0u32
-    , otile)
+entry occ_reduce(#[builtin(global_invocation_id)] gid: vec3u32,
+                 #[view(occ_depth, storage_write)]  od: *storage_image,
+                 #[view(scene_depth, storage_read)] sd: storage_image)
+  () =
+  let i = i32(gid.x)
+  let tx = i % OCC_W
+  let ty = i / OCC_W
+  let m =
+    loop m = 1.0 for k < 64 do
+      let sx = tx * OCC_TILE + (k % OCC_TILE)
+      let sy = ty * OCC_TILE + (k / OCC_TILE)
+      let v = image_load(sd, @[sx, sy]) in
+      f32.min(m, v.x) in
+  od with [@[tx, ty]] = @[m, m, m, m]
 
 ------------------------------------------------------------
 -- Deferred G-buffer (Nine Phase 3, the "thin raster waist"). The scene fragments
@@ -548,39 +546,33 @@ def gtao_consts: gtao.consts =
 -- Pass 1: linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
 -- to CLIP_FAR so it stays finite and never reads as an occluder.
 #[compute]
-entry gtao_depth(pxl: []u32,
-                 #[view(scene_depth, storage_read)] sd: storage_image,
-                 #[view(vdepth, storage_write)]     vd: storage_image)
-  []u32 =
-  map(|t|
-    let i = i32(t)
-    let x = i % 1280
-    let y = i / 1280
-    let ndc = image_load(sd, @[x, y]).x
-    let vz = if ndc > 0.99999 then CLIP_FAR
-             else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts))
-    let _ = image_store(vd, @[x, y], @[vz, 0.0, 0.0, 1.0]) in
-    0u32
-    , pxl)
+entry gtao_depth(#[builtin(global_invocation_id)] gid: vec3u32,
+                 #[view(vdepth, storage_write)]     vd: *storage_image,
+                 #[view(scene_depth, storage_read)] sd: storage_image)
+  () =
+  let i = i32(gid.x)
+  let x = i % 1280
+  let y = i / 1280
+  let ndc = image_load(sd, @[x, y]).x
+  let vz = if ndc > 0.99999 then CLIP_FAR
+           else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts)) in
+  vd with [@[x, y]] = @[vz, 0.0, 0.0, 1.0]
 
 -- Pass 2: GTAO main (High preset = 3 slices x 3 steps), normals reconstructed from
 -- vdepth. Writes the raw visibility term (.x) + packed denoise edges (.y) to ao_work.
 -- The slice/step loops live inside gtao.main_pass_single, not here.
 #[compute]
-entry gtao_main(pxl: []u32,
-                #[view(vdepth, sampled)]        vd: texture2d,
-                #[view(ao_work, storage_write)] aw: storage_image)
-  []u32 =
-  map(|t|
-    let i = i32(t)
-    let x = i % 1280
-    let y = i / 1280
-    let nrm = gtao.compute_viewspace_normal(@[x, y], vd, gtao_consts)
-    let noise = gtao.spatiotemporal_noise(@[u32(x), u32(y)], 0u32)
-    let (vis, edg) = gtao.main_pass_single(@[x, y], 3, 3, noise, nrm, gtao_consts, vd)
-    let _ = image_store(aw, @[x, y], @[vis, edg, 0.0, 1.0]) in
-    0u32
-    , pxl)
+entry gtao_main(#[builtin(global_invocation_id)] gid: vec3u32,
+                #[view(ao_work, storage_write)] aw: *storage_image,
+                #[view(vdepth, sampled)]        vd: texture2d)
+  () =
+  let i = i32(gid.x)
+  let x = i % 1280
+  let y = i / 1280
+  let nrm = gtao.compute_viewspace_normal(@[x, y], vd, gtao_consts)
+  let noise = gtao.spatiotemporal_noise(@[u32(x), u32(y)], 0u32)
+  let (vis, edg) = gtao.main_pass_single(@[x, y], 3, 3, noise, nrm, gtao_consts, vd) in
+  aw with [@[x, y]] = @[vis, edg, 0.0, 1.0]
 
 -- The GTAO edge-aware denoise (final blur of ao_work) is NOT a separate pass — it
 -- reads only gtao_main's output, so `light` folds it in inline (see its `ao`).
@@ -628,26 +620,25 @@ def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
     shade_surface(@[alb.x, alb.y, alb.z], n, ao, shc, shm_frac)
 
 -- The entry is just the dispatch: one invocation per pixel calls shade_frame and
--- writes the result to `lit`.
+-- writes the result to `lit`. `lt` (the write target) is listed first so the
+-- dispatch is sized from it (all its images are window-sized, so the choice is
+-- moot for size, but keeping the output first matches the other passes).
 #[compute]
-entry light(pxl: []u32,
+entry light(#[builtin(global_invocation_id)] gid: vec3u32,
             #[uniform(set=1, binding=0)] frame: frame_globals,
+            #[view(lit, storage_write)]       lt: *storage_image,
             #[view(g_albedo, storage_read)]  ga: storage_image,
             #[view(g_normal, storage_read)]  gn: storage_image,
             #[view(scene_depth, storage_read)] sd: storage_image,
             #[view(sun_depth, storage_read)]  shm: storage_image,
-            #[view(ao_work, sampled)]         aw: texture2d,
-            #[view(lit, storage_write)]       lt: storage_image)
-  []u32 =
-  map(|s|
-    let w = i32(frame.resolution.x)
-    let i = i32(s)
-    let x = i % w
-    let y = i / w
-    let col = shade_frame(ga, gn, sd, shm, aw, frame, x, y) in
-    let _ = image_store(lt, @[x, y], col) in
-    0u32
-    , pxl)
+            #[view(ao_work, sampled)]         aw: texture2d)
+  () =
+  let w = i32(frame.resolution.x)
+  let i = i32(gid.x)
+  let x = i % w
+  let y = i / w
+  let col = shade_frame(ga, gn, sd, shm, aw, frame, x, y) in
+  lt with [@[x, y]] = col
 
 ------------------------------------------------------------
 -- Deferred resolve. One fullscreen triangle copies the finished `lit` image to the

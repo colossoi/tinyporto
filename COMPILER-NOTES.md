@@ -13,19 +13,22 @@ passing wgpu/naga) run it through the driver to catch validation errors.
 
 ## Standing workarounds (currently in the code)
 
-1. **Image-writing compute entries need a dummy buffer output + iota domain.**
-   `image_store` is only per-invocation inside a `map`, and a `map` needs an array
-   to range over, so an image-only entry can't just return `()`. We feed an iota
-   input (`otile`/`pxl`) and return a throwaway `[]u32` (`… in 0u32`) purely to
-   carry the dispatch domain. See `occ_reduce`, `walls`, `light` in `wyn/main.wyn`.
-   *Ideal:* a compute entry that dispatches over an explicit grid and writes only
-   images, no carrier buffer.
+1. **Image-writing compute entries are per-invocation, not `map`s.** A storage-image
+   write is `img with [coord] = value` on a `*storage_image` (unique) param; it is
+   linear and **cannot** appear in a `map`/SOAC body ("linear … cannot be used inside
+   a SOAC body"). So an image pass takes `#[builtin(global_invocation_id)] gid:
+   vec3u32`, derives one pixel from the 1-D index `gid.x` (`x = i % w`, `y = i / w`),
+   writes with `with`, and returns `()`. The dispatch is auto-sized from the written
+   image, so **list the write target first** (matters when it differs in size from a
+   read image — e.g. `occ_reduce` writes 160×100 `occ_depth` but reads window-sized
+   `scene_depth`). See `occ_reduce` / `gtao_depth` / `gtao_main` / `light` in
+   `wyn/main.wyn`. `image_load` (reads) are unrestricted and may still sit in a `map`.
 
 2. **A `loop` inside a `map` must not reference values bound outside the `map`.**
    Doing so panics the compiler: *"FuncParam/BlockParam NodeId(..) should have been
    pre-populated in elaborated map."* Workaround: compute those values **inside** the
-   map body. In `light` we compute `w`/`h` from `iResolution` inside the lambda
-   instead of once above it.
+   map body (e.g. in `step`'s tessellation maps, recompute per-element rather than
+   hoisting). Per-invocation image entries sidestep this entirely (no `map`).
 
 3. **A `def` may take a `storage_image`/`texture2d` parameter.** The compiler inlines
    the helper or specializes it per call-site, binding its image ops to the concrete
