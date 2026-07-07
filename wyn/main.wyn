@@ -197,7 +197,7 @@ resource ao_work: image2d { format = rgba16float  size = window  usages = [stora
 ------------------------------------------------------------
 
 #[compute]
-entry cull(bidx: []u32,
+entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
            #[uniform(set=1, binding=0)] frame: frame_globals,
            #[view(occ_depth, storage_read)] od: storage_image)
   (?k. [k]vec4f32, [4]u32) =
@@ -220,9 +220,9 @@ entry cull(bidx: []u32,
       -- Occlusion: hidden if the nearest recorded surface beats the sett across its
       -- whole tile neighbourhood (hiz.wyn's occ_test), so a partly-visible sett stays.
       let occluded = occ_test(od, world_to_clip(c3, frame.resolution, o), frame.resolution)
-      -- Water converts cobble to canal: drop any sett within a hair of the water so no
-      -- partial setts comb over the quay edge.
-      let in_water = water_sdf(center) < 0.08
+      -- Water converts cobble to canal: drop any sett within a hair of a painted canal
+      -- so no partial setts comb over the quay edge.
+      let in_water = water_sdf(center, items_in, points_in) < 0.08
       let keep = visible && (!occluded) && (!in_water)
       let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
       -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
@@ -604,7 +604,7 @@ def shade_sky(resl: vec3f32, fragc: vec2f32, o: orbit) vec4f32 =
 -- compiler specializes each to its resource global.
 def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
                 shm: storage_image, aw: texture2d, frame: frame_globals,
-                x: i32, y: i32) vec4f32 =
+                items: []vec4f32, points: []vec2f32, x: i32, y: i32) vec4f32 =
   let rx = frame.resolution.x
   let ry = frame.resolution.y
   let resl = @[rx, ry, 0.0]
@@ -622,9 +622,9 @@ def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
     -- Water (approach A): only a ground-level pixel (y ~ 0) can be canal. `s0` is its
     -- signed distance to the water edge: < -QUAY_RIM traces the sunken water/quay per
     -- pixel; the [-QUAY_RIM, 0) lip is lit as a wet-stone quay cap; >= 0 is dry land.
-    let s0 = if pg.y < 0.03 then water_sdf(@[pg.x, pg.z]) else 1.0 in
+    let s0 = if pg.y < 0.03 then water_sdf(@[pg.x, pg.z], items, points) else 1.0 in
     if s0 < 0.0 - QUAY_RIM then
-      let wc = shade_water(pg, rd, frame.time) in
+      let wc = shade_water(pg, rd, frame.time, items, points) in
       @[wc.x, wc.y, wc.z, 1.0]
     else
       let base = if s0 < 0.0 then QUAY_COLOR else @[alb.x, alb.y, alb.z]
@@ -641,6 +641,7 @@ def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
 -- moot for size, but keeping the output first matches the other passes).
 #[compute]
 entry light(#[builtin(global_invocation_id)] gid: vec3u32,
+            items_in: []vec4f32, points_in: []vec2f32,
             #[uniform(set=1, binding=0)] frame: frame_globals,
             #[view(lit, storage_write)]       lt: *storage_image,
             #[view(g_albedo, storage_read)]  ga: storage_image,
@@ -653,7 +654,7 @@ entry light(#[builtin(global_invocation_id)] gid: vec3u32,
   let i = i32(gid.x)
   let x = i % w
   let y = i / w
-  let col = shade_frame(ga, gn, sd, shm, aw, frame, x, y) in
+  let col = shade_frame(ga, gn, sd, shm, aw, frame, items_in, points_in, x, y) in
   lt with [@[x, y]] = col
 
 ------------------------------------------------------------

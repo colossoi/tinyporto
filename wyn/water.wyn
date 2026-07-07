@@ -17,7 +17,6 @@ import "shade"    -- sun (specular glint)
 -- Water sits this far below the ground plane (y = 0); the shoreline is a quay wall
 -- of this height. Kept shallow — a shallow murky harbour, not a deep lake.
 def WATER_DEPTH: f32 = 0.6     -- water surface below the ground plane (quay height)
-def WATER_HW:    f32 = 1.6     -- canal half-width (metres)
 def QUAY_RIM:    f32 = 0.2     -- wet-stone lip inside the edge before the drop
 
 -- Murky municipal-harbour palette: low-saturation green-grey-brown, dark. Deep water
@@ -27,10 +26,10 @@ def WATER_SILT:    vec3f32 = @[0.13, 0.17, 0.16]
 def QUAY_COLOR:    vec3f32 = @[0.30, 0.29, 0.27]
 def FOAM_COLOR:    vec3f32 = @[0.62, 0.65, 0.64]   -- scummy off-white shoreline foam
 
--- Hardcoded test canal centreline (two endpoints), replaced by the painter later.
--- A straight canal at z = -3.8, clear of both building footprints.
-def CANAL_A: vec2f32 = @[0.0 - 8.0, 0.0 - 3.8]
-def CANAL_B: vec2f32 = @[8.0, 0.0 - 3.8]
+-- Loop caps for the painted-water evaluation (bounded so the per-pixel field is a
+-- fixed-cost loop): at most this many item slots scanned, this many segments each.
+def MAX_WATER_ITEMS: i32 = 16
+def MAX_SEG:         i32 = 40
 
 -- Distance from point `p` to the segment [a,b] (metres).
 def seg_dist(p: vec2f32, a: vec2f32, b: vec2f32) f32 =
@@ -39,9 +38,28 @@ def seg_dist(p: vec2f32, a: vec2f32, b: vec2f32) f32 =
   let h = f32.min(1.0, f32.max(0.0, dot(pa, ba) / dot(ba, ba))) in
   magnitude(pa - ba * v2(h))
 
--- Signed distance (metres) from (x,z) to the water region edge in the ground plane:
--- negative inside a canal, positive on land, ~0 at the quay line.
-def water_sdf(p: vec2f32) f32 = seg_dist(p, CANAL_A, CANAL_B) - WATER_HW
+-- Signed distance (metres) from (x,z) to the nearest painted canal edge: negative
+-- inside a canal, positive on land, ~0 at the quay line. Reads the item list (a water
+-- stroke is kind 1, its control points at [pstart, pstart+pcount), swept at half-width
+-- `param`) — the painter's source of truth. Distance to a stroke = the min distance to
+-- its centre-line segments (capsule chain) minus its half-width; the field is the min
+-- over all water strokes.
+def water_sdf(p: vec2f32, items: []vec4f32, points: []vec2f32) f32 =
+  loop best = 100.0 for ii < MAX_WATER_ITEMS do
+    let it = items[ii] in
+    if it.x > 0.5 && it.x < 1.5 then           -- a water stroke (kind 1)
+      let pstart = i32(it.y)
+      let pcount = i32(it.z)
+      let hw = it.w
+      let dmin =
+        if pcount <= 1 then magnitude(p - points[pstart])
+        else
+          loop d = 100.0 for s < MAX_SEG do
+            if s >= pcount - 1 then d
+            else f32.min(d, seg_dist(p, points[pstart + s], points[pstart + s + 1]))
+        in
+      f32.min(best, dmin - hw)
+    else best
 
 def WATER_UP: vec3f32 = @[0.0, 1.0, 0.0]
 
@@ -109,10 +127,11 @@ def water_normal(p: vec2f32, t: f32) vec3f32 =
 
 -- Horizontal gradient of the water field (points OUT of the canal); used to face the
 -- far quay wall the camera looks across at grazing angles.
-def water_grad(p: vec2f32) vec2f32 =
+def water_grad(p: vec2f32, items: []vec4f32, points: []vec2f32) vec2f32 =
   let e = 0.05
-  let s0 = water_sdf(p) in
-  @[(water_sdf(@[p.x + e, p.y]) - s0) / e, (water_sdf(@[p.x, p.y + e]) - s0) / e]
+  let s0 = water_sdf(p, items, points) in
+  @[(water_sdf(@[p.x + e, p.y], items, points) - s0) / e,
+    (water_sdf(@[p.x, p.y + e], items, points) - s0) / e]
 
 -- Per-pixel canal shade (approach A): from the flat-ground hit `p0` (inside the water
 -- region) trace down the view ray `rd` into the sunken basin. On the water plane at
@@ -120,11 +139,11 @@ def water_grad(p: vec2f32) vec2f32 =
 -- path length, Beer), a rippled sky reflection (low Fresnel — murky water reflects
 -- little except at grazing) and a sharp sun glint on the wavelets. Overshooting the far
 -- edge gives the quay wall. Returns a display-range colour (sky/reflection are in range).
-def shade_water(p0: vec3f32, rd: vec3f32, t: f32) vec3f32 =
+def shade_water(p0: vec3f32, rd: vec3f32, t: f32, items: []vec4f32, points: []vec2f32) vec3f32 =
   let t_floor = (0.0 - WATER_DEPTH - p0.y) / rd.y
   let pf = p0 + rd * v3(t_floor)
-  let onwater = water_sdf(@[pf.x, pf.z]) < 0.0 in
-  if onwater then
+  let sf = water_sdf(@[pf.x, pf.z], items, points) in     -- floor point vs the canal edge
+  if sf < 0.0 then
     let wn = water_normal(@[pf.x, pf.z], t)
     let ndv = f32.max(0.03, 0.0 - dot(rd, wn))           -- 1 top-down .. 0 grazing
     let m = 1.0 - ndv
@@ -136,13 +155,22 @@ def shade_water(p0: vec3f32, rd: vec3f32, t: f32) vec3f32 =
     let body = mix(WATER_SILT, WATER_DEEP, absorb)
     let surf = mix(body, sky, fres) + v3(spec)
     -- Scummy foam collar along the quay (hides the grazing-reflection seam too).
-    let foam = smoothstep(0.0 - 0.30, 0.0 - 0.05, water_sdf(@[pf.x, pf.z])) in
+    let foam = smoothstep(0.0 - 0.30, 0.0 - 0.05, sf) in
     mix(surf, FOAM_COLOR, foam * 0.4)
   else
-    -- Far quay wall: the ray crossed the canal and out before reaching the floor. Face
-    -- it with the (inward) horizontal water gradient and light it as stone, so it reads
-    -- as the far embankment rising from the water rather than a flat grey band.
-    let g = water_grad(@[pf.x, pf.z])
-    let nrm = normalize(@[0.0 - g.x, 0.4, 0.0 - g.y])       -- inward + a little up
-    let ndl = f32.max(0.0, dot(nrm, sun)) in
-    QUAY_COLOR * v3(0.4 + 0.6 * ndl)
+    -- Quay wall: the ray left the canal footprint before reaching the floor, so it
+    -- crosses the vertical embankment. Bisect along [0, t_floor] for the water_sdf = 0
+    -- crossing (the wall face) — evaluating the field AT the boundary, where its
+    -- gradient is well defined, avoids the facet/pyramid artifacts of sampling the
+    -- overshot point. Shade lit wet stone, darker at the waterline, lighter up top.
+    let (lo, hi) =
+      loop (lo, hi) = (0.0, t_floor) for k < 12 do
+        let mid = (lo + hi) * 0.5
+        let pm = p0 + rd * v3(mid) in
+        if water_sdf(@[pm.x, pm.z], items, points) < 0.0 then (mid, hi) else (lo, mid)
+    let pw = p0 + rd * v3((lo + hi) * 0.5)
+    let g = water_grad(@[pw.x, pw.z], items, points)
+    let nrm = normalize(@[0.0 - g.x, 0.22, 0.0 - g.y])       -- inward-facing, near-vertical
+    let ndl = f32.max(0.0, dot(nrm, sun))
+    let wet = clamp01((pw.y + WATER_DEPTH) / WATER_DEPTH) in  -- 0 at waterline .. 1 at top
+    QUAY_COLOR * v3((0.35 + 0.55 * ndl) * mix(0.55, 1.0, wet))
