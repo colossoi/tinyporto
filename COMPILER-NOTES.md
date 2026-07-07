@@ -27,11 +27,13 @@ passing wgpu/naga) run it through the driver to catch validation errors.
    map body. In `light` we compute `w`/`h` from `iResolution` inside the lambda
    instead of once above it.
 
-3. **A `def` cannot take a `storage_image`/`texture2d` parameter.** It lowers to a
-   function with an image `OpFunctionParameter`, which the SPIR-V logical model /
-   naga reject (image ops must reference a global). So image-touching helpers are
-   **inlined** into the entry: the SSAO loop in `light`, and the occlusion test
-   duplicated inline in both `cull` and `walls` (would otherwise be one shared def).
+3. **A `def` may take a `storage_image`/`texture2d` parameter.** The compiler inlines
+   the helper or specializes it per call-site, binding its image ops to the concrete
+   resource global (the image never travels as a value parameter), so the logical
+   model's "image ops reference a global" holds. Image-touching helpers are ordinary
+   defs — `contact_shadow` / `sun_shadow_pcf` in `shadow.wyn`, `gtao.denoise` (a
+   `texture2d`). The occlusion test still inlined in both `cull` and `walls` could
+   likewise collapse to one shared def in `hiz.wyn`.
 
 4. **Read-write storage textures are r32-only** (WebGPU limit, not a compiler bug,
    but it shapes the design). An image written in one entry and read in another via
@@ -49,8 +51,6 @@ passing wgpu/naga) run it through the driver to catch validation errors.
   `repro/r5_filter_count.wyn` (inspect the `*_filter_scan` stage).
 - **Loop-in-map capturing an outer binding panics** — see workaround #2. The
   elaborator should handle a `loop` closing over the map's enclosing scope.
-- **Image handle as a function parameter** — see workaround #3. Either inline such
-  helpers automatically, or support image params in the logical model.
 
 ---
 

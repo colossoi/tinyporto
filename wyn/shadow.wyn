@@ -4,10 +4,12 @@
 -- screen and reading back the recorded scene depth; a step that lands behind a
 -- nearer surface (within a thickness window) means the sun is blocked.
 --
--- Pure helpers only. The depth SAMPLING (image_load) stays inline in the `light`
--- entry, because a `def` cannot take a storage_image parameter (the SPIR-V/naga
--- logical model forbids it — see COMPILER-NOTES.md). So this module owns all the
--- math and tunables; `main` keeps only the bare march loop + the one image read.
+-- Owns the shadow tunables, the pure projection/compare helpers, AND the two
+-- complete marches (contact_shadow, sun_shadow_pcf) — which take the depth
+-- `storage_image` directly: the compiler specializes such a def to the concrete
+-- resource global (the image never travels as a value parameter), so an
+-- image-touching helper is an ordinary def. `light` just reconstructs the pixel's
+-- world position and calls these.
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
@@ -49,6 +51,30 @@ def shadow_occluded(sp: vec3f32, wp: vec3f32, cq: vec4f32, surfd: f32) bool =
   let lins = linear_depth(surfd) in
   surfd < 0.99999 && linq > lins + SH_BIAS && magnitude(wp - sp) < SH_RADIUS
 
+-- The full contact-shadow march for a surface point `p` (already surface-lifted) with
+-- normal `n`, reading scene depth from `sd`. Marches toward the sun in world space,
+-- re-projecting each step to screen and comparing against the recorded surface; a step
+-- landing behind a nearer occluder ON the ray blocks the sun. Only marches where the
+-- face sees the sun (a back-to-sun face is already unlit by ndl, so a shadow there is
+-- a no-op that only adds noise). Returns occlusion in {0,1} (early-outs once blocked).
+def contact_shadow(sd: storage_image, p: vec3f32, n: vec3f32, resl: vec3f32, o: orbit) f32 =
+  let rx = resl.x
+  let ry = resl.y
+  let w = i32(rx)
+  let h = i32(ry)
+  let ndl = f32.max(dot(n, sun), 0.0) in
+  if ndl <= 0.0 then 0.0
+  else
+    loop shc = 0.0 for k < 20 do
+      if shc > 0.5 then shc
+      else
+        let sp = shadow_point(p, sun, k)
+        let cq = world_to_clip(sp, resl, o)
+        let (sx, sy, valid) = shadow_pixel(cq, rx, ry, w, h)
+        let surfd = if valid then image_load(sd, @[sx, sy]).x else 1.0
+        let wp = world_from_depth(resl, @[f32(sx) + 0.5, ry - (f32(sy) + 0.5)], o, surfd) in
+        if shadow_occluded(sp, wp, cq, surfd) then 1.0 else shc
+
 ------------------------------------------------------------
 -- Sun shadow map (directional cast shadows). An orthographic camera looks down the
 -- sun ray (-sun) over a box covering the built area; the caster pass rasterizes the
@@ -56,8 +82,8 @@ def shadow_occluded(sp: vec3f32, wp: vec3f32, cq: vec4f32, surfd: f32) bool =
 -- texel. The deferred light pass reconstructs each pixel's world position, projects
 -- it the same way, and PCF-compares to that stored depth: farther than the nearest
 -- caster => the sun is blocked. These are the long, robust cast shadows; the
--- contact march above stays for fine local grounding. Pure math only (the map read
--- stays in the light entry — a `def` can't take a storage_image).
+-- contact march above stays for fine local grounding. The projection/compare helpers
+-- are pure; the full PCF read (sun_shadow_pcf) is at the bottom and takes the map.
 ------------------------------------------------------------
 
 def SUN_DIST: f32 = 20.0    -- light-camera distance from the origin, along +sun
@@ -100,3 +126,25 @@ def sun_shadow_uv(lc: vec4f32) (f32, f32, bool) =
 -- Is a receiver at light-space depth `refz` lit, given the nearest caster depth
 -- `stored` in that texel? Lit when it's at or nearer than the caster (plus bias).
 def sun_lit(refz: f32, stored: f32) bool = refz - SUN_BIAS <= stored
+
+-- Full sun-shadow-map PCF for a world point `p`, reading the caster map `shm`.
+-- Projects `p` into the light camera and compares its light-space depth to the
+-- nearest recorded caster over a softened 3x3 tap. Returns the occluded fraction in
+-- [0,1] (0 = fully lit, outside the map's covered volume => lit).
+def sun_shadow_pcf(shm: storage_image, p: vec3f32, rx: f32, ry: f32) f32 =
+  let w = i32(rx)
+  let h = i32(ry)
+  let lc = world_to_light(p)
+  let (su, sv, inr) = sun_shadow_uv(lc)
+  let tx = i32(su * rx)
+  let ty = i32(sv * ry) in
+  if !inr then 0.0
+  else
+    let occ =
+      loop occ = 0.0 for kk < 9 do
+        let stx = tx + (kk % 3 - 1)
+        let sty = ty + (kk / 3 - 1)
+        let inb = stx >= 0 && stx < w && sty >= 0 && sty < h
+        let stored = if inb then image_load(shm, @[stx, sty]).x else 1.0 in
+        if sun_lit(lc.z, stored) then occ else occ + 1.0
+      in occ / 9.0

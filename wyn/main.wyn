@@ -609,12 +609,43 @@ entry gtao_main(pxl: []u32,
 -- is the unified shading home — AO here, contact shadows / local lights later.
 ------------------------------------------------------------
 
--- Screen-space AO and contact shadows are inlined below (a `def` taking a
--- storage_image would be lowered to a function with an image parameter, which the
--- SPIR-V/naga logical model forbids — image ops must reference a global). Kept
--- inline in the map body. Values derived from the entry uniforms (resolution, cam)
--- are copied into map-local bindings first, because a loop inside a `map` may not
--- reference values bound outside the map (compiler panic; see COMPILER-NOTES.md).
+-- Sky shade for a G-buffer miss (alb.w < 0.5): raymarch the static volumetric
+-- clouds along this pixel's view ray. `fragc` is the pixel centre, bottom-up.
+def shade_sky(resl: vec3f32, fragc: vec2f32, o: orbit) vec4f32 =
+  let (ro, rd) = get_ray(resl, fragc, o)
+  let sc = clouds.sky(ro, rd) in
+  @[sc.x, sc.y, sc.z, 1.0]
+
+-- Deferred shade for one pixel: read the thin G-buffer at (x,y) and return its final
+-- colour. Sky pixels get the cloud sky; lit pixels get GTAO (the edge-aware denoise
+-- folded in — it only reads gtao_main's ao_work), the sun contact march + sun-shadow-
+-- map PCF (shadow.wyn owns both marches, which take the depth images directly), and
+-- the AO/shadow-attenuated shade. The image-touching helpers are ordinary defs — the
+-- compiler specializes each to its resource global.
+def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
+                shm: storage_image, aw: texture2d, frame: frame_globals,
+                x: i32, y: i32) vec4f32 =
+  let rx = frame.resolution.x
+  let ry = frame.resolution.y
+  let resl = @[rx, ry, 0.0]
+  let o = cam(frame)
+  let ao_off = (frame.mods & 2u32) != 0u32              -- hold Ctrl to suppress AO
+  let alb = image_load(ga, @[x, y])
+  let fragc = @[f32(x) + 0.5, ry - (f32(y) + 0.5)] in    -- pixel centre, bottom-up
+  if alb.w < 0.5 then shade_sky(resl, fragc, o)
+  else
+    let gnv = image_load(gn, @[x, y])
+    let n = normalize(@[gnv.x, gnv.y, gnv.z])
+    let cd = image_load(sd, @[x, y]).x
+    let ao = if ao_off then 0.0
+             else let (aov, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true) in 1.0 - aov
+    let p = world_from_depth(resl, fragc, o, cd) + n * SH_LIFT
+    let shc = contact_shadow(sd, p, n, resl, o)
+    let shm_frac = sun_shadow_pcf(shm, p, rx, ry) in
+    shade_surface(@[alb.x, alb.y, alb.z], n, ao, shc, shm_frac)
+
+-- The entry is just the dispatch: one invocation per pixel calls shade_frame and
+-- writes the result to `lit`.
 #[compute]
 entry light(pxl: []u32,
             #[uniform(set=1, binding=0)] frame: frame_globals,
@@ -626,80 +657,12 @@ entry light(pxl: []u32,
             #[view(lit, storage_write)]       lt: storage_image)
   []u32 =
   map(|s|
-    let rx = frame.resolution.x
-    let ry = frame.resolution.y
-    let resl = @[rx, ry, 0.0]
-    let o = cam(frame)
-    -- Hold Ctrl (live modifier bit 1) to suppress ambient occlusion.
-    let ao_off = (frame.mods & 2u32) != 0u32
-    let sunv = sun
-    let w = i32(rx)
-    let h = i32(ry)
+    let w = i32(frame.resolution.x)
     let i = i32(s)
     let x = i % w
     let y = i / w
-    let alb = image_load(ga, @[x, y])
-    let out =
-      if alb.w < 0.5 then
-        -- Sky: raymarch static volumetric clouds along this pixel's view ray.
-        let (sro, srd) = get_ray(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], o)
-        let sc = clouds.sky(sro, srd) in
-        @[sc.x, sc.y, sc.z, 1.0]
-      else
-        let gnv = image_load(gn, @[x, y])
-        let n = normalize(@[gnv.x, gnv.y, gnv.z])
-        let cd = image_load(sd, @[x, y]).x
-        -- Ambient occlusion: the GTAO edge-aware denoise folded in here (it only reads
-        -- gtao_main's raw ao_work, so it needs no pass of its own), as an occlusion
-        -- amount (1 - visibility); zeroed while Ctrl is held.
-        let ao =
-          if ao_off then 0.0
-          else let (aov, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true) in 1.0 - aov
-        -- Ray-marched contact shadow toward the sun (shadow.wyn owns the math;
-        -- only the depth read stays here, since a `def` can't take an image). March
-        -- from this pixel's reconstructed, surface-lifted world position; a step
-        -- that projects behind a nearer recorded surface blocks the sun.
-        let p = world_from_depth(resl, @[f32(x) + 0.5, ry - (f32(y) + 0.5)], o, cd) + n * SH_LIFT
-        -- Only march where the surface actually faces the sun; a back-to-sun face is
-        -- already unlit by ndl, so a contact shadow there is a no-op that only burns
-        -- work and adds screen-space noise.
-        let ndl = f32.max(dot(n, sunv), 0.0)
-        let shc =
-          if ndl <= 0.0 then 0.0
-          else
-            loop shc = 0.0 for k < 20 do
-              if shc > 0.5 then shc
-              else
-                let sp = shadow_point(p, sunv, k)
-                let cq = world_to_clip(sp, resl, o)
-                let (sx, sy, valid) = shadow_pixel(cq, rx, ry, w, h)
-                let surfd = if valid then image_load(sd, @[sx, sy]).x else 1.0
-                let wp = world_from_depth(resl, @[f32(sx) + 0.5, ry - (f32(sy) + 0.5)], o, surfd) in
-                if shadow_occluded(sp, wp, cq, surfd) then 1.0 else shc
-        -- Sun shadow map: project this pixel into the light camera and PCF-compare
-        -- its light-space depth to the nearest recorded caster (3x3 tap, softened).
-        let lc = world_to_light(p)
-        let (su, sv, inr) = sun_shadow_uv(lc)
-        let tx = i32(su * rx)
-        let ty = i32(sv * ry)
-        let shm_frac =
-          if !inr then 0.0
-          else
-            let occ2 =
-              loop occ2 = 0.0 for kk < 9 do
-                let stx = tx + (kk % 3 - 1)
-                let sty = ty + (kk / 3 - 1)
-                let inb = stx >= 0 && stx < w && sty >= 0 && sty < h
-                let stored = if inb then image_load(shm, @[stx, sty]).x else 1.0 in
-                if sun_lit(lc.z, stored) then occ2 else occ2 + 1.0
-              in occ2 / 9.0
-        -- Combine: a pixel is shadowed if EITHER the long sun cast or the local
-        -- contact march blocks the sun.
-        let sh = f32.max(shc, shm_frac)
-        let col = lit_ao_sh(@[alb.x, alb.y, alb.z], n, ao, sh)
-        let m = tonemap_aces(col) in
-        @[m.x, m.y, m.z, 1.0]
-    let _ = image_store(lt, @[x, y], out) in
+    let col = shade_frame(ga, gn, sd, shm, aw, frame, x, y) in
+    let _ = image_store(lt, @[x, y], col) in
     0u32
     , pxl)
 

@@ -2,10 +2,10 @@
 --
 -- `occ_reduce` stores the nearest surface depth per coarse tile; an instance is
 -- occluded only when the nearest surface beats it across its whole screen footprint
--- (the max over the tile neighbourhood). The neighbourhood image sampling itself
--- stays at the call site — a `def` can't take a `storage_image` (image ops must
--- reference a global) — so this module holds only the PURE projection and the
--- comparison; the caller loops the tiles and passes in the sampled max depth.
+-- (the max over the tile neighbourhood). This module holds the PURE projection and
+-- comparison; the caller (cull / walls) loops the tile neighbourhood and passes in
+-- the sampled max depth. (That split is a design choice, not a constraint — a def
+-- CAN take a storage_image and loop it directly; see shadow.wyn's marches.)
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 

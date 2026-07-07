@@ -50,3 +50,13 @@ def tonemap_aces(x: vec3f32) vec3f32 =
   let d = 0.59
   let e = 0.14 in
   (x * (a * x + v3(b))) / (x * (c * x + v3(d)) + v3(e))
+
+-- Final shade for a lit G-buffer pixel: sky-ambient (AO-attenuated) + direct sun
+-- (shadow-attenuated), tonemapped to an opaque colour. `ao` is the occlusion amount
+-- (1 = fully occluded); `shc`/`shm_frac` are the contact-march and sun-shadow-map
+-- occlusion, combined by `max` (either one blocks the sun).
+def shade_surface(albedo: vec3f32, n: vec3f32, ao: f32, shc: f32, shm_frac: f32) vec4f32 =
+  let sh = f32.max(shc, shm_frac)
+  let col = lit_ao_sh(albedo, n, ao, sh)
+  let m = tonemap_aces(col) in
+  @[m.x, m.y, m.z, 1.0]
