@@ -48,10 +48,6 @@ passing wgpu/naga) run it through the driver to catch validation errors.
 
 ## Open compiler issues (fix-list)
 
-- **`filter`'s scan stage is serial** — emitted as `dispatch_size: fixed 1×1×1`, a
-  single-thread prefix sum over the whole input. It dominates frame time (~85%).
-  A workgroup-parallel / work-efficient scan is the biggest perf lever. Repro:
-  `repro/r5_filter_count.wyn` (inspect the `*_filter_scan` stage).
 - **Loop-in-map capturing an outer binding panics** — see workaround #2. The
   elaborator should handle a `loop` closing over the map's enclosing scope.
 
