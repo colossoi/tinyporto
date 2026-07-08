@@ -90,6 +90,11 @@ def pixel_xy(gid: vec3u32, w: i32) vec2i32 =
 -- compiler flattens it back to the same four storage buffers (ABI-neutral).
 type world = { ui: []f32, points: []vec2f32, items: []vec4f32, head: []f32 }
 
+-- The painted geometry the render passes read: the control points and the packed
+-- items — the read-only geometry view of the `world`. `cull` and `light` bundle
+-- their two storage inputs into this to evaluate the canal SDF against one value.
+type painted = { points: []vec2f32, items: []vec4f32 }
+
 type state_update = {
   ui: ui_state,
   head: stroke_head,
@@ -245,7 +250,7 @@ resource ao_work: image2d { format = rgba16float  size = window  usages = [stora
 -- from `length`. Output 0 = compacted sett_inst, output 1 = sett_args.
 ------------------------------------------------------------
 
-def sett_candidate(frame: frame_globals, items: []vec4f32, points: []vec2f32,
+def sett_candidate(frame: frame_globals, sc: painted,
                    od: storage_image, i: i32) sett_inst =
   let base = brick_center(i)
   -- No along-row (x) jitter: setts sit on the exact cell x so the clamped along-row
@@ -262,7 +267,7 @@ def sett_candidate(frame: frame_globals, items: []vec4f32, points: []vec2f32,
   let occluded = occ_test(od, world_to_clip(c3, frame.resolution, o), frame.resolution)
   -- Water converts cobble to canal: drop any sett within a hair of a painted canal
   -- so no partial setts comb over the quay edge.
-  let in_water = water_sdf(center, items, points) < 0.08
+  let in_water = water_sdf(center, sc.items, sc.points) < 0.08
   let keep = visible && (!occluded) && (!in_water)
   let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
   -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
@@ -278,13 +283,13 @@ def sett_visible(s: sett_inst) bool =
 def sett_draw_args(n: i32) [4]u32 =
   [36u32, u32(n), 0u32, 0u32]
 
-def build_visibility_setts(bidx: []u32, items: []vec4f32, points: []vec2f32,
+def build_visibility_setts(bidx: []u32, sc: painted,
                            frame: frame_globals, od: storage_image)
   ([]vec4f32, [4]u32) =
   let cand =
     map(|s|
       let i = i32(s)
-      let inst = sett_candidate(frame, items, points, od, i) in
+      let inst = sett_candidate(frame, sc, od, i) in
       pack_sett_inst(inst)
       , bidx) in
   (cand, sett_draw_args(BCOLS * BROWS))
@@ -297,7 +302,7 @@ entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
   -- Build one candidate record per cell. Culled records are emitted as degenerate
   -- height=0 setts (the sett raymarch skips them); the draw count is the full cell
   -- grid. Compaction via `filter(sett_visible, ...)` down to the live count is PR 4.
-  build_visibility_setts(bidx, items_in, points_in, frame, od)
+  build_visibility_setts(bidx, { points = points_in, items = items_in }, frame, od)
 
 -- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
 -- block of scene_depth under it. Runs after the scene pass; cull reads it next
@@ -693,7 +698,7 @@ def shade_sky(resl: vec3f32, fragc: vec2f32, o: orbit) vec4f32 =
 -- compiler specializes each to its resource global.
 def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
                 shm: storage_image, aw: texture2d, frame: frame_globals,
-                items: []vec4f32, points: []vec2f32, x: i32, y: i32) vec4f32 =
+                sc: painted, x: i32, y: i32) vec4f32 =
   let rx = frame.resolution.x
   let ry = frame.resolution.y
   let resl = @[rx, ry, 0.0]
@@ -711,9 +716,9 @@ def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
     -- Water (approach A): only a ground-level pixel (y ~ 0) can be canal. `s0` is its
     -- signed distance to the water edge: < -QUAY_RIM traces the sunken water/quay per
     -- pixel; the [-QUAY_RIM, 0) lip is lit as a wet-stone quay cap; >= 0 is dry land.
-    let s0 = if pg.y < 0.03 then water_sdf(@[pg.x, pg.z], items, points) else 1.0 in
+    let s0 = if pg.y < 0.03 then water_sdf(@[pg.x, pg.z], sc.items, sc.points) else 1.0 in
     if s0 < 0.0 - QUAY_RIM then
-      let wc = shade_water(pg, rd, frame.time, items, points) in
+      let wc = shade_water(pg, rd, frame.time, sc.items, sc.points) in
       @[wc.x, wc.y, wc.z, 1.0]
     else
       let base = if s0 < 0.0 then QUAY_COLOR else @[alb.x, alb.y, alb.z]
@@ -741,7 +746,7 @@ entry light(#[builtin(global_invocation_id)] gid: vec3u32,
   () =
   let w = i32(frame.resolution.x)
   let xy = pixel_xy(gid, w)
-  let col = shade_frame(ga, gn, sd, shm, aw, frame, items_in, points_in, xy.x, xy.y) in
+  let col = shade_frame(ga, gn, sd, shm, aw, frame, { points = points_in, items = items_in }, xy.x, xy.y) in
   lt with [xy] = col
 
 ------------------------------------------------------------
