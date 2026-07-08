@@ -10,7 +10,10 @@ use std::borrow::Cow;
 
 /// Build a wgpu shader module from embedded SPIR-V bytes.
 pub fn load_module_bytes(device: &wgpu::Device, label: &str, bytes: &[u8]) -> wgpu::ShaderModule {
-    assert!(bytes.len() % 4 == 0, "SPIR-V '{label}' is not a whole number of 32-bit words");
+    assert!(
+        bytes.len() % 4 == 0,
+        "SPIR-V '{label}' is not a whole number of 32-bit words"
+    );
     let words: Vec<u32> = bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))

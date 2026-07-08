@@ -75,19 +75,30 @@ pub enum Resource {
     /// A uniform block the driver fills each frame: one buffer whose members are
     /// packed from `members` at the offsets the descriptor publishes for `name`
     /// (see `UniformBlockLayout`). Replaces N single-value system uniforms.
-    UniformBlock { name: &'static str, members: &'static [BlockMember] },
+    UniformBlock {
+        name: &'static str,
+        members: &'static [BlockMember],
+    },
     /// A storage buffer (compute I/O, derived geometry, …).
     Buffer(BufferDef),
     /// Two storage buffers swapped each frame (persistent state). A binding reads
     /// the prev one (StorageRead) and writes the next (StorageWrite). `size` is
     /// `None` for a buffer that is also a compute output (derived).
-    PingPong { name: &'static str, size: Option<u64> },
+    PingPong {
+        name: &'static str,
+        size: Option<u64>,
+    },
     /// A window-sized depth texture (recreated on resize). One per graph.
     Depth,
     /// A 2D image backing `storage_image` and/or sampled `texture2d` views. `mips`
     /// > 1 builds a pyramid (Hi-Z). Storage/texture/copy usages are derived from
     /// how the graph's bindings reference it.
-    Image { name: &'static str, format: TexFormat, size: ImgSize, mips: u32 },
+    Image {
+        name: &'static str,
+        format: TexFormat,
+        size: ImgSize,
+        mips: u32,
+    },
     /// A filtering sampler bound to `sampler` params.
     Sampler { name: &'static str },
 }
@@ -134,7 +145,10 @@ pub enum ImgAccess {
 pub enum ImgSize {
     /// Recreated on resize to match the surface (Hi-Z, G-buffer).
     Window,
-    Fixed { w: u32, h: u32 },
+    Fixed {
+        w: u32,
+        h: u32,
+    },
 }
 
 /// How a (set, binding) slot is typed in the shader. Matches the values the
@@ -154,7 +168,10 @@ pub enum BindingKind {
     Sampler,
     /// A `storage_image` view: fixed `vec4f32` texels; `format` is the on-GPU pixel
     /// format and `access` is how the shader reads/writes it.
-    StorageImage { format: TexFormat, access: ImgAccess },
+    StorageImage {
+        format: TexFormat,
+        access: ImgAccess,
+    },
 }
 
 /// One generated binding row: (set, binding, kind, shader-param name). The driver

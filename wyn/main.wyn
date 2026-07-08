@@ -55,6 +55,12 @@ type frame_globals = {
 def cam(f: frame_globals) orbit =
   { target = f.cam_target, az = f.cam_az, elev = f.cam_elev, dist = f.cam_dist }
 
+-- The compute backend dispatches image-sized passes as a 1-D grid. Keep that
+-- convention at the entry boundary; pure per-pixel/tile helpers take vec2i32.
+def pixel_xy(gid: vec3u32, w: i32) vec2i32 =
+  let i = i32(gid.x) in
+  @[i % w, i / w]
+
 -- The raw-event stream (`events`) and its decode constants, the screen->ground
 -- pick, and the per-frame UI / stroke-capture folds all live in input.wyn; `step`
 -- just calls fold_ui / fold_strokes below.
@@ -200,7 +206,7 @@ resource ao_work: image2d { format = rgba16float  size = window  usages = [stora
 entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
            #[uniform(set=1, binding=0)] frame: frame_globals,
            #[view(occ_depth, storage_read)] od: storage_image)
-  (?k. [k]vec4f32, [4]u32) =
+  ([]vec4f32, [4]u32) =
   -- Build one candidate record per cell, then `filter` keeps only the visible ones
   -- and COMPACTS them into a dense prefix. Culled records get height = 0 so the
   -- predicate drops them; the compacted length becomes instance_count.
@@ -228,30 +234,31 @@ entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
       -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
       let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919) in
       @[center.x, center.y, height, roundfrac]
-      , bidx)
-  let inst = filter(|c| c.z > 0.0, cand)
-  let n = length(inst) in
-  (inst, [36u32, u32(n), 0u32, 0u32])
+      , bidx) in
+  (cand, [36u32, u32(BCOLS * BROWS), 0u32, 0u32])
 
 -- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
 -- block of scene_depth under it. Runs after the scene pass; cull reads it next
 -- frame. The write target `od` is listed first so the dispatch is sized from it
 -- (occ_depth = OCC_W x OCC_H), not the window-sized scene_depth it reads.
-#[compute]
-entry occ_reduce(#[builtin(global_invocation_id)] gid: vec3u32,
-                 #[view(occ_depth, storage_write)]  od: *storage_image,
-                 #[view(scene_depth, storage_read)] sd: storage_image)
-  () =
-  let i = i32(gid.x)
-  let tx = i % OCC_W
-  let ty = i / OCC_W
+def occ_reduce_tile(sd: storage_image, tile: vec2i32) vec4f32 =
+  let tx = tile.x
+  let ty = tile.y
   let m =
     loop m = 1.0 for k < 64 do
       let sx = tx * OCC_TILE + (k % OCC_TILE)
       let sy = ty * OCC_TILE + (k / OCC_TILE)
       let v = image_load(sd, @[sx, sy]) in
       f32.min(m, v.x) in
-  od with [@[tx, ty]] = @[m, m, m, m]
+  @[m, m, m, m]
+
+#[compute]
+entry occ_reduce(#[builtin(global_invocation_id)] gid: vec3u32,
+                 #[view(occ_depth, storage_write)]  od: *storage_image,
+                 #[view(scene_depth, storage_read)] sd: storage_image)
+  () =
+  let xy = pixel_xy(gid, OCC_W) in
+  od with [xy] = occ_reduce_tile(sd, xy)
 
 ------------------------------------------------------------
 -- Deferred G-buffer (Nine Phase 3, the "thin raster waist"). The scene fragments
@@ -353,7 +360,10 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
   let lc = @[local.x * (sett_hx(sc) * 2.0), (local.y - 0.5) * height, local.z * BRICK_L * sc]
   let bcenter = @[center.x, height * 0.5, center.y]
   let world = bcenter + sett_orient(lc, right, up, fwd) in
-  (world_to_clip(world, frame.resolution, cam(frame)), world, inst, sett_var(center.x, center.y))
+  if height <= 0.0 then
+    (@[2.0, 2.0, 2.0, 1.0], world, inst, sett_var(center.x, center.y))
+  else
+    (world_to_clip(world, frame.resolution, cam(frame)), world, inst, sett_var(center.x, center.y))
 
 -- Sphere-trace the rounded box for this instance from the proxy front face. On a
 -- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
@@ -419,24 +429,18 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
 
 #[compute]
 entry walls(wbidx: []u32,
-            #[uniform(set=1, binding=0)] frame: frame_globals,
-            #[view(occ_depth, storage_read)] od: storage_image)
-  (?k. [k]block, [4]u32) =
+            #[uniform(set=1, binding=0)] frame: frame_globals)
+  ([]block, [4]u32) =
   let cand =
     map(|s|
       let brk = wall_brick(i32(s))
       let center = brk.center
       let o = cam(frame)
-      let visible = center.y > 0.0 && frustum_keep(center, magnitude(brk.half), frame.resolution, o)
-      -- Occlusion: hidden if the nearest recorded surface beats the brick across its
-      -- whole tile neighbourhood (hiz.wyn's occ_test), so a partly-occluded brick stays.
-      let occluded = occ_test(od, world_to_clip(center, frame.resolution, o), frame.resolution) in
-      if visible && (!occluded) then brk
+      let visible = center.y > 0.0 && frustum_keep(center, magnitude(brk.half), frame.resolution, o) in
+      if visible then brk
       else { center = @[center.x, 0.0 - 1.0, center.z], yaw = brk.yaw, kind = brk.kind, half = brk.half }
-      , wbidx)
-  let inst = filter(|b| b.center.y > 0.0, cand)
-  let n = length(inst) in
-  (inst, [36u32, u32(n), 0u32, 0u32])
+      , wbidx) in
+  (cand, [36u32, u32(BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS), 0u32, 0u32])
 
 #[vertex]
 entry brick_vertex(#[builtin(vertex_index)] vid: i32,
@@ -460,7 +464,10 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
   -- Tone seed from the (stable, baked) brick centre — NOT iid, which is the
   -- compaction order and would make a brick's colour shimmer as culling changes.
   let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0)) in
-  (world_to_clip(world, frame.resolution, cam(frame)), world, center, yaw, cv, kind, hf)
+  if center.y <= 0.0 then
+    (@[2.0, 2.0, 2.0, 1.0], world, center, yaw, cv, kind, hf)
+  else
+    (world_to_clip(world, frame.resolution, cam(frame)), world, center, yaw, cv, kind, hf)
 
 -- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
 -- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
@@ -550,34 +557,36 @@ def gtao_consts: gtao.consts =
 
 -- Pass 1: linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
 -- to CLIP_FAR so it stays finite and never reads as an occluder.
+def gtao_depth_pixel(sd: storage_image, xy: vec2i32) vec4f32 =
+  let ndc = image_load(sd, xy).x
+  let vz = if ndc > 0.99999 then CLIP_FAR
+           else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts)) in
+  @[vz, 0.0, 0.0, 1.0]
+
 #[compute]
 entry gtao_depth(#[builtin(global_invocation_id)] gid: vec3u32,
                  #[view(vdepth, storage_write)]     vd: *storage_image,
                  #[view(scene_depth, storage_read)] sd: storage_image)
   () =
-  let i = i32(gid.x)
-  let x = i % 1280
-  let y = i / 1280
-  let ndc = image_load(sd, @[x, y]).x
-  let vz = if ndc > 0.99999 then CLIP_FAR
-           else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts)) in
-  vd with [@[x, y]] = @[vz, 0.0, 0.0, 1.0]
+  let xy = pixel_xy(gid, 1280) in
+  vd with [xy] = gtao_depth_pixel(sd, xy)
 
 -- Pass 2: GTAO main (High preset = 3 slices x 3 steps), normals reconstructed from
 -- vdepth. Writes the raw visibility term (.x) + packed denoise edges (.y) to ao_work.
 -- The slice/step loops live inside gtao.main_pass_single, not here.
+def gtao_main_pixel(vd: texture2d, xy: vec2i32) vec4f32 =
+  let nrm = gtao.compute_viewspace_normal(xy, vd, gtao_consts)
+  let noise = gtao.spatiotemporal_noise(@[u32(xy.x), u32(xy.y)], 0u32)
+  let (vis, edg) = gtao.main_pass_single(xy, 3, 3, noise, nrm, gtao_consts, vd) in
+  @[vis, edg, 0.0, 1.0]
+
 #[compute]
 entry gtao_main(#[builtin(global_invocation_id)] gid: vec3u32,
                 #[view(ao_work, storage_write)] aw: *storage_image,
                 #[view(vdepth, sampled)]        vd: texture2d)
   () =
-  let i = i32(gid.x)
-  let x = i % 1280
-  let y = i / 1280
-  let nrm = gtao.compute_viewspace_normal(@[x, y], vd, gtao_consts)
-  let noise = gtao.spatiotemporal_noise(@[u32(x), u32(y)], 0u32)
-  let (vis, edg) = gtao.main_pass_single(@[x, y], 3, 3, noise, nrm, gtao_consts, vd) in
-  aw with [@[x, y]] = @[vis, edg, 0.0, 1.0]
+  let xy = pixel_xy(gid, 1280) in
+  aw with [xy] = gtao_main_pixel(vd, xy)
 
 -- The GTAO edge-aware denoise (final blur of ao_work) is NOT a separate pass — it
 -- reads only gtao_main's output, so `light` folds it in inline (see its `ao`).
@@ -651,11 +660,9 @@ entry light(#[builtin(global_invocation_id)] gid: vec3u32,
             #[view(ao_work, sampled)]         aw: texture2d)
   () =
   let w = i32(frame.resolution.x)
-  let i = i32(gid.x)
-  let x = i % w
-  let y = i / w
-  let col = shade_frame(ga, gn, sd, shm, aw, frame, items_in, points_in, x, y) in
-  lt with [@[x, y]] = col
+  let xy = pixel_xy(gid, w)
+  let col = shade_frame(ga, gn, sd, shm, aw, frame, items_in, points_in, xy.x, xy.y) in
+  lt with [xy] = col
 
 ------------------------------------------------------------
 -- Deferred resolve. One fullscreen triangle copies the finished `lit` image to the

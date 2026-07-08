@@ -2,8 +2,8 @@
 //! Generic — no knowledge of the graph or the game. `surface` is `None` in
 //! headless mode (used by `--screenshot`, which renders to an offscreen texture).
 
-use std::sync::Arc;
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use winit::window::Window;
 
 pub struct Gfx {
@@ -45,7 +45,9 @@ impl Gfx {
     async fn new_async(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let surface = instance.create_surface(window.clone()).context("create_surface")?;
+        let surface = instance
+            .create_surface(window.clone())
+            .context("create_surface")?;
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -68,7 +70,12 @@ impl Gfx {
         }
         surface.configure(&device, &config);
 
-        Ok(Self { surface: Some(surface), device, queue, config })
+        Ok(Self {
+            surface: Some(surface),
+            device,
+            queue,
+            config,
+        })
     }
 
     /// Headless context (no window/surface) for offscreen rendering. `config`
@@ -95,7 +102,12 @@ impl Gfx {
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             };
-            Ok(Self { surface: None, device, queue, config })
+            Ok(Self {
+                surface: None,
+                device,
+                queue,
+                config,
+            })
         })
     }
 

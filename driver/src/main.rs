@@ -100,7 +100,11 @@ struct Renderer {
     image_views: HashMap<&'static str, wgpu::TextureView>,
     samplers: HashMap<&'static str, wgpu::Sampler>,
     /// Uniform blocks to fill each frame: (buffer name, members, std140 layout).
-    blocks: Vec<(&'static str, &'static [BlockMember], &'static UniformBlockLayout)>,
+    blocks: Vec<(
+        &'static str,
+        &'static [BlockMember],
+        &'static UniformBlockLayout,
+    )>,
     depth_view: Option<wgpu::TextureView>,
     passes: Vec<BuiltPass>,
     frame: u32,
@@ -136,14 +140,21 @@ impl Renderer {
         for pass in graph.passes {
             if let Pass::Compute(cp) = pass {
                 for &(_, binding, kind, name) in cp.bindings {
-                    if matches!(kind, BindingKind::StorageWrite | BindingKind::StorageReadWrite) {
+                    if matches!(
+                        kind,
+                        BindingKind::StorageWrite | BindingKind::StorageReadWrite
+                    ) {
                         derived.insert(name_to_resource(graph, name), (cp.out_bytes)(binding));
                     }
                 }
             }
         }
         let size_of = |name: &'static str, declared: Option<u64>| -> u64 {
-            declared.unwrap_or_else(|| *derived.get(name).unwrap_or_else(|| panic!("no size for '{name}'")))
+            declared.unwrap_or_else(|| {
+                *derived
+                    .get(name)
+                    .unwrap_or_else(|| panic!("no size for '{name}'"))
+            })
         };
 
         // Resources.
@@ -153,8 +164,11 @@ impl Renderer {
         let mut image_views: HashMap<&'static str, wgpu::TextureView> = HashMap::new();
         let mut img_formats: HashMap<&'static str, TexFormat> = HashMap::new();
         let mut samplers: HashMap<&'static str, wgpu::Sampler> = HashMap::new();
-        let mut blocks: Vec<(&'static str, &'static [BlockMember], &'static UniformBlockLayout)> =
-            Vec::new();
+        let mut blocks: Vec<(
+            &'static str,
+            &'static [BlockMember],
+            &'static UniformBlockLayout,
+        )> = Vec::new();
         let mut has_depth = false;
         let (cw, ch) = (gfx.config.width, gfx.config.height);
         for res in graph.resources {
@@ -164,12 +178,21 @@ impl Renderer {
                     let layout = generated::UNIFORM_BLOCKS
                         .iter()
                         .find(|l| l.name == name)
-                        .unwrap_or_else(|| panic!("no descriptor layout for uniform block '{name}'"));
+                        .unwrap_or_else(|| {
+                            panic!("no descriptor layout for uniform block '{name}'")
+                        });
                     buffers.insert(name, make_uniform(device, name, layout.size));
                     blocks.push((name, members, layout));
                 }
                 Resource::Buffer(def) => {
-                    let buf = make_storage(device, &gfx.queue, def.name, size_of(def.name, def.size), def.init, def.indirect);
+                    let buf = make_storage(
+                        device,
+                        &gfx.queue,
+                        def.name,
+                        size_of(def.name, def.size),
+                        def.init,
+                        def.indirect,
+                    );
                     buffers.insert(def.name, buf);
                 }
                 Resource::PingPong { name, size } => {
@@ -178,14 +201,22 @@ impl Renderer {
                     let b = make_storage_raw(device, &format!("{name}#1"), size, false);
                     pingpong.insert(name, [a, b]);
                 }
-                Resource::Image { name, format, size, mips } => {
+                Resource::Image {
+                    name,
+                    format,
+                    size,
+                    mips,
+                } => {
                     let (w, h) = match size {
                         ImgSize::Window => (cw, ch),
                         ImgSize::Fixed { w, h } => (w, h),
                     };
                     let usage = image_usage(graph, name);
                     let tex = create_image(device, name, format, w, h, mips, usage);
-                    image_views.insert(name, tex.create_view(&wgpu::TextureViewDescriptor::default()));
+                    image_views.insert(
+                        name,
+                        tex.create_view(&wgpu::TextureViewDescriptor::default()),
+                    );
                     images.insert(name, tex);
                     img_formats.insert(name, format);
                 }
@@ -220,15 +251,30 @@ impl Renderer {
             match pass {
                 Pass::Compute(cp) => {
                     let module = modules.get(cp.module).expect("module");
-                    passes.push(BuiltPass::Compute(build_compute(device, module, cp, res, graph)));
+                    passes.push(BuiltPass::Compute(build_compute(
+                        device, module, cp, res, graph,
+                    )));
                 }
                 Pass::Render(rp) => {
                     let mut items = Vec::new();
                     for it in rp.items {
                         let module = modules.get(it.module).expect("module");
-                        items.push(build_item(device, gfx.config.format, rp.color, rp.depth.is_some(), module, it, res, graph));
+                        items.push(build_item(
+                            device,
+                            gfx.config.format,
+                            rp.color,
+                            rp.depth.is_some(),
+                            module,
+                            it,
+                            res,
+                            graph,
+                        ));
                     }
-                    passes.push(BuiltPass::Render(BuiltRender { depth: rp.depth, color: rp.color, items }));
+                    passes.push(BuiltPass::Render(BuiltRender {
+                        depth: rp.depth,
+                        color: rp.color,
+                        items,
+                    }));
                 }
             }
         }
@@ -250,7 +296,11 @@ impl Renderer {
     fn resize(&mut self, w: u32, h: u32) {
         self.gfx.resize(w, h);
         if self.depth_view.is_some() {
-            self.depth_view = Some(create_depth(&self.gfx.device, self.gfx.config.width, self.gfx.config.height));
+            self.depth_view = Some(create_depth(
+                &self.gfx.device,
+                self.gfx.config.width,
+                self.gfx.config.height,
+            ));
         }
     }
 
@@ -260,7 +310,9 @@ impl Renderer {
         let mut buf = vec![[0.0f32; 4]; app::EV_CAP];
         let n = events.len().min(app::EV_CAP);
         buf[..n].copy_from_slice(&events[..n]);
-        self.gfx.queue.write_buffer(&self.buffers["events"], 0, bytemuck::cast_slice(&buf));
+        self.gfx
+            .queue
+            .write_buffer(&self.buffers["events"], 0, bytemuck::cast_slice(&buf));
     }
 
     fn update_uniforms(&self, cam: &Camera, mods: u32, time: f32) {
@@ -280,10 +332,16 @@ impl Renderer {
                 let off = *offset as usize;
                 match m.source {
                     FrameSource::Resolution => {
-                        put(&mut bytes, off, bytemuck::cast_slice(&[w, h, if h > 0.0 { w / h } else { 1.0 }]));
+                        put(
+                            &mut bytes,
+                            off,
+                            bytemuck::cast_slice(&[w, h, if h > 0.0 { w / h } else { 1.0 }]),
+                        );
                     }
                     FrameSource::Mods => put(&mut bytes, off, bytemuck::cast_slice(&[mods])),
-                    FrameSource::CamTarget => put(&mut bytes, off, bytemuck::cast_slice(&cam.target)),
+                    FrameSource::CamTarget => {
+                        put(&mut bytes, off, bytemuck::cast_slice(&cam.target))
+                    }
                     FrameSource::CamAz => put(&mut bytes, off, bytemuck::cast_slice(&[cam.az])),
                     FrameSource::CamElev => put(&mut bytes, off, bytemuck::cast_slice(&[cam.elev])),
                     FrameSource::CamDist => put(&mut bytes, off, bytemuck::cast_slice(&[cam.dist])),
@@ -319,11 +377,16 @@ impl Renderer {
                 }
                 BuiltPass::Render(r) => {
                     let depth_attach = if r.depth.is_some() {
-                        self.depth_view.as_ref().map(|dv| wgpu::RenderPassDepthStencilAttachment {
-                            view: dv,
-                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                            stencil_ops: None,
-                        })
+                        self.depth_view
+                            .as_ref()
+                            .map(|dv| wgpu::RenderPassDepthStencilAttachment {
+                                view: dv,
+                                depth_ops: Some(wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(1.0),
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                                stencil_ops: None,
+                            })
                     } else {
                         None
                     };
@@ -344,7 +407,12 @@ impl Renderer {
                                 resolve_target: None,
                                 depth_slice: None,
                                 ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0], g: c[1], b: c[2], a: c[3] }),
+                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: c[0],
+                                        g: c[1],
+                                        b: c[2],
+                                        a: c[3],
+                                    }),
                                     store: wgpu::StoreOp::Store,
                                 },
                             })
@@ -371,7 +439,11 @@ impl Renderer {
 
     fn render(&mut self, cam: &Camera, mods: u32) -> Result<()> {
         self.update_uniforms(cam, mods, self.start.elapsed().as_secs_f32());
-        let surface = self.gfx.surface.as_ref().expect("window mode has a surface");
+        let surface = self
+            .gfx
+            .surface
+            .as_ref()
+            .expect("window mode has a surface");
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -380,11 +452,15 @@ impl Renderer {
             }
             Err(e) => return Err(anyhow::anyhow!("acquire frame: {e:?}")),
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = self
             .gfx
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         self.record(&mut enc, &view);
         self.gfx.queue.submit(Some(enc.finish()));
         frame.present();
@@ -394,11 +470,21 @@ impl Renderer {
 
     /// Headless: render a scripted scenario into an offscreen texture and write it
     /// to `path` as a PNG. Used to eyeball the pipeline without a window.
-    fn screenshot(&mut self, path: &std::path::Path, cam: &Camera, mods: u32, time: f32) -> Result<()> {
+    fn screenshot(
+        &mut self,
+        path: &std::path::Path,
+        cam: &Camera,
+        mods: u32,
+        time: f32,
+    ) -> Result<()> {
         let (w, h) = (self.gfx.config.width, self.gfx.config.height);
         let tex = self.gfx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -438,10 +524,15 @@ impl Renderer {
             let mut enc = self
                 .gfx
                 .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("offscreen"),
+                });
             self.record(&mut enc, &view);
             self.gfx.queue.submit(Some(enc.finish()));
-            let _ = self.gfx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            let _ = self.gfx.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
             frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
             self.frame = self.frame.wrapping_add(1);
         }
@@ -462,7 +553,9 @@ impl Renderer {
         let mut enc = self
             .gfx
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy"),
+            });
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex,
@@ -478,12 +571,19 @@ impl Renderer {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         self.gfx.queue.submit(Some(enc.finish()));
 
         readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        let _ = self.gfx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = self.gfx.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
         let data = readback.slice(..).get_mapped_range();
 
         // Drop the row padding into a tight RGBA8 buffer.
@@ -495,7 +595,8 @@ impl Renderer {
         drop(data);
         readback.unmap();
 
-        let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let file =
+            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
         let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
@@ -529,8 +630,8 @@ fn encode_event(kind: u32, mods: u32, code: f32, x: f32, y: f32) -> [f32; 4] {
 fn keycode(pk: winit::keyboard::PhysicalKey) -> Option<f32> {
     use winit::keyboard::{KeyCode, PhysicalKey};
     match pk {
-        PhysicalKey::Code(KeyCode::Tab) => Some(1.0),  // KEY_TAB
-        PhysicalKey::Code(KeyCode::KeyL) => Some(2.0),  // KEY_L
+        PhysicalKey::Code(KeyCode::Tab) => Some(1.0), // KEY_TAB
+        PhysicalKey::Code(KeyCode::KeyL) => Some(2.0), // KEY_L
         _ => None,
     }
 }
@@ -549,10 +650,22 @@ fn make_storage_raw(device: &wgpu::Device, label: &str, size: u64, indirect: boo
     if indirect {
         usage |= wgpu::BufferUsages::INDIRECT;
     }
-    device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    })
 }
 
-fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, size: u64, init: BufInit, indirect: bool) -> wgpu::Buffer {
+fn make_storage(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    name: &str,
+    size: u64,
+    init: BufInit,
+    indirect: bool,
+) -> wgpu::Buffer {
     let buf = make_storage_raw(device, name, size, indirect);
     match init {
         BufInit::Iota => {
@@ -569,7 +682,11 @@ fn make_storage(device: &wgpu::Device, queue: &wgpu::Queue, name: &str, size: u6
 fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
-        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -633,7 +750,11 @@ fn create_image(
 ) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(name),
-        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
         mip_level_count: mips.max(1),
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -726,9 +847,10 @@ fn resolve_table(
         .map(|&(set, binding, kind, name)| {
             let resource = name_to_resource(graph, name);
             let kind = match kind {
-                BindingKind::StorageImage { format, .. } => {
-                    BindingKind::StorageImage { format, access: image_union_access(graph, resource) }
-                }
+                BindingKind::StorageImage { format, .. } => BindingKind::StorageImage {
+                    format,
+                    access: image_union_access(graph, resource),
+                },
                 other => other,
             };
             let is_pp = pp.contains_key(resource);
@@ -737,14 +859,24 @@ fn resolve_table(
                 BindingKind::StorageRead if is_pp => Role::Prev,
                 _ => Role::Plain,
             };
-            Binding { set, binding, resource, kind, role }
+            Binding {
+                set,
+                binding,
+                resource,
+                kind,
+                role,
+            }
         })
         .collect()
 }
 
 /// Whether a resolved binding set needs both parities (has a ping-pong binding).
 fn variant_count(bindings: &[Binding]) -> usize {
-    if bindings.iter().any(|b| b.role != Role::Plain) { 2 } else { 1 }
+    if bindings.iter().any(|b| b.role != Role::Plain) {
+        2
+    } else {
+        1
+    }
 }
 
 /// Resolve a buffer binding to its physical buffer for `parity`. Ping-pong: this
@@ -753,9 +885,18 @@ fn variant_count(bindings: &[Binding]) -> usize {
 /// `res.samplers`.
 fn resolve<'a>(b: &Binding, parity: usize, res: Res<'a>) -> &'a wgpu::Buffer {
     match b.role {
-        Role::Plain => res.buffers.get(b.resource).unwrap_or_else(|| panic!("no resource '{}'", b.resource)),
-        Role::Next => &res.pp.get(b.resource).unwrap_or_else(|| panic!("no ping-pong '{}'", b.resource))[parity],
-        Role::Prev => &res.pp.get(b.resource).unwrap_or_else(|| panic!("no ping-pong '{}'", b.resource))[1 - parity],
+        Role::Plain => res
+            .buffers
+            .get(b.resource)
+            .unwrap_or_else(|| panic!("no resource '{}'", b.resource)),
+        Role::Next => &res
+            .pp
+            .get(b.resource)
+            .unwrap_or_else(|| panic!("no ping-pong '{}'", b.resource))[parity],
+        Role::Prev => &res
+            .pp
+            .get(b.resource)
+            .unwrap_or_else(|| panic!("no ping-pong '{}'", b.resource))[1 - parity],
     }
 }
 
@@ -819,7 +960,9 @@ fn build_sets(
                 // a non-filterable sample type; look up the bound resource's format.
                 ty: layout_type(
                     b.kind,
-                    res.img_formats.get(b.resource).map_or(true, |f| f.filterable()),
+                    res.img_formats
+                        .get(b.resource)
+                        .map_or(true, |f| f.filterable()),
                 ),
                 count: None,
             })
@@ -832,15 +975,24 @@ fn build_sets(
             .iter()
             .map(|&b| {
                 let resource = match b.kind {
-                    BindingKind::Texture | BindingKind::StorageImage { .. } => wgpu::BindingResource::TextureView(
-                        res.views.get(b.resource).unwrap_or_else(|| panic!("no image view '{}'", b.resource)),
-                    ),
+                    BindingKind::Texture | BindingKind::StorageImage { .. } => {
+                        wgpu::BindingResource::TextureView(
+                            res.views
+                                .get(b.resource)
+                                .unwrap_or_else(|| panic!("no image view '{}'", b.resource)),
+                        )
+                    }
                     BindingKind::Sampler => wgpu::BindingResource::Sampler(
-                        res.samplers.get(b.resource).unwrap_or_else(|| panic!("no sampler '{}'", b.resource)),
+                        res.samplers
+                            .get(b.resource)
+                            .unwrap_or_else(|| panic!("no sampler '{}'", b.resource)),
                     ),
                     _ => resolve(b, parity, res).as_entire_binding(),
                 };
-                wgpu::BindGroupEntry { binding: b.binding, resource }
+                wgpu::BindGroupEntry {
+                    binding: b.binding,
+                    resource,
+                }
             })
             .collect();
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -862,8 +1014,14 @@ fn build_compute(
     graph: &Graph,
 ) -> BuiltCompute {
     let binds = resolve_table(cp.bindings, graph, res.pp);
-    let (layouts, sets0) =
-        build_sets(device, cp.label, &binds, wgpu::ShaderStages::COMPUTE, res, 0);
+    let (layouts, sets0) = build_sets(
+        device,
+        cp.label,
+        &binds,
+        wgpu::ShaderStages::COMPUTE,
+        res,
+        0,
+    );
     let layout_refs: Vec<&wgpu::BindGroupLayout> = layouts.iter().collect();
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(cp.label),
@@ -889,7 +1047,17 @@ fn build_compute(
         .collect();
     let mut sets = vec![sets0];
     for p in 1..variant_count(&binds) {
-        sets.push(build_sets(device, cp.label, &binds, wgpu::ShaderStages::COMPUTE, res, p).1);
+        sets.push(
+            build_sets(
+                device,
+                cp.label,
+                &binds,
+                wgpu::ShaderStages::COMPUTE,
+                res,
+                p,
+            )
+            .1,
+        );
     }
     BuiltCompute { stages, sets }
 }
@@ -908,12 +1076,21 @@ fn build_item(
     // deduping shared (set, binding) slots (e.g. the `frame` block in both stages).
     let mut binds = resolve_table(it.vs_bindings, graph, res.pp);
     for b in resolve_table(it.fs_bindings, graph, res.pp) {
-        if !binds.iter().any(|x| x.set == b.set && x.binding == b.binding) {
+        if !binds
+            .iter()
+            .any(|x| x.set == b.set && x.binding == b.binding)
+        {
             binds.push(b);
         }
     }
-    let (layouts, sets0) =
-        build_sets(device, it.label, &binds, wgpu::ShaderStages::VERTEX_FRAGMENT, res, 0);
+    let (layouts, sets0) = build_sets(
+        device,
+        it.label,
+        &binds,
+        wgpu::ShaderStages::VERTEX_FRAGMENT,
+        res,
+        0,
+    );
     let layout_refs: Vec<&wgpu::BindGroupLayout> = layouts.iter().collect();
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(it.label),
@@ -927,7 +1104,11 @@ fn build_item(
         Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: it.depth_write,
-            depth_compare: if it.depth_write { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Always },
+            depth_compare: if it.depth_write {
+                wgpu::CompareFunction::LessEqual
+            } else {
+                wgpu::CompareFunction::Always
+            },
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         })
@@ -970,9 +1151,23 @@ fn build_item(
     });
     let mut sets = vec![sets0];
     for p in 1..variant_count(&binds) {
-        sets.push(build_sets(device, it.label, &binds, wgpu::ShaderStages::VERTEX_FRAGMENT, res, p).1);
+        sets.push(
+            build_sets(
+                device,
+                it.label,
+                &binds,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
+                res,
+                p,
+            )
+            .1,
+        );
     }
-    BuiltItem { pipeline, sets, draw_args: it.draw_args }
+    BuiltItem {
+        pipeline,
+        sets,
+        draw_args: it.draw_args,
+    }
 }
 
 // winit 0.30 drives the app through `ApplicationHandler`: the window (and thus
@@ -1031,8 +1226,13 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(renderer) = self.renderer.as_mut() else { return };
-        let (sw, sh) = (renderer.gfx.config.width as f32, renderer.gfx.config.height as f32);
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let (sw, sh) = (
+            renderer.gfx.config.width as f32,
+            renderer.gfx.config.height as f32,
+        );
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(sz) => renderer.resize(sz.width, sz.height),
@@ -1055,7 +1255,13 @@ impl ApplicationHandler for App {
                 } else {
                     // Forward motion to Wyn's paint stream only when not manipulating the
                     // camera, so a right/middle drag never grows a stroke.
-                    self.events.push(encode_event(EV_MOUSEMOVE, self.mods, 0.0, self.mouse.0, self.mouse.1));
+                    self.events.push(encode_event(
+                        EV_MOUSEMOVE,
+                        self.mods,
+                        0.0,
+                        self.mouse.0,
+                        self.mouse.1,
+                    ));
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1065,14 +1271,23 @@ impl ApplicationHandler for App {
                     // camera button is held (no painting during orbit/pan).
                     MouseButton::Left if !(self.rmb || self.mmb) => {
                         let kind = if down { EV_MOUSEDOWN } else { EV_MOUSEUP };
-                        self.events.push(encode_event(kind, self.mods, 0.0, self.mouse.0, self.mouse.1));
+                        self.events.push(encode_event(
+                            kind,
+                            self.mods,
+                            0.0,
+                            self.mouse.0,
+                            self.mouse.1,
+                        ));
                     }
                     MouseButton::Left => {}
                     // Right = orbit (driver-owned camera): anchor the cursor pivot on press.
                     MouseButton::Right => {
                         self.rmb = down;
-                        if down { self.cam.begin_orbit(sw, sh, self.mouse.0, self.mouse.1); }
-                        else { self.cam.end_orbit(); }
+                        if down {
+                            self.cam.begin_orbit(sw, sh, self.mouse.0, self.mouse.1);
+                        } else {
+                            self.cam.end_orbit();
+                        }
                     }
                     // Middle = pan.
                     MouseButton::Middle => self.mmb = down,
@@ -1086,14 +1301,21 @@ impl ApplicationHandler for App {
                 };
                 self.cam.zoom(sw, sh, self.mouse.0, self.mouse.1, notches);
             }
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
                 // Forward keydown/up edges (ignore auto-repeat) as events carrying the
                 // live mods. The driver maps physical keys to codes but never assigns
                 // them meaning — `step` does.
                 if !key_event.repeat {
                     if let Some(code) = keycode(key_event.physical_key) {
-                        let kind = if key_event.state == ElementState::Pressed { EV_KEYDOWN } else { EV_KEYUP };
-                        self.events.push(encode_event(kind, self.mods, code, 0.0, 0.0));
+                        let kind = if key_event.state == ElementState::Pressed {
+                            EV_KEYDOWN
+                        } else {
+                            EV_KEYUP
+                        };
+                        self.events
+                            .push(encode_event(kind, self.mods, code, 0.0, 0.0));
                     }
                 }
             }

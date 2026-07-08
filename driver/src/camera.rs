@@ -19,18 +19,39 @@ const ZOOM_STEP: f32 = 0.88; // distance multiplier per wheel notch (in)
 
 type V3 = [f32; 3];
 
-fn sub(a: V3, b: V3) -> V3 { [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
-fn add(a: V3, b: V3) -> V3 { [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
-fn scale(a: V3, s: f32) -> V3 { [a[0] * s, a[1] * s, a[2] * s] }
-fn len(a: V3) -> f32 { (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt() }
-fn norm(a: V3) -> V3 { let l = len(a); if l > 0.0 { scale(a, 1.0 / l) } else { a } }
-fn lerp3(a: V3, b: V3, t: f32) -> V3 { add(a, scale(sub(b, a), t)) }
+fn sub(a: V3, b: V3) -> V3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn add(a: V3, b: V3) -> V3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+fn scale(a: V3, s: f32) -> V3 {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+fn len(a: V3) -> f32 {
+    (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+}
+fn norm(a: V3) -> V3 {
+    let l = len(a);
+    if l > 0.0 {
+        scale(a, 1.0 / l)
+    } else {
+        a
+    }
+}
+fn lerp3(a: V3, b: V3, t: f32) -> V3 {
+    add(a, scale(sub(b, a), t))
+}
 
 /// Column-major orbit rotation, mirroring camera.wyn `rotation(angle=(elev,az))`.
 fn rotation(elev: f32, az: f32) -> [V3; 3] {
     let (se, ce) = (elev.sin(), elev.cos());
     let (sa, ca) = (az.sin(), az.cos());
-    [[ca, 0.0, -sa], [sa * se, ce, ca * se], [sa * ce, -se, ca * ce]]
+    [
+        [ca, 0.0, -sa],
+        [sa * se, ce, ca * se],
+        [sa * ce, -se, ca * ce],
+    ]
 }
 
 /// `m * v` for a column-major mat3 (columns are m[0], m[1], m[2]).
@@ -71,14 +92,27 @@ pub struct Camera {
 impl Default for Camera {
     fn default() -> Self {
         let (target, az, elev, dist) = ([0.0, 0.0, 0.0], 0.6, -0.35, 45.0);
-        Self { target, az, elev, dist, tt: target, t_az: az, t_elev: elev, t_dist: dist, anchor: None }
+        Self {
+            target,
+            az,
+            elev,
+            dist,
+            tt: target,
+            t_az: az,
+            t_elev: elev,
+            t_dist: dist,
+            anchor: None,
+        }
     }
 }
 
 impl Camera {
     /// Eye of the *visible* camera.
     pub fn eye(&self) -> V3 {
-        add(self.target, mul(&rotation(self.elev, self.az), [0.0, 0.0, self.dist]))
+        add(
+            self.target,
+            mul(&rotation(self.elev, self.az), [0.0, 0.0, self.dist]),
+        )
     }
 
     /// World ray for a top-left cursor pixel, using the visible camera.
@@ -92,9 +126,13 @@ impl Camera {
     /// Ground-plane (y=0) hit under a top-left cursor pixel, if the ray descends to it.
     fn ground_hit(&self, sw: f32, sh: f32, mx: f32, my: f32) -> Option<V3> {
         let (ro, rd) = self.cursor_ray(sw, sh, mx, my);
-        if rd[1].abs() < 1e-6 { return None; }
+        if rd[1].abs() < 1e-6 {
+            return None;
+        }
         let t = -ro[1] / rd[1];
-        if t <= 0.0 { return None; }
+        if t <= 0.0 {
+            return None;
+        }
         Some(add(ro, scale(rd, t)))
     }
 
@@ -105,7 +143,9 @@ impl Camera {
         self.anchor = Some((pivot, [mx, sh - my], d0));
     }
 
-    pub fn end_orbit(&mut self) { self.anchor = None; }
+    pub fn end_orbit(&mut self) {
+        self.anchor = None;
+    }
 
     /// Right-drag: spin azimuth / tilt elevation, keeping the anchored pivot glued
     /// under its original pixel (cursor-based rotation).
@@ -123,7 +163,10 @@ impl Camera {
     /// Middle-drag: grab the ground and slide it — the point under the cursor follows
     /// the cursor (cursor-based pan). Incremental, using the visible camera.
     pub fn pan(&mut self, sw: f32, sh: f32, from: (f32, f32), to: (f32, f32)) {
-        let (a, b) = (self.ground_hit(sw, sh, from.0, from.1), self.ground_hit(sw, sh, to.0, to.1));
+        let (a, b) = (
+            self.ground_hit(sw, sh, from.0, from.1),
+            self.ground_hit(sw, sh, to.0, to.1),
+        );
         if let (Some(a), Some(b)) = (a, b) {
             self.tt = add(self.tt, sub(a, b)); // move the world so the grabbed point tracks the cursor
         }
@@ -151,7 +194,13 @@ impl Camera {
 
     /// Set the camera outright (screenshot scenarios) — snaps input target and visible.
     pub fn set(&mut self, target: V3, az: f32, elev: f32, dist: f32) {
-        self.target = target; self.az = az; self.elev = elev; self.dist = dist;
-        self.tt = target; self.t_az = az; self.t_elev = elev; self.t_dist = dist;
+        self.target = target;
+        self.az = az;
+        self.elev = elev;
+        self.dist = dist;
+        self.tt = target;
+        self.t_az = az;
+        self.t_elev = elev;
+        self.t_dist = dist;
     }
 }

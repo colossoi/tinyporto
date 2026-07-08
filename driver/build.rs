@@ -109,7 +109,11 @@ enum Length {
     /// A fixed byte size (e.g. a small fixed-shape output array).
     Fixed { bytes: u64 },
     /// Sized from an input binding: (src_bytes / src_elem_bytes) * elem_bytes.
-    LikeInput { binding: u32, elem_bytes: u64, src_elem_bytes: u64 },
+    LikeInput {
+        binding: u32,
+        elem_bytes: u64,
+        src_elem_bytes: u64,
+    },
     /// One element per dispatched invocation (compiler scratch whose length tracks
     /// the pass's grid): (dispatch_elems) * elem_bytes, where dispatch_elems is the
     /// element count of the input binding this pass's dispatch derives from.
@@ -146,6 +150,17 @@ fn id(s: &str) -> Ident {
     Ident::new(s, Span::call_site())
 }
 
+fn rerun_if_wyn_changed(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.expect("read_dir entry").path();
+        if path.is_dir() {
+            rerun_if_wyn_changed(&path);
+        } else if path.extension().is_some_and(|ext| ext == "wyn") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
 /// The input binding a compute pipeline's dispatch grid derives from, as
 /// (binding, src_elem_bytes) — the domain a `same_as_dispatch` output tracks. All
 /// buffer-derived stages of a fused pipeline share one domain (e.g. `cull` runs
@@ -153,11 +168,20 @@ fn id(s: &str) -> Ident {
 fn dispatch_input(p: &Pipeline) -> (u32, u64) {
     let mut found: Option<(u32, u64)> = None;
     for s in &p.stages {
-        if let Some(DispatchSize::DerivedFrom { len: Len::InputBinding { binding, elem_bytes }, .. }) =
-            s.dispatch_size.as_ref()
+        if let Some(DispatchSize::DerivedFrom {
+            len:
+                Len::InputBinding {
+                    binding,
+                    elem_bytes,
+                },
+            ..
+        }) = s.dispatch_size.as_ref()
         {
             match found {
-                Some((b, _)) => assert_eq!(b, *binding, "pipeline dispatch derives from >1 input binding"),
+                Some((b, _)) => assert_eq!(
+                    b, *binding,
+                    "pipeline dispatch derives from >1 input binding"
+                ),
                 None => found = Some((*binding, *elem_bytes)),
             }
         }
@@ -233,14 +257,23 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
         .iter()
         .map(|s| {
             let entry = s.entry_point.as_str();
-            let ds = s.dispatch_size.as_ref().expect("compute stage has dispatch_size");
+            let ds = s
+                .dispatch_size
+                .as_ref()
+                .expect("compute stage has dispatch_size");
             let dims = match ds {
                 DispatchSize::Fixed { x, y, z } => quote! { [#x, #y, #z] },
-                DispatchSize::DerivedFrom { len, workgroup_size } => {
+                DispatchSize::DerivedFrom {
+                    len,
+                    workgroup_size,
+                } => {
                     let wg = *workgroup_size;
                     match len {
                         // Buffer input: dispatch ceil(input_len_elems / wg).
-                        Len::InputBinding { binding, elem_bytes } => {
+                        Len::InputBinding {
+                            binding,
+                            elem_bytes,
+                        } => {
                             let param = input_param(p, *binding);
                             disp_params.insert(param.to_string());
                             quote! { [((#param / #elem_bytes) as u32).div_ceil(#wg), 1, 1] }
@@ -275,7 +308,11 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
             let b = o.binding;
             let expr = match o.length.as_ref().expect("output binding has length") {
                 Length::Fixed { bytes } => quote! { #bytes },
-                Length::LikeInput { binding, elem_bytes, src_elem_bytes } => {
+                Length::LikeInput {
+                    binding,
+                    elem_bytes,
+                    src_elem_bytes,
+                } => {
                     let src = input_param(p, *binding);
                     params.insert(src.to_string());
                     quote! { (#src / #src_elem_bytes) * #elem_bytes }
@@ -369,11 +406,14 @@ fn codegen_uniform_blocks(pipelines: &[Pipeline]) -> TokenStream {
 
 fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo = manifest.parent().expect("driver crate has a parent").to_path_buf();
+    let repo = manifest
+        .parent()
+        .expect("driver crate has a parent")
+        .to_path_buf();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={}", repo.join("wyn").display());
+    rerun_if_wyn_changed(&repo.join("wyn"));
 
     // One codegen path (quote). Each root contributes its embedded-SPIR-V row and
     // its descriptor translation; everything is emitted into a single file.
