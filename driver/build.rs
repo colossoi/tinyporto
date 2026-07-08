@@ -20,6 +20,20 @@ const ROOTS: &[(&str, &str)] = &[("main", "wyn/main.wyn")];
 #[derive(serde::Deserialize)]
 struct Descriptor {
     pipelines: Vec<Pipeline>,
+    #[serde(default)]
+    frame_graph: Option<FrameGraph>,
+}
+
+#[derive(serde::Deserialize)]
+struct FrameGraph {
+    #[serde(default)]
+    passes: Vec<FrameGraphPass>,
+}
+
+#[derive(serde::Deserialize)]
+struct FrameGraphPass {
+    name: String,
+    kind: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -404,6 +418,28 @@ fn codegen_uniform_blocks(pipelines: &[Pipeline]) -> TokenStream {
     }
 }
 
+fn codegen_frame_graph(desc: &Descriptor) -> TokenStream {
+    let rows = desc
+        .frame_graph
+        .as_ref()
+        .map(|fg| {
+            fg.passes
+                .iter()
+                .map(|p| {
+                    let name = &p.name;
+                    let kind = &p.kind;
+                    quote! { crate::graph::DescriptorPassInfo { name: #name, kind: #kind } }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    quote! {
+        /// Physical stages from the descriptor frame_graph, preserving descriptor
+        /// stage names and kinds for graph validation/diagnostics.
+        pub static DESCRIPTOR_PASSES: &[crate::graph::DescriptorPassInfo] = &[#(#rows),*];
+    }
+}
+
 fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo = manifest
@@ -446,6 +482,7 @@ fn main() {
             codegen.extend(codegen_bindings(p));
         }
         codegen.extend(codegen_uniform_blocks(&desc.pipelines));
+        codegen.extend(codegen_frame_graph(&desc));
     }
 
     let generated = quote! {

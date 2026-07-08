@@ -47,6 +47,13 @@ pub struct UniformBlockLayout {
     pub members: &'static [(&'static str, u32, u32)],
 }
 
+/// One physical stage from the Wyn descriptor's `frame_graph`.
+#[derive(Clone, Copy, Debug)]
+pub struct DescriptorPassInfo {
+    pub name: &'static str,
+    pub kind: &'static str,
+}
+
 /// How a storage buffer's initial contents are set.
 #[derive(Clone, Copy, Debug)]
 pub enum BufInit {

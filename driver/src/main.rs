@@ -126,6 +126,7 @@ struct Res<'a> {
 
 impl Renderer {
     fn new(gfx: Gfx, graph: &Graph) -> Result<Self> {
+        validate_descriptor_graph(graph)?;
         let device = &gfx.device;
 
         let mut modules: HashMap<&str, wgpu::ShaderModule> = HashMap::new();
@@ -604,6 +605,49 @@ impl Renderer {
         eprintln!("wrote {} ({w}x{h})", path.display());
         Ok(())
     }
+}
+
+fn validate_descriptor_graph(graph: &Graph) -> Result<()> {
+    let mut expected: Vec<(&'static str, &'static str)> = Vec::new();
+    for pass in graph.passes {
+        match pass {
+            Pass::Compute(cp) => {
+                for stage in cp.stages {
+                    expected.push((stage.entry, "compute"));
+                }
+            }
+            Pass::Render(rp) => {
+                for item in rp.items {
+                    expected.push((item.vs, "vertex"));
+                    expected.push((item.fs, "fragment"));
+                }
+            }
+        }
+    }
+
+    for &(name, kind) in &expected {
+        if !generated::DESCRIPTOR_PASSES
+            .iter()
+            .any(|p| p.name == name && p.kind == kind)
+        {
+            anyhow::bail!("graph references {kind} stage '{name}', but it is not in the Wyn descriptor frame_graph");
+        }
+    }
+
+    for pass in generated::DESCRIPTOR_PASSES {
+        if !expected
+            .iter()
+            .any(|(name, kind)| *name == pass.name && *kind == pass.kind)
+        {
+            anyhow::bail!(
+                "Wyn descriptor frame_graph contains {} stage '{}', but the driver graph does not schedule it",
+                pass.kind,
+                pass.name
+            );
+        }
+    }
+
+    Ok(())
 }
 
 // ---- resource creation ----
