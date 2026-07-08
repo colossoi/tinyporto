@@ -31,6 +31,20 @@ def FENCE_HW: f32 = 0.30       -- fence half-width (stored per item; widenable)
 def BUILD_HX: f32 = 2.0        -- building half-extent x (4 m wide)
 def BUILD_HZ: f32 = 1.5        -- building half-extent z (3 m deep)
 
+type paint_item = { kind: f32, point_start: i32, point_count: i32, param: f32 }
+
+def paint_item_from_packed(v: vec4f32) paint_item =
+  { kind = v.x, point_start = i32(v.y), point_count = i32(v.z), param = v.w }
+
+def pack_paint_item(it: paint_item) vec4f32 =
+  @[it.kind, f32(it.point_start), f32(it.point_count), it.param]
+
+type ground_vertex = { pos: vec3f32, kind: f32, nrm: vec3f32, attr: f32 }
+
+def ground_vertex_from_packed(pos: vec4f32, nrm: vec4f32) ground_vertex =
+  { pos = @[pos.x, pos.y, pos.z], kind = pos.w,
+    nrm = @[nrm.x, nrm.y, nrm.z], attr = nrm.w }
+
 -- Rendering.
 def GROUND_HALF: f32 = 20.0    -- half-size of the ground quad (40 m patch)
 def CR_SUB:    i32 = 4         -- Catmull-Rom subsegments per control-point span
@@ -58,11 +72,11 @@ def ground_pos(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
     let vi = v - TESS_BASE
     let item = vi / TESS_VPI
     let local = vi % TESS_VPI
-    let it = items[item]
-    let kind = it.x
-    let pstart = i32(it.y)
-    let pcount = i32(it.z)
-    let prm = it.w in
+    let it = paint_item_from_packed(items[item])
+    let kind = it.kind
+    let pstart = it.point_start
+    let pcount = it.point_count
+    let prm = it.param in
     if kind < 0.5 then @[0.0, 0.0, 0.0, 0.0]
     else if kind > 2.5 then
       if local < 6 then
@@ -91,11 +105,11 @@ def ground_nrm(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
     let vi = v - TESS_BASE
     let item = vi / TESS_VPI
     let local = vi % TESS_VPI
-    let it = items[item]
-    let kind = it.x
-    let pstart = i32(it.y)
-    let pcount = i32(it.z)
-    let prm = it.w in
+    let it = paint_item_from_packed(items[item])
+    let kind = it.kind
+    let pstart = it.point_start
+    let pcount = it.point_count
+    let prm = it.param in
     if kind < 0.5 then @[0.0, 1.0, 0.0, 0.0]
     else if kind > 2.5 then @[0.0, 1.0, 0.0, 1.0]
     else

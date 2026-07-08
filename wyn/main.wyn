@@ -92,12 +92,14 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
   let res = frame.resolution
   let o = cam(frame)
-  let pc = i32(head_in[0])
-  let ic = i32(head_in[1])
+  let head0 = stroke_head_from_buffer(head_in)
+  let pc = head0.point_count
+  let ic = head0.item_count
 
   -- Stroke kind is fixed at frame start (a Tab this frame applies next frame).
-  let tool0 = uistate_in[0]
-  let ovl0 = uistate_in[1]
+  let ui0 = ui_state_from_buffer(uistate_in)
+  let tool0 = ui0.tool
+  let ovl0 = ui0.overlay
   let is_building = tool0 > 1.5
   let kindv = tool0 + 1.0
   let param = if tool0 < 0.5 then WATER_R else if tool0 < 1.5 then FENCE_HW else 0.0
@@ -105,7 +107,7 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   -- UI fold (Tab cycles the tool, L toggles the overlay) and stroke-capture fold
   -- (Reumann-Witkam control-point emission into `em`/`ec`) both live in input.wyn.
   let (tool1, ovl1) = fold_ui(tool0, ovl0, events)
-  let uistate_out = [tool1, ovl1]
+  let uistate_out = pack_ui_state({ tool = tool1, overlay = ovl1 })
 
   let (anchor, dir, last, hd, held, press, ec, em) =
     fold_strokes(head_in, events, res, o, is_building)
@@ -123,16 +125,19 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   -- drag (no press, ec > 0) bumps the current item's count by ec.
   let items_out =
     map(|s| let i = i32(s) in
-            if press > 0.5 && i == ic then @[kindv, f32(pc), f32(ec), param]
+            if press > 0.5 && i == ic then
+              pack_paint_item({ kind = kindv, point_start = pc, point_count = ec, param = param })
             else if press < 0.5 && ec > 0i32 && i == ic - 1i32 then
-              let it = items_in[i] in @[it.x, it.y, it.z + f32(ec), it.w]
+              let it = paint_item_from_packed(items_in[i]) in
+              pack_paint_item({ kind = it.kind, point_start = it.point_start,
+                                point_count = it.point_count + ec, param = it.param })
             else items_in[i]
         , iidx)
 
   -- Head: counts + Reumann-Witkam anchor/dir/last + held, as a fixed-size literal.
   let head_out =
-    [f32(new_pc), f32(new_ic), held, anchor.x, anchor.y, dir.x, dir.y,
-     last.x, last.y, hd, 0.0, 0.0]
+    pack_stroke_head({ point_count = new_pc, item_count = new_ic, held = held,
+                       anchor = anchor, dir = dir, last = last, have_dir = hd })
 
   -- Ground geometry, as two parallel streams over the PREVIOUS state: geom_pos =
   -- (pos.xyz, kind) and geom_nrm = (nrm.xyz, attr). The per-vertex tessellation
@@ -233,7 +238,7 @@ entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
       let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
       -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
       let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919) in
-      @[center.x, center.y, height, roundfrac]
+      pack_sett_inst({ center = center, height = height, roundfrac = roundfrac })
       , bidx) in
   (cand, [36u32, u32(BCOLS * BROWS), 0u32, 0u32])
 
@@ -305,8 +310,9 @@ entry scene_vertex(#[builtin(vertex_index)] vid: i32,
                    #[storage(set=1, binding=9, access=read)] geom_nrm: []vec4f32)
   (#[builtin(position)] vec4f32, #[location(0)] f32, #[location(1)] f32, #[location(2)] vec3f32) =
   let p = geom_pos[vid]
-  let n = geom_nrm[vid] in
-  (world_to_clip(@[p.x, p.y, p.z], frame.resolution, cam(frame)), p.w, n.w, @[n.x, n.y, n.z])
+  let n = geom_nrm[vid]
+  let v = ground_vertex_from_packed(p, n) in
+  (world_to_clip(v.pos, frame.resolution, cam(frame)), v.kind, v.attr, v.nrm)
 
 def item_color(kind: f32) vec3f32 =
   if kind < 0.5 then SAND_COLOR
@@ -347,9 +353,9 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
                   #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
   (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec4f32,
    #[location(2)] f32) =
-  let inst = sett_inst[iid]
-  let center = @[inst.x, inst.y]
-  let height = inst.z
+  let inst = sett_inst_from_packed(sett_inst[iid])
+  let center = inst.center
+  let height = inst.height
   -- Per-sett orientation (random-tilt basis) + footprint scale, keyed on the stable
   -- centre. Cobbles are irregular: varied size, leaning in random directions.
   let (right, up, fwd) = sett_basis(center.x, center.y)
@@ -361,9 +367,9 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
   let bcenter = @[center.x, height * 0.5, center.y]
   let world = bcenter + sett_orient(lc, right, up, fwd) in
   if height <= 0.0 then
-    (@[2.0, 2.0, 2.0, 1.0], world, inst, sett_var(center.x, center.y))
+    (@[2.0, 2.0, 2.0, 1.0], world, pack_sett_inst(inst), sett_var(center.x, center.y))
   else
-    (world_to_clip(world, frame.resolution, cam(frame)), world, inst, sett_var(center.x, center.y))
+    (world_to_clip(world, frame.resolution, cam(frame)), world, pack_sett_inst(inst), sett_var(center.x, center.y))
 
 -- Sphere-trace the rounded box for this instance from the proxy front face. On a
 -- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
@@ -374,14 +380,16 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
                     #[location(2)] var: f32,
                     #[uniform(set=1, binding=0)] frame: frame_globals)
   (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
-  let height = inst.z
-  let bcenter = @[inst.x, height * 0.5, inst.y]
+  let sinst = sett_inst_from_packed(inst)
+  let center = sinst.center
+  let height = sinst.height
+  let bcenter = @[center.x, height * 0.5, center.y]
   -- Same stable per-sett scale + orientation basis as the vertex, so the traced
   -- box matches the proxy. Roundness is `roundfrac` of the min half-extent.
-  let sc = sett_scale(inst.x, inst.y)
-  let (right, up, fwd) = sett_basis(inst.x, inst.y)
+  let sc = sett_scale(center.x, center.y)
+  let (right, up, fwd) = sett_basis(center.x, center.y)
   let half = @[sett_hx(sc), height * 0.5, BRICK_L * 0.5 * sc]
-  let r = inst.w * f32.min(half.x, f32.min(half.y, half.z))
+  let r = sinst.roundfrac * f32.min(half.x, f32.min(half.y, half.z))
   let b = @[half.x - r, half.y - r, half.z - r]
   -- Trace in box-local space: project the world offset onto the sett's basis.
   let rd = normalize(world - cam_eye(cam(frame)))
@@ -403,7 +411,7 @@ entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
     -- Per-sett colour from three independent hashes on the stable centre: hue (warm
     -- greige <-> cool blue-grey), saturation (mute toward grey <-> enrich the undertone),
     -- and lightness (`var`). Independent axes keep the field from reading uniform.
-    let seed = sett_seed(inst.x, inst.y)
+    let seed = sett_seed(center.x, center.y)
     let hued = mix(COBBLE_WARM, COBBLE_COOL, brick_hash(seed + 17))
     let g = (hued.x + hued.y + hued.z) * 0.3333
     let sat = 0.7 + 0.8 * brick_hash(seed + 29)          -- <1 mutes to grey, >1 enriches

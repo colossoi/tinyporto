@@ -29,6 +29,33 @@ def BTN_LEFT: i32 = 0
 def KEY_TAB:  i32 = 1    -- host-side keycode table (mirror of the driver's)
 def KEY_L:    i32 = 2
 
+type ui_state = { tool: f32, overlay: f32 }
+
+def ui_state_from_buffer(xs: []f32) ui_state =
+  { tool = xs[0], overlay = xs[1] }
+
+def pack_ui_state(s: ui_state) [2]f32 =
+  [s.tool, s.overlay]
+
+type stroke_head = {
+  point_count: i32,
+  item_count: i32,
+  held: f32,
+  anchor: vec2f32,
+  dir: vec2f32,
+  last: vec2f32,
+  have_dir: f32,
+}
+
+def stroke_head_from_buffer(xs: []f32) stroke_head =
+  { point_count = i32(xs[0]), item_count = i32(xs[1]), held = xs[2],
+    anchor = @[xs[3], xs[4]], dir = @[xs[5], xs[6]], last = @[xs[7], xs[8]],
+    have_dir = xs[9] }
+
+def pack_stroke_head(h: stroke_head) [12]f32 =
+  [f32(h.point_count), f32(h.item_count), h.held, h.anchor.x, h.anchor.y,
+   h.dir.x, h.dir.y, h.last.x, h.last.y, h.have_dir, 0.0, 0.0]
+
 -- Screen pixel -> ground-plane point (same ray as the rendered cursor). `py` is
 -- top-left pixel Y (as events carry it); flip to the bottom-left ray convention.
 def screen_to_ground(resolution: vec3f32, o: orbit, px: f32, py: f32) vec2f32 =

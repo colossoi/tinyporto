@@ -27,6 +27,14 @@ def CELLZ: f32 = 0.175      -- cross-row pitch (short axis + a tight joint)
 def BCOLS: i32 = 168
 def BROWS: i32 = 220
 
+type sett_inst = { center: vec2f32, height: f32, roundfrac: f32 }
+
+def pack_sett_inst(s: sett_inst) vec4f32 =
+  @[s.center.x, s.center.y, s.height, s.roundfrac]
+
+def sett_inst_from_packed(v: vec4f32) sett_inst =
+  { center = @[v.x, v.y], height = v.z, roundfrac = v.w }
+
 -- World-space (x,z) center of sett i. Odd rows shift half a cell (running bond).
 def brick_center(i: i32) vec2f32 =
   let col = i % BCOLS in
