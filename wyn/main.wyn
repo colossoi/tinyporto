@@ -84,18 +84,24 @@ def pixel_xy(gid: vec3u32, w: i32) vec2i32 =
 -- rendered geometry lags input by one frame (imperceptible).
 -- tidx is first so the compiler derives the dispatch from it: it's the largest
 -- map (the ribbon), and the smaller maps (points/items) run guarded within it.
-#[compute]
-entry step(tidx: []u32, pidx: []u32, iidx: []u32,
-           uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
-           events: []vec4f32,
-           #[uniform(set=1, binding=0)] frame: frame_globals)
-  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
+type state_update = {
+  ui: ui_state,
+  head: stroke_head,
+  press: f32,
+  emit_count: i32,
+  kind: f32,
+  param: f32,
+  prev_point_count: i32,
+  prev_item_count: i32,
+}
+
+def next_state(frame: frame_globals, events: []vec4f32,
+               uistate_in: []f32, head_in: []f32) (state_update, [16]vec2f32) =
   let res = frame.resolution
   let o = cam(frame)
   let head0 = stroke_head_from_buffer(head_in)
   let pc = head0.point_count
   let ic = head0.item_count
-
   -- Stroke kind is fixed at frame start (a Tab this frame applies next frame).
   let ui0 = ui_state_from_buffer(uistate_in)
   let tool0 = ui0.tool
@@ -103,51 +109,74 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   let is_building = tool0 > 1.5
   let kindv = tool0 + 1.0
   let param = if tool0 < 0.5 then WATER_R else if tool0 < 1.5 then FENCE_HW else 0.0
-
-  -- UI fold (Tab cycles the tool, L toggles the overlay) and stroke-capture fold
-  -- (Reumann-Witkam control-point emission into `em`/`ec`) both live in input.wyn.
   let (tool1, ovl1) = fold_ui(tool0, ovl0, events)
-  let uistate_out = pack_ui_state({ tool = tool1, overlay = ovl1 })
-
   let (anchor, dir, last, hd, held, press, ec, em) =
     fold_strokes(head_in, events, res, o, is_building)
-
   let new_pc = if pc + ec < POINTS_CAP then pc + ec else POINTS_CAP
-  let new_ic = if press > 0.5 && ic < ITEMS_CAP then ic + 1i32 else ic
+  let new_ic = if press > 0.5 && ic < ITEMS_CAP then ic + 1i32 else ic in
+  ({ ui = { tool = tool1, overlay = ovl1 },
+     head = { point_count = new_pc, item_count = new_ic, held = held,
+              anchor = anchor, dir = dir, last = last, have_dir = hd },
+     press = press, emit_count = ec, kind = kindv, param = param,
+     prev_point_count = pc, prev_item_count = ic },
+   em)
 
-  -- Points: append this frame's committed points at [pc, pc + ec) (else copy through).
-  let points_out =
-    map(|s| let i = i32(s) in
-            if i >= pc && i - pc < ec then em[i - pc] else points_in[i]
-        , pidx)
+def update_points<[pn]>(prev_points: [pn]vec2f32, update: state_update,
+                        emitted: [16]vec2f32, indices: [pn]u32) [pn]vec2f32 =
+  map(|s| let i = i32(s)
+          let pc = update.prev_point_count in
+          if i >= pc && i - pc < update.emit_count then emitted[i - pc] else prev_points[i]
+      , indices)
 
-  -- Items: a press creates a new item covering this frame's points; a continuing
-  -- drag (no press, ec > 0) bumps the current item's count by ec.
+def update_items<[ni]>(prev_items: [ni]vec4f32, update: state_update, indices: [ni]u32) [ni]vec4f32 =
+  map(|s| let i = i32(s)
+          let pc = update.prev_point_count
+          let ic = update.prev_item_count
+          let ec = update.emit_count in
+          if update.press > 0.5 && i == ic then
+            pack_paint_item({ kind = update.kind, point_start = pc, point_count = ec, param = update.param })
+          else if update.press < 0.5 && ec > 0i32 && i == ic - 1i32 then
+            let it = paint_item_from_packed(prev_items[i]) in
+            pack_paint_item({ kind = it.kind, point_start = it.point_start,
+                              point_count = it.point_count + ec, param = it.param })
+          else prev_items[i]
+      , indices)
+
+def ground_positions<[tn]>(items: []vec4f32, points: []vec2f32, indices: [tn]u32) [tn]vec4f32 =
+  map(|s| ground_pos(i32(s), items, points), indices)
+
+def ground_normals<[tn]>(items: []vec4f32, points: []vec2f32, indices: [tn]u32) [tn]vec4f32 =
+  map(|s| ground_nrm(i32(s), items, points), indices)
+
+def ground_draw_args: [4]u32 =
+  [u32(TESS_CAP), 1u32, 0u32, 0u32]
+
+#[compute]
+entry step(tidx: []u32, pidx: []u32, iidx: []u32,
+           uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
+           events: []vec4f32,
+           #[uniform(set=1, binding=0)] frame: frame_globals)
+  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
+  let (update, emitted) = next_state(frame, events, uistate_in, head_in)
+  let uistate_out = pack_ui_state(update.ui)
+  let points_out = update_points(points_in, update, emitted, pidx)
   let items_out =
-    map(|s| let i = i32(s) in
-            if press > 0.5 && i == ic then
-              pack_paint_item({ kind = kindv, point_start = pc, point_count = ec, param = param })
-            else if press < 0.5 && ec > 0i32 && i == ic - 1i32 then
+    map(|s| let i = i32(s)
+            let pc = update.prev_point_count
+            let ic = update.prev_item_count
+            let ec = update.emit_count in
+            if update.press > 0.5 && i == ic then
+              pack_paint_item({ kind = update.kind, point_start = pc, point_count = ec, param = update.param })
+            else if update.press < 0.5 && ec > 0i32 && i == ic - 1i32 then
               let it = paint_item_from_packed(items_in[i]) in
               pack_paint_item({ kind = it.kind, point_start = it.point_start,
                                 point_count = it.point_count + ec, param = it.param })
             else items_in[i]
         , iidx)
-
-  -- Head: counts + Reumann-Witkam anchor/dir/last + held, as a fixed-size literal.
-  let head_out =
-    pack_stroke_head({ point_count = new_pc, item_count = new_ic, held = held,
-                       anchor = anchor, dir = dir, last = last, have_dir = hd })
-
-  -- Ground geometry, as two parallel streams over the PREVIOUS state: geom_pos =
-  -- (pos.xyz, kind) and geom_nrm = (nrm.xyz, attr). The per-vertex tessellation
-  -- (sand base quad + per-item CR ribbon / building quad) lives in paint.wyn.
-  let geom_pos = map(|s| ground_pos(i32(s), items_in, points_in), tidx)
-  let geom_nrm = map(|s| ground_nrm(i32(s), items_in, points_in), tidx)
-
-  -- Non-indexed draw_indirect args for the ground: the whole geom buffer (base
-  -- quad + all item slots; unused slots are degenerate).
-  let draw_args = [u32(TESS_CAP), 1u32, 0u32, 0u32] in
+  let head_out = pack_stroke_head(update.head)
+  let geom_pos = ground_positions(items_in, points_in, tidx)
+  let geom_nrm = ground_normals(items_in, points_in, tidx)
+  let draw_args = ground_draw_args in
 
   (uistate_out, points_out, items_out, head_out, geom_pos, geom_nrm, draw_args)
 
