@@ -160,19 +160,7 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
   let (update, emitted) = next_state(frame, events, uistate_in, head_in)
   let uistate_out = pack_ui_state(update.ui)
   let points_out = update_points(points_in, update, emitted, pidx)
-  let items_out =
-    map(|s| let i = i32(s)
-            let pc = update.prev_point_count
-            let ic = update.prev_item_count
-            let ec = update.emit_count in
-            if update.press > 0.5 && i == ic then
-              pack_paint_item({ kind = update.kind, point_start = pc, point_count = ec, param = update.param })
-            else if update.press < 0.5 && ec > 0i32 && i == ic - 1i32 then
-              let it = paint_item_from_packed(items_in[i]) in
-              pack_paint_item({ kind = it.kind, point_start = it.point_start,
-                                point_count = it.point_count + ec, param = it.param })
-            else items_in[i]
-        , iidx)
+  let items_out = update_items(items_in, update, iidx)
   let head_out = pack_stroke_head(update.head)
   let geom_pos = ground_positions(items_in, points_in, tidx)
   let geom_nrm = ground_normals(items_in, points_in, tidx)
@@ -260,6 +248,9 @@ def sett_candidate(frame: frame_globals, items: []vec4f32, points: []vec2f32,
   let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919) in
   { center = center, height = height, roundfrac = roundfrac }
 
+-- Keep-predicate for a candidate sett. Not yet wired: `cull` currently emits every
+-- candidate (culled ones as degenerate height=0 records) rather than compacting.
+-- This becomes the `filter` predicate when the compaction slice (PR 4) lands.
 def sett_visible(s: sett_inst) bool =
   s.height > 0.0
 
@@ -282,9 +273,9 @@ entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
            #[uniform(set=1, binding=0)] frame: frame_globals,
            #[view(occ_depth, storage_read)] od: storage_image)
   ([]vec4f32, [4]u32) =
-  -- Build one candidate record per cell, then `filter` keeps only the visible ones
-  -- and COMPACTS them into a dense prefix. Culled records get height = 0 so the
-  -- predicate drops them; the compacted length becomes instance_count.
+  -- Build one candidate record per cell. Culled records are emitted as degenerate
+  -- height=0 setts (the sett raymarch skips them); the draw count is the full cell
+  -- grid. Compaction via `filter(sett_visible, ...)` down to the live count is PR 4.
   build_visibility_setts(bidx, items_in, points_in, frame, od)
 
 -- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
@@ -488,6 +479,9 @@ def wall_candidate(frame: frame_globals, i: i32) block =
   if visible then brk
   else { center = @[center.x, 0.0 - 1.0, center.z], yaw = brk.yaw, kind = brk.kind, half = brk.half }
 
+-- Keep-predicate for a candidate wall brick (mirrors sett_visible). Not yet wired:
+-- `walls` emits every brick, culled ones sunk to y = -1 (off-plate). Becomes the
+-- `filter` predicate when wall compaction (PR 4) lands.
 def wall_visible(b: block) bool =
   b.center.y > 0.0
 
