@@ -84,6 +84,12 @@ def pixel_xy(gid: vec3u32, w: i32) vec2i32 =
 -- rendered geometry lags input by one frame (imperceptible).
 -- tidx is first so the compiler derives the dispatch from it: it's the largest
 -- map (the ribbon), and the smaller maps (points/items) run guarded within it.
+-- The persistent painted-scene state, ping-ponged prev -> next each frame: the
+-- packed UI buffer, the control points, the packed items, and the packed capture
+-- head. One value threaded through the frame instead of four parallel buffers; the
+-- compiler flattens it back to the same four storage buffers (ABI-neutral).
+type world = { ui: []f32, points: []vec2f32, items: []vec4f32, head: []f32 }
+
 type state_update = {
   ui: ui_state,
   head: stroke_head,
@@ -151,22 +157,37 @@ def ground_normals<[tn]>(items: []vec4f32, points: []vec2f32, indices: [tn]u32) 
 def ground_draw_args: [4]u32 =
   [u32(TESS_CAP), 1u32, 0u32, 0u32]
 
+-- Advance ALL persistent state one frame: fold events into the UI and capture head,
+-- append this frame's committed points, create/extend the current item. Reads the
+-- previous `world` and returns the next. pidx/iidx are iota seeds so the point/item
+-- maps recover their element index (and size their outputs to those domains).
+def update_world(frame: frame_globals, events: []vec4f32, w: world,
+                 pidx: []u32, iidx: []u32) world =
+  let (update, emitted) = next_state(frame, events, w.ui, w.head) in
+  { ui = pack_ui_state(update.ui),
+    points = update_points(w.points, update, emitted, pidx),
+    items = update_items(w.items, update, iidx),
+    head = pack_stroke_head(update.head) }
+
+-- Ground geometry derived from the (previous) world: two parallel vertex streams
+-- (geom_pos = pos.xyz+kind, geom_nrm = nrm.xyz+attr) over the tessellation domain,
+-- plus the non-indexed ground draw args. Tessellates the PREVIOUS points/items, so
+-- rendered geometry lags input by one frame (imperceptible).
+def build_scene(w: world, tidx: []u32) ([]vec4f32, []vec4f32, [4]u32) =
+  (ground_positions(w.items, w.points, tidx),
+   ground_normals(w.items, w.points, tidx),
+   ground_draw_args)
+
 #[compute]
 entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
            events: []vec4f32,
            #[uniform(set=1, binding=0)] frame: frame_globals)
   ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
-  let (update, emitted) = next_state(frame, events, uistate_in, head_in)
-  let uistate_out = pack_ui_state(update.ui)
-  let points_out = update_points(points_in, update, emitted, pidx)
-  let items_out = update_items(items_in, update, iidx)
-  let head_out = pack_stroke_head(update.head)
-  let geom_pos = ground_positions(items_in, points_in, tidx)
-  let geom_nrm = ground_normals(items_in, points_in, tidx)
-  let draw_args = ground_draw_args in
-
-  (uistate_out, points_out, items_out, head_out, geom_pos, geom_nrm, draw_args)
+  let w = { ui = uistate_in, points = points_in, items = items_in, head = head_in }
+  let w2 = update_world(frame, events, w, pidx, iidx)
+  let (geom_pos, geom_nrm, draw_args) = build_scene(w, tidx) in
+  (w2.ui, w2.points, w2.items, w2.head, geom_pos, geom_nrm, draw_args)
 
 ------------------------------------------------------------
 -- Hi-Z occlusion (Nine, simple single-level form). The scene writes window-space
