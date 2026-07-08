@@ -266,6 +266,17 @@ def sett_visible(s: sett_inst) bool =
 def sett_draw_args(n: i32) [4]u32 =
   [36u32, u32(n), 0u32, 0u32]
 
+def build_visibility_setts(bidx: []u32, items: []vec4f32, points: []vec2f32,
+                           frame: frame_globals, od: storage_image)
+  ([]vec4f32, [4]u32) =
+  let cand =
+    map(|s|
+      let i = i32(s)
+      let inst = sett_candidate(frame, items, points, od, i) in
+      pack_sett_inst(inst)
+      , bidx) in
+  (cand, sett_draw_args(BCOLS * BROWS))
+
 #[compute]
 entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
            #[uniform(set=1, binding=0)] frame: frame_globals,
@@ -274,13 +285,7 @@ entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
   -- Build one candidate record per cell, then `filter` keeps only the visible ones
   -- and COMPACTS them into a dense prefix. Culled records get height = 0 so the
   -- predicate drops them; the compacted length becomes instance_count.
-  let cand =
-    map(|s|
-      let i = i32(s)
-      let inst = sett_candidate(frame, items_in, points_in, od, i) in
-      pack_sett_inst(inst)
-      , bidx) in
-  (cand, sett_draw_args(BCOLS * BROWS))
+  build_visibility_setts(bidx, items_in, points_in, frame, od)
 
 -- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
 -- block of scene_depth under it. Runs after the scene pass; cull reads it next
@@ -489,15 +494,18 @@ def wall_visible(b: block) bool =
 def wall_draw_args(n: i32) [4]u32 =
   [36u32, u32(n), 0u32, 0u32]
 
-#[compute]
-entry walls(wbidx: []u32,
-            #[uniform(set=1, binding=0)] frame: frame_globals)
-  ([]block, [4]u32) =
+def build_visibility_walls(wbidx: []u32, frame: frame_globals) ([]block, [4]u32) =
   let cand =
     map(|s|
       wall_candidate(frame, i32(s))
       , wbidx) in
   (cand, wall_draw_args(BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS))
+
+#[compute]
+entry walls(wbidx: []u32,
+            #[uniform(set=1, binding=0)] frame: frame_globals)
+  ([]block, [4]u32) =
+  build_visibility_walls(wbidx, frame)
 
 #[vertex]
 entry brick_vertex(#[builtin(vertex_index)] vid: i32,
