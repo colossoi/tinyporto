@@ -370,7 +370,7 @@ entry scene_vertex(#[builtin(vertex_index)] vid: i32,
                    #[uniform(set=1, binding=0)] frame: frame_globals,
                    #[storage(set=1, binding=8, access=read)] geom_pos: []vec4f32,
                    #[storage(set=1, binding=9, access=read)] geom_nrm: []vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] f32, #[location(1)] f32, #[location(2)] vec3f32) =
+  (#[builtin(position)] vec4f32, #[varying(0)] f32, #[varying(1)] f32, #[varying(2)] vec3f32) =
   let p = geom_pos[vid]
   let n = geom_nrm[vid]
   let v = ground_vertex_from_packed(p, n) in
@@ -387,10 +387,10 @@ def item_color(kind: f32) vec3f32 =
 -- G-buffer write for the ground: albedo (material color + stroke edging, pre-light)
 -- @0, world normal @1, window depth @2 (also feeds the Hi-Z pyramid). No lighting.
 #[fragment]
-entry scene_fragment(#[location(0)] kind: f32, #[location(1)] attr: f32,
-                     #[location(2)] normal: vec3f32,
+entry scene_fragment(#[varying(0)] kind: f32, #[varying(1)] attr: f32,
+                     #[varying(2)] normal: vec3f32,
                      #[builtin(frag_coord)] fc: vec4f32)
-  (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32) =
+  (#[target(g_albedo)] vec4f32, #[target(g_normal)] vec4f32, #[target(scene_depth)] f32) =
   let nrm = normalize(normal)
   let base = item_color(kind)
   let edge = smoothstep(0.78, 1.0, f32.abs(attr))
@@ -413,8 +413,8 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
                   #[builtin(instance_index)] iid: i32,
                   #[uniform(set=1, binding=0)] frame: frame_globals,
                   #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec4f32,
-   #[location(2)] f32) =
+  (#[builtin(position)] vec4f32, #[varying(0)] vec3f32, #[varying(1)] vec4f32,
+   #[varying(2)] f32) =
   let inst = sett_inst_from_packed(sett_inst[iid])
   let center = inst.center
   let height = inst.height
@@ -438,10 +438,10 @@ entry sett_vertex(#[builtin(vertex_index)] vid: i32,
 -- ray grazes a rounded-off corner) push frag_depth to the far plane so the
 -- already-drawn ground wins the LessEqual depth test — that carves the silhouette.
 #[fragment]
-entry sett_fragment(#[location(0)] world: vec3f32, #[location(1)] inst: vec4f32,
-                    #[location(2)] var: f32,
+entry sett_fragment(#[varying(0)] world: vec3f32, #[varying(1)] inst: vec4f32,
+                    #[varying(2)] var: f32,
                     #[uniform(set=1, binding=0)] frame: frame_globals)
-  (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
+  (#[target(g_albedo)] vec4f32, #[target(g_normal)] vec4f32, #[target(scene_depth)] f32, #[builtin(frag_depth)] f32) =
   let sinst = sett_inst_from_packed(inst)
   let center = sinst.center
   let height = sinst.height
@@ -532,8 +532,8 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
                    #[builtin(instance_index)] iid: i32,
                    #[uniform(set=1, binding=0)] frame: frame_globals,
                    #[storage(set=1, binding=11, access=read)] wall_brick_inst: []block)
-  (#[builtin(position)] vec4f32, #[location(0)] vec3f32, #[location(1)] vec3f32,
-   #[location(2)] f32, #[location(3)] f32, #[location(4)] f32, #[location(5)] vec3f32) =
+  (#[builtin(position)] vec4f32, #[varying(0)] vec3f32, #[varying(1)] vec3f32,
+   #[varying(2)] f32, #[varying(3)] f32, #[varying(4)] f32, #[varying(5)] vec3f32) =
   let inst = wall_brick_inst[iid]
   let center = inst.center
   let kind = f32(inst.kind)     -- 0 brick, 1 quoin, 2 grout (passed on for the fragment)
@@ -557,11 +557,11 @@ entry brick_vertex(#[builtin(vertex_index)] vid: i32,
 -- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
 -- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
 #[fragment]
-entry brick_fragment(#[location(0)] world: vec3f32, #[location(1)] bcenter: vec3f32,
-                     #[location(2)] yaw: f32, #[location(3)] cv: f32, #[location(4)] kind: f32,
-                     #[location(5)] hf: vec3f32,
+entry brick_fragment(#[varying(0)] world: vec3f32, #[varying(1)] bcenter: vec3f32,
+                     #[varying(2)] yaw: f32, #[varying(3)] cv: f32, #[varying(4)] kind: f32,
+                     #[varying(5)] hf: vec3f32,
                      #[uniform(set=1, binding=0)] frame: frame_globals)
-  (#[location(0)] vec4f32, #[location(1)] vec4f32, #[location(2)] f32, #[builtin(frag_depth)] f32) =
+  (#[target(g_albedo)] vec4f32, #[target(g_normal)] vec4f32, #[target(scene_depth)] f32, #[builtin(frag_depth)] f32) =
   -- Blocks carry their own half-extents. A tiny corner radius keeps the edges
   -- crisp (just enough to catch a highlight). kind 0 brick, 1 quoin, 2 grout.
   let rr = 0.004
@@ -631,7 +631,7 @@ entry brick_shadow_vertex(#[builtin(vertex_index)] vid: i32,
 -- Depth-only caster shade: store this fragment's light-space depth (frag_coord.z)
 -- into the R32Float sun_depth target; the depth test already kept the nearest.
 #[fragment]
-entry shadow_fragment(#[builtin(frag_coord)] fc: vec4f32) #[location(0)] f32 = fc.z
+entry shadow_fragment(#[builtin(frag_coord)] fc: vec4f32) #[target(sun_depth)] f32 = fc.z
 
 -- Perspective constants for GTAO, built once from our fixed viewport + camera FOV
 -- (vertical 20°) and clip planes. Frame 0: no temporal accumulation (we have no TAA),
@@ -766,5 +766,5 @@ entry blit_vertex(#[builtin(vertex_index)] vid: i32)
 #[fragment]
 entry resolve_fragment(#[builtin(frag_coord)] fc: vec4f32,
                        #[view(lit, sampled)] lt: texture2d)
-  #[location(0)] vec4f32 =
+  #[target(surface)] vec4f32 =
   texture_load(lt, @[i32(fc.x), i32(fc.y)], 0)
