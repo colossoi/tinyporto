@@ -254,7 +254,7 @@ def frame_state_scene_slice(frame: frame_globals, events: []vec4f32,
 -- degenerate one-level Hi-Z: a full mip pyramid + the two-pass prev-visible
 -- refinement is later work. cull reads the PREVIOUS frame's occ_depth (occ_reduce
 -- runs after the scene pass), a one-frame lag imperceptible for a slow orbit.
--- (OCC_TILE / OCC_W / OCC_H — the coarse-grid dimensions — live in hiz.wyn.)
+-- (OCC_TILE and the occ_w / occ_h coarse-grid dimensions live in hiz.wyn.)
 ------------------------------------------------------------
 
 resource scene_depth: image2d {
@@ -390,14 +390,19 @@ def frame_prop_visibility_slice(sc: painted, frame: frame_globals,
 
 -- Coarse-depth reduction: mins the OCC_TILE^2 block of scene_depth under one
 -- occ_depth texel. Dispatched from `gtao_main` (both read scene_depth right after
--- the scene pass); `cull` reads the result next frame.
-def occ_reduce_tile(sd: storage_image, tile: vec2i32) vec4f32 =
+-- the scene pass); `cull` reads the result next frame. Source reads are clamped to
+-- the window: a size that is not a multiple of OCC_TILE leaves the last tile row /
+-- column partly outside, and an out-of-bounds read would come back as depth 0 (the
+-- near plane) and fake an occluder.
+def occ_reduce_tile(sd: storage_image, resolution: vec3f32, tile: vec2i32) vec4f32 =
+  let mx = i32(resolution.x) - 1
+  let my = i32(resolution.y) - 1
   let tx = tile.x
   let ty = tile.y
   let m =
     loop m = 1.0 for k < 64 do
-      let sx = tx * OCC_TILE + (k % OCC_TILE)
-      let sy = ty * OCC_TILE + (k / OCC_TILE)
+      let sx = clampi(tx * OCC_TILE + (k % OCC_TILE), 0, mx)
+      let sy = clampi(ty * OCC_TILE + (k / OCC_TILE), 0, my)
       let v = image_load(sd, @[sx, sy]) in
       f32.min(m, v.x) in
   @[m, m, m, m]
@@ -605,41 +610,41 @@ entry brick_shadow_vertex(#[builtin(vertex_index)] vid: i32,
 #[fragment]
 entry shadow_fragment(#[builtin(frag_coord)] fc: vec4f32) #[target(sun_depth)] f32 = fc.z
 
--- Perspective constants for GTAO, built once from our fixed viewport + camera FOV
--- (vertical 20°) and clip planes. Frame 0: no temporal accumulation (we have no TAA),
--- so the per-pixel noise is static and the denoise pass cleans it up spatially.
-def gtao_consts: gtao.consts =
-  gtao.make_constants(@[1280.0, 800.0], f32.tan(f32.radians(10.0)),
+-- Perspective constants for GTAO, built from the live viewport + camera FOV (vertical
+-- 20°) and clip planes. Frame 0: no temporal accumulation (we have no TAA), so the
+-- per-pixel noise is static and the denoise pass cleans it up spatially.
+def gtao_consts(resolution: vec3f32) gtao.consts =
+  gtao.make_constants(@[resolution.x, resolution.y], f32.tan(f32.radians(10.0)),
                       CLIP_NEAR, CLIP_FAR, 0u32, gtao.default_settings)
 
 -- Linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
 -- to CLIP_FAR so it stays finite and never reads as an occluder.
-def gtao_scene_vdepth(sd: storage_image, xy: vec2i32) f32 =
+def gtao_scene_vdepth(sd: storage_image, c: gtao.consts, xy: vec2i32) f32 =
   let ndc = image_load(sd, xy).x in
   if ndc > 0.99999 then CLIP_FAR
-  else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts))
+  else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, c))
 
-def gtao_load_scene_vdepth(sd: storage_image, x: i32, y: i32) f32 =
-  let cx = clampi(x, 0i32, i32(gtao_consts.viewport_size.x) - 1i32)
-  let cy = clampi(y, 0i32, i32(gtao_consts.viewport_size.y) - 1i32) in
-  gtao_scene_vdepth(sd, @[cx, cy])
+def gtao_load_scene_vdepth(sd: storage_image, c: gtao.consts, x: i32, y: i32) f32 =
+  let cx = clampi(x, 0i32, i32(c.viewport_size.x) - 1i32)
+  let cy = clampi(y, 0i32, i32(c.viewport_size.y) - 1i32) in
+  gtao_scene_vdepth(sd, c, @[cx, cy])
 
-def gtao_load_scene_vdepth_uv(sd: storage_image, uv: vec2f32) f32 =
-  gtao_load_scene_vdepth(sd,
-                         i32(f32.floor(uv.x * gtao_consts.viewport_size.x)),
-                         i32(f32.floor(uv.y * gtao_consts.viewport_size.y)))
+def gtao_load_scene_vdepth_uv(sd: storage_image, c: gtao.consts, uv: vec2f32) f32 =
+  gtao_load_scene_vdepth(sd, c,
+                         i32(f32.floor(uv.x * c.viewport_size.x)),
+                         i32(f32.floor(uv.y * c.viewport_size.y)))
 
 -- GTAO main (High preset = 3 slices x 3 steps), normals reconstructed from
 -- linearized scene depth. Writes raw visibility (.x) + packed denoise edges (.y).
-def gtao_main_pixel(sd: storage_image, xy: vec2i32) vec4f32 =
-  let cz = gtao_load_scene_vdepth(sd, xy.x, xy.y)
-  let lz = gtao_load_scene_vdepth(sd, xy.x - 1i32, xy.y)
-  let rz = gtao_load_scene_vdepth(sd, xy.x + 1i32, xy.y)
-  let tz = gtao_load_scene_vdepth(sd, xy.x, xy.y - 1i32)
-  let bz = gtao_load_scene_vdepth(sd, xy.x, xy.y + 1i32)
-  let nrm = gtao.viewspace_normal_from_depths(xy, cz, lz, rz, tz, bz, gtao_consts)
+def gtao_main_pixel(sd: storage_image, c: gtao.consts, xy: vec2i32) vec4f32 =
+  let cz = gtao_load_scene_vdepth(sd, c, xy.x, xy.y)
+  let lz = gtao_load_scene_vdepth(sd, c, xy.x - 1i32, xy.y)
+  let rz = gtao_load_scene_vdepth(sd, c, xy.x + 1i32, xy.y)
+  let tz = gtao_load_scene_vdepth(sd, c, xy.x, xy.y - 1i32)
+  let bz = gtao_load_scene_vdepth(sd, c, xy.x, xy.y + 1i32)
+  let nrm = gtao.viewspace_normal_from_depths(xy, cz, lz, rz, tz, bz, c)
   let packed_edges = gtao.pack_edges(gtao.calculate_edges(cz, lz, rz, tz, bz))
-  let p = gtao.setup_pixel(xy, cz, gtao_consts)
+  let p = gtao.setup_pixel(xy, cz, c)
   let noise = gtao.spatiotemporal_noise(@[u32(xy.x), u32(xy.y)], 0u32)
   let visibility =
     loop vis = p.visibility_base for slice < 3 do
@@ -647,32 +652,35 @@ def gtao_main_pixel(sd: storage_image, xy: vec2i32) vec4f32 =
       let (hc0, hc1) =
         loop (hc0, hc1) = (s.low_horizon_cos0, s.low_horizon_cos1)
         for step < 3 do
-          let (off, _) = gtao.step_sample(p, s, slice, step, 3, noise.y, gtao_consts)
+          let (off, _) = gtao.step_sample(p, s, slice, step, 3, noise.y, c)
           let uv0 = p.nsp + off
           let uv1 = p.nsp - off
-          let sz0 = gtao_load_scene_vdepth_uv(sd, uv0)
-          let sz1 = gtao_load_scene_vdepth_uv(sd, uv1) in
-          gtao.horizon_fold(p, s, uv0, sz0, uv1, sz1, hc0, hc1, gtao_consts)
+          let sz0 = gtao_load_scene_vdepth_uv(sd, c, uv0)
+          let sz1 = gtao_load_scene_vdepth_uv(sd, c, uv1) in
+          gtao.horizon_fold(p, s, uv0, sz0, uv1, sz1, hc0, hc1, c)
       in
       vis + gtao.slice_visibility(s, hc0, hc1)
-  let vis = gtao.finalize_visibility(visibility, 3, gtao_consts) in
+  let vis = gtao.finalize_visibility(visibility, 3, c) in
   @[vis, packed_edges, 0.0, 1.0]
 
 -- One post-scene pass over scene_depth. Every invocation integrates AO for its
--- pixel into ao_work; the first OCC_W * OCC_H of them also reduce one coarse
+-- pixel into ao_work; the first occ_w * occ_h of them also reduce one coarse
 -- occ_depth tile. `aw` is listed first so the dispatch is sized from it (the
 -- window), which covers the smaller occ_depth grid.
 #[compute]
 entry gtao_main(#[builtin(global_invocation_id)] gid: vec3u32,
+                #[uniform(set=1, binding=0)] frame: frame_globals,
                 #[view(ao_work, storage_write)] aw: *storage_image,
                 #[view(occ_depth, storage_write)] od: *storage_image,
                 #[view(scene_depth, storage_read)] sd: storage_image)
   () =
+  let res = frame.resolution
   let i = i32(gid.x)
-  let tile = @[i % OCC_W, i / OCC_W]
-  let _od = if i < OCC_W * OCC_H then od with [tile] = occ_reduce_tile(sd, tile) else od
-  let xy = pixel_xy(gid, 1280) in
-  aw with [xy] = gtao_main_pixel(sd, xy)
+  let ow = occ_w(res)
+  let tile = @[i % ow, i / ow]
+  let _od = if i < ow * occ_h(res) then od with [tile] = occ_reduce_tile(sd, res, tile) else od
+  let xy = pixel_xy(gid, i32(res.x)) in
+  aw with [xy] = gtao_main_pixel(sd, gtao_consts(res), xy)
 
 -- The GTAO edge-aware denoise (final blur of ao_work) is NOT a separate pass — it
 -- reads only gtao_main's output, so `shade_frame` folds it in inline (see its `ao`).
@@ -725,7 +733,7 @@ def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
     else
       let base = if s0 < 0.0 then QUAY_COLOR else @[alb.x, alb.y, alb.z]
       let ao = if ao_off then 0.0
-               else let (aov, _e) = gtao.denoise(@[x, y], aw, gtao_consts, true) in 1.0 - aov
+               else let (aov, _e) = gtao.denoise(@[x, y], aw, gtao_consts(resl), true) in 1.0 - aov
       let p = pg + n * SH_LIFT
       let shc = contact_shadow(sd, p, n, resl, o)
       let shm_frac = sun_shadow_pcf(shm, p, rx, ry) in

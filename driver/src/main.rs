@@ -1,5 +1,5 @@
 //! tinyporto driver — a generic wgpu host that executes a Wyn-compiled SPIR-V
-//! frame-graph (`app::GRAPH`). No game concepts live here; see `graph.rs`.
+//! frame-graph (`app::graph`). No game concepts live here; see `graph.rs`.
 
 mod app;
 mod camera;
@@ -138,7 +138,7 @@ impl Renderer {
         // bytes), from each compute pass's generated size calc applied to its
         // StorageWrite bindings. Buffers with no declared size are sized from here.
         let mut derived: HashMap<&'static str, u64> = HashMap::new();
-        for pass in graph.passes {
+        for pass in &graph.passes {
             if let Pass::Compute(cp) = pass {
                 for &(_, binding, kind, name) in cp.bindings {
                     if matches!(
@@ -172,7 +172,7 @@ impl Renderer {
         )> = Vec::new();
         let mut has_depth = false;
         let (cw, ch) = (gfx.config.width, gfx.config.height);
-        for res in graph.resources {
+        for res in &graph.resources {
             match *res {
                 Resource::UniformBlock { name, members } => {
                     // Size the buffer from the descriptor's published std140 layout.
@@ -248,7 +248,7 @@ impl Renderer {
 
         // Passes (preserve order).
         let mut passes = Vec::new();
-        for pass in graph.passes {
+        for pass in &graph.passes {
             match pass {
                 Pass::Compute(cp) => {
                     let module = modules.get(cp.module).expect("module");
@@ -609,10 +609,10 @@ impl Renderer {
 
 fn validate_descriptor_graph(graph: &Graph) -> Result<()> {
     let mut expected: Vec<(&'static str, &'static str)> = Vec::new();
-    for pass in graph.passes {
+    for pass in &graph.passes {
         match pass {
             Pass::Compute(cp) => {
-                for stage in cp.stages {
+                for stage in &cp.stages {
                     expected.push((stage.entry, "compute"));
                 }
             }
@@ -766,7 +766,7 @@ fn image_usage(graph: &Graph, name: &str) -> wgpu::TextureUsages {
             }
         }
     };
-    for pass in graph.passes {
+    for pass in &graph.passes {
         match pass {
             Pass::Compute(cp) => touch(cp.bindings, &mut u),
             Pass::Render(rp) => {
@@ -858,7 +858,7 @@ fn image_union_access(graph: &Graph, resource: &str) -> ImgAccess {
             }
         }
     };
-    for pass in graph.passes {
+    for pass in &graph.passes {
         match pass {
             Pass::Compute(cp) => scan(cp.bindings),
             Pass::Render(rp) => {
@@ -1256,7 +1256,10 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let renderer = Gfx::new(window.clone()).and_then(|gfx| Renderer::new(gfx, &app::GRAPH));
+        let renderer = Gfx::new(window.clone()).and_then(|gfx| {
+            let (w, h) = (gfx.config.width, gfx.config.height);
+            Renderer::new(gfx, &app::graph(w, h))
+        });
         match renderer {
             Ok(r) => {
                 self.window = Some(window);
@@ -1392,7 +1395,8 @@ fn main() -> Result<()> {
     // Headless: render a scripted scenario offscreen to a PNG and exit.
     if let Some(path) = args.screenshot.clone() {
         let gfx = Gfx::new_headless(args.width, args.height)?;
-        let mut renderer = Renderer::new(gfx, &app::GRAPH)?;
+        let (gw, gh) = (gfx.config.width, gfx.config.height);
+        let mut renderer = Renderer::new(gfx, &app::graph(gw, gh))?;
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
         return renderer.screenshot(&path, &cam, args.mods, args.time);

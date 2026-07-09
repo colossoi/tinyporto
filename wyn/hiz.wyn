@@ -9,10 +9,15 @@
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
 def OCC_TILE: i32 = 8    -- source pixels per coarse texel, per axis
-def OCC_W: i32 = 160     -- coarse grid = window (1280x800) / OCC_TILE
-def OCC_H: i32 = 100
 
 def clampi(v: i32, lo: i32, hi: i32) i32 = if v < lo then lo else if v > hi then hi else v
+
+def ceil_div(a: i32, b: i32) i32 = (a + b - 1) / b
+
+-- Coarse grid dimensions for a window: one texel per OCC_TILE^2 block, rounding up
+-- so a window whose size is not a multiple of OCC_TILE still gets full coverage.
+def occ_w(resolution: vec3f32) i32 = ceil_div(i32(resolution.x), OCC_TILE)
+def occ_h(resolution: vec3f32) i32 = ceil_div(i32(resolution.y), OCC_TILE)
 
 -- Project a clip-space point to (ndc depth, coarse tile x, tile y, in front of eye?).
 -- `tile` is the coarse-grid tile size in pixels. Behind the eye => not in front.
@@ -36,10 +41,12 @@ def occ_test(od: storage_image, clip: vec4f32, resolution: vec3f32) bool =
   let (ndcz, tx, ty, infront) = occ_tile(clip, resolution, OCC_TILE) in
   if !infront then false
   else
+    let ow = occ_w(resolution)
+    let oh = occ_h(resolution)
     let mo =
       loop mo = 0.0 for k < 9 do
-        let cx = clampi(tx + (k % 3 - 1), 0, OCC_W - 1)
-        let cy = clampi(ty + (k / 3 - 1), 0, OCC_H - 1)
+        let cx = clampi(tx + (k % 3 - 1), 0, ow - 1)
+        let cy = clampi(ty + (k / 3 - 1), 0, oh - 1)
         let v = image_load(od, @[cx, cy]).x in
         f32.max(mo, v)
       in

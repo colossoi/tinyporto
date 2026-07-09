@@ -25,9 +25,16 @@ const BRICK_COUNT: u64 = 36960; // running-bond grid cells = sett instances (BCO
 const TIDX_BYTES: u64 = TESS_CAP * 4;
 const PIDX_BYTES: u64 = POINTS_CAP * 4;
 const IIDX_BYTES: u64 = ITEMS_CAP * 4;
-// Coarse occlusion grid (Hi-Z simple): window (1280x800) / 8. `gtao_main`'s first
-// OCC_COUNT invocations reduce one coarse texel each.
-const OCC_COUNT: u64 = 160 * 100;
+// Coarse occlusion grid (Hi-Z simple): one texel per OCC_TILE^2 window block,
+// rounded up. `gtao_main`'s first occ_w*occ_h invocations reduce one texel each.
+// Must match OCC_TILE / occ_w / occ_h in wyn/hiz.wyn.
+const OCC_TILE: u32 = 8;
+const fn occ_w(w: u32) -> u32 {
+    w.div_ceil(OCC_TILE)
+}
+const fn occ_h(h: u32) -> u32 {
+    h.div_ceil(OCC_TILE)
+}
 // Wall-brick budget (must match walls.wyn: BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS =
 // N_WALL*PER_COURSE*COURSES + 128 + 8 = 8*13*24 + 136 = 2632).
 const WALL_BRICKS: u64 = 2632;
@@ -36,9 +43,6 @@ const WALL_BRICKS: u64 = 2632;
 // over, and the instanced prop draw runs over the same slot count.
 const PROP_COUNT: u64 = BRICK_COUNT + WALL_BRICKS;
 const PROPIDX_BYTES: u64 = PROP_COUNT * 4;
-// Window pixel count — the dispatch domain for `gtao_main`, sized from its
-// window-sized write image.
-const PXL_COUNT: u64 = 1280 * 800;
 // Input event stream: EV_CAP events (must match `step`'s EV_CAP in main.wyn), one
 // vec4f32 (16 bytes) each. The host zero-pads unused slots to None each frame.
 pub const EV_CAP: usize = 32;
@@ -56,15 +60,70 @@ const fn gtao_main_out(binding: u32) -> u64 {
     gtao_main_out_bytes(binding)
 }
 
-// Ordered compute stages per entry, dispatch sized from the seed counts. The
-// stage entry names and per-stage dispatch rules come from the descriptor (via
-// the generated `*_stages`); only the seed byte sizes are authored here.
-static FRAME_PREPARE_STAGES: [ComputeStage; FRAME_PREPARE_STAGE_COUNT] =
-    frame_prepare_stages(IIDX_BYTES, OCC_COUNT, PIDX_BYTES, PROPIDX_BYTES, TIDX_BYTES);
-static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_COUNT);
+// Ordered compute stages per entry, dispatch sized from the seed counts. The stage
+// entry names and per-stage dispatch rules come from the descriptor (via the
+// generated `*_stages`); only the seed sizes are authored here. The image-sized ones
+// take the live window, so nothing bakes a resolution.
+fn frame_prepare_stage_list(w: u32, h: u32) -> [ComputeStage; FRAME_PREPARE_STAGE_COUNT] {
+    let occ_pixels = (occ_w(w) as u64) * (occ_h(h) as u64);
+    frame_prepare_stages(IIDX_BYTES, occ_pixels, PIDX_BYTES, PROPIDX_BYTES, TIDX_BYTES)
+}
+fn gtao_main_stage_list(w: u32, h: u32) -> [ComputeStage; GTAO_MAIN_STAGE_COUNT] {
+    gtao_main_stages((w as u64) * (h as u64))
+}
 
-pub const GRAPH: Graph = Graph {
-    resources: &[
+// Draw lists, hoisted out of `graph` because a RenderItem reads the generated
+// binding-table statics and so cannot be const-promoted inside a function body.
+static SUN_SHADOW_ITEMS: [RenderItem; 1] = [RenderItem {
+    label: "brick_shadow",
+    module: "main",
+    vs: "brick_shadow_vertex",
+    fs: "shadow_fragment",
+    vs_bindings: BRICK_SHADOW_VERTEX_BINDINGS,
+    fs_bindings: SHADOW_FRAGMENT_BINDINGS,
+    draw_args: "shadow_args",
+    depth_write: true,
+}];
+
+static SCENE_ITEMS: [RenderItem; 2] = [
+    RenderItem {
+        label: "ground",
+        module: "main",
+        vs: "scene_vertex",
+        fs: "scene_fragment",
+        vs_bindings: SCENE_VERTEX_BINDINGS,
+        fs_bindings: SCENE_FRAGMENT_BINDINGS,
+        draw_args: "draw_args",
+        depth_write: true,
+    },
+    RenderItem {
+        label: "props",
+        module: "main",
+        vs: "prop_vertex",
+        fs: "prop_fragment",
+        vs_bindings: PROP_VERTEX_BINDINGS,
+        fs_bindings: PROP_FRAGMENT_BINDINGS,
+        draw_args: "prop_args",
+        depth_write: true,
+    },
+];
+
+static RESOLVE_ITEMS: [RenderItem; 1] = [RenderItem {
+    label: "resolve",
+    module: "main",
+    vs: "blit_vertex",
+    fs: "resolve_fragment",
+    vs_bindings: BLIT_VERTEX_BINDINGS,
+    fs_bindings: RESOLVE_FRAGMENT_BINDINGS,
+    draw_args: "blit_args",
+    depth_write: false,
+}];
+
+/// The frame graph for a `w` x `h` surface. Image extents and image-sized compute
+/// dispatches derive from it; no resolution is hardcoded here or in the shaders.
+pub fn graph(w: u32, h: u32) -> Graph {
+    Graph {
+    resources: vec![
         // Per-frame globals, one std140 uniform block (see `frame_globals` in
         // main.wyn). The driver fills each member by name at the descriptor's
         // offset; member order here is free.
@@ -197,7 +256,10 @@ pub const GRAPH: Graph = Graph {
         Resource::Image {
             name: "occ_depth",
             format: TexFormat::R32Float,
-            size: ImgSize::Fixed { w: 160, h: 100 },
+            size: ImgSize::Fixed {
+                w: occ_w(w),
+                h: occ_h(h),
+            },
             mips: 1,
         },
         // Sun shadow map: the `sun_shadow` pass writes light-space depth here (R32Float
@@ -289,14 +351,14 @@ pub const GRAPH: Graph = Graph {
         ("aw", "ao_work"),
     ],
 
-    passes: &[
+    passes: vec![
         // Logical frame preparation: advance persistent state, tessellate the
         // ground ribbon, and build visibility records for cobble/wall instances.
         Pass::Compute(ComputePass {
             label: "frame_prepare",
             module: "main",
             bindings: FRAME_PREPARE_BINDINGS,
-            stages: &FRAME_PREPARE_STAGES,
+            stages: frame_prepare_stage_list(w, h).to_vec(),
             out_bytes: frame_prepare_out,
         }),
         // Sun shadow map: rasterize the wall bricks through the sun's ortho light
@@ -311,16 +373,7 @@ pub const GRAPH: Graph = Graph {
                 format: Some(TexFormat::R32Float),
                 clear: [1.0, 1.0, 1.0, 1.0],
             }],
-            items: &[RenderItem {
-                label: "brick_shadow",
-                module: "main",
-                vs: "brick_shadow_vertex",
-                fs: "shadow_fragment",
-                vs_bindings: BRICK_SHADOW_VERTEX_BINDINGS,
-                fs_bindings: SHADOW_FRAGMENT_BINDINGS,
-                draw_args: "shadow_args",
-                depth_write: true,
-            }],
+            items: &SUN_SHADOW_ITEMS,
         }),
         // Scene: the flat ground (materialized ribbon), then one instanced draw over
         // every prop — cobble setts and wall blocks. Both depth-tested; the props
@@ -348,38 +401,17 @@ pub const GRAPH: Graph = Graph {
                     clear: [1.0, 1.0, 1.0, 1.0],
                 },
             ],
-            items: &[
-                RenderItem {
-                    label: "ground",
-                    module: "main",
-                    vs: "scene_vertex",
-                    fs: "scene_fragment",
-                    vs_bindings: SCENE_VERTEX_BINDINGS,
-                    fs_bindings: SCENE_FRAGMENT_BINDINGS,
-                    draw_args: "draw_args",
-                    depth_write: true,
-                },
-                RenderItem {
-                    label: "props",
-                    module: "main",
-                    vs: "prop_vertex",
-                    fs: "prop_fragment",
-                    vs_bindings: PROP_VERTEX_BINDINGS,
-                    fs_bindings: PROP_FRAGMENT_BINDINGS,
-                    draw_args: "prop_args",
-                    depth_write: true,
-                },
-            ],
+            items: &SCENE_ITEMS,
         }),
         // GTAO + Hi-Z reduce: one pass over the scene depth written above. Every
-        // invocation integrates horizon AO into ao_work; the first OCC_COUNT also min
+        // invocation integrates horizon AO into ao_work; the first occ_w*occ_h also min
         // their coarse occ_depth tile, which `cull` reads next frame. Runs before the
         // resolve, which reads ao_work and folds the edge-aware denoise into shading.
         Pass::Compute(ComputePass {
             label: "gtao_main",
             module: "main",
             bindings: GTAO_MAIN_BINDINGS,
-            stages: &GTAO_MAIN_STAGES,
+            stages: gtao_main_stage_list(w, h).to_vec(),
             out_bytes: gtao_main_out,
         }),
         // Deferred resolve: one fullscreen triangle whose fragment reads the G-buffer,
@@ -394,16 +426,8 @@ pub const GRAPH: Graph = Graph {
                 format: None,
                 clear: [0.74, 0.80, 0.86, 1.0],
             }],
-            items: &[RenderItem {
-                label: "resolve",
-                module: "main",
-                vs: "blit_vertex",
-                fs: "resolve_fragment",
-                vs_bindings: BLIT_VERTEX_BINDINGS,
-                fs_bindings: RESOLVE_FRAGMENT_BINDINGS,
-                draw_args: "blit_args",
-                depth_write: false,
-            }],
+            items: &RESOLVE_ITEMS,
         }),
     ],
-};
+    }
+}

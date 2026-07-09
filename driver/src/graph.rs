@@ -209,12 +209,15 @@ pub struct ComputeStage {
 /// A compute pass: its generated binding table, the ordered stages it lowers to
 /// (each with its own dispatch), and the generated size calc for its output
 /// bindings (used to derive the byte sizes of buffers this pass writes).
-#[derive(Clone, Copy, Debug)]
+///
+/// `stages` is owned because image-sized dispatches depend on the window size,
+/// which is only known once the surface exists (see `app::graph`).
+#[derive(Clone, Debug)]
 pub struct ComputePass {
     pub label: &'static str,
     pub module: &'static str,
     pub bindings: BindTable,
-    pub stages: &'static [ComputeStage],
+    pub stages: Vec<ComputeStage>,
     pub out_bytes: fn(u32) -> u64,
 }
 
@@ -259,7 +262,7 @@ pub struct RenderPass {
     pub items: &'static [RenderItem],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Pass {
     Compute(ComputePass),
     Render(RenderPass),
@@ -268,9 +271,12 @@ pub enum Pass {
 /// The whole application as data. `names` maps each shader binding name (from the
 /// generated tables) to a resource name — the only binding info still authored by
 /// hand, and purely semantic (no set/binding numbers or types).
-#[derive(Clone, Copy, Debug)]
+///
+/// Built once per run against the actual surface size (see `app::graph`): image
+/// extents and image-sized compute dispatches both derive from it.
+#[derive(Clone, Debug)]
 pub struct Graph {
-    pub resources: &'static [Resource],
-    pub passes: &'static [Pass],
+    pub resources: Vec<Resource>,
+    pub passes: Vec<Pass>,
     pub names: &'static [(&'static str, &'static str)],
 }
