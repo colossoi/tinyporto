@@ -27,14 +27,6 @@ def CELLZ: f32 = 0.175      -- cross-row pitch (short axis + a tight joint)
 def BCOLS: i32 = 168
 def BROWS: i32 = 220
 
-type sett_inst = { center: vec2f32, height: f32, roundfrac: f32 }
-
-def pack_sett_inst(s: sett_inst) vec4f32 =
-  @[s.center.x, s.center.y, s.height, s.roundfrac]
-
-def sett_inst_from_packed(v: vec4f32) sett_inst =
-  { center = @[v.x, v.y], height = v.z, roundfrac = v.w }
-
 -- World-space (x,z) center of sett i. Odd rows shift half a cell (running bond).
 def brick_center(i: i32) vec2f32 =
   let col = i % BCOLS in
@@ -108,6 +100,29 @@ def sett_orient(p: vec3f32, r: vec3f32, u: vec3f32, f: vec3f32) vec3f32 =
 
 def sett_unorient(p: vec3f32, r: vec3f32, u: vec3f32, f: vec3f32) vec3f32 =
   @[dot(p, r), dot(p, u), dot(p, f)]
+
+-- One instanced prop: a rounded box, fully self-describing. Cobble setts and wall
+-- bricks/quoins/grout all reduce to this, so a single vertex/fragment pair places
+-- and sphere-traces every one of them. The generator (`frame_prepare`) resolves each
+-- candidate's placement, orientation, roundness and colour once; the draw does no
+-- per-kind work. A dead (culled) slot is marked center.y <= 0 and collapses to a
+-- degenerate vertex.
+type prop = {
+  center: vec3f32,     -- box centre, world
+  radius: f32,         -- corner radius (<= min half extent)
+  half: vec3f32,       -- half extents, box-local
+  right: vec3f32,      -- orthonormal basis: box-local x, y, z in world
+  up: vec3f32,
+  fwd: vec3f32,
+  albedo: vec3f32,
+}
+
+-- A yaw about +Y as the same orthonormal basis a tilted sett carries, so a wall
+-- brick and a cobble share one orient/unorient path.
+def yaw_basis(yaw: f32) (vec3f32, vec3f32, vec3f32) =
+  let cw = f32.cos(yaw)
+  let sw = f32.sin(yaw) in
+  (@[cw, 0.0, sw], @[0.0, 1.0, 0.0], @[0.0 - sw, 0.0, cw])
 
 -- Unit proxy box for a sett: x,z in [-0.5,0.5], y in [0,1] (scaled per instance).
 -- 6 faces x 2 tris x 3 verts = 36, non-indexed. Every triangle is wound CCW as

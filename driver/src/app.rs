@@ -8,10 +8,10 @@
 
 use crate::generated::{
     frame_prepare_out_bytes, frame_prepare_stages, gtao_main_out_bytes, gtao_main_stages,
-    BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS,
-    BRICK_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS, FRAME_PREPARE_STAGE_COUNT, GTAO_MAIN_BINDINGS,
-    GTAO_MAIN_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
-    SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
+    BLIT_VERTEX_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS,
+    FRAME_PREPARE_STAGE_COUNT, GTAO_MAIN_BINDINGS, GTAO_MAIN_STAGE_COUNT, PROP_FRAGMENT_BINDINGS,
+    PROP_VERTEX_BINDINGS, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
+    SCENE_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
 };
 use crate::graph::*;
 
@@ -25,15 +25,17 @@ const BRICK_COUNT: u64 = 36960; // running-bond grid cells = sett instances (BCO
 const TIDX_BYTES: u64 = TESS_CAP * 4;
 const PIDX_BYTES: u64 = POINTS_CAP * 4;
 const IIDX_BYTES: u64 = ITEMS_CAP * 4;
-const BIDX_BYTES: u64 = BRICK_COUNT * 4;
 // Coarse occlusion grid (Hi-Z simple): window (1280x800) / 8. `gtao_main`'s first
 // OCC_COUNT invocations reduce one coarse texel each.
 const OCC_COUNT: u64 = 160 * 100;
 // Wall-brick budget (must match walls.wyn: BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS =
-// N_WALL*PER_COURSE*COURSES + 128 + 8 = 8*13*24 + 136 = 2632). `wbidx` is the iota
-// domain the `walls` generator maps over (one slot per candidate block).
+// N_WALL*PER_COURSE*COURSES + 128 + 8 = 8*13*24 + 136 = 2632).
 const WALL_BRICKS: u64 = 2632;
-const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
+// The prop domain: cobble setts first, then the wall blocks (must match main.wyn's
+// PROP_SETTS / PROP_WALLS split). `propidx` is the one iota the prop generator maps
+// over, and the instanced prop draw runs over the same slot count.
+const PROP_COUNT: u64 = BRICK_COUNT + WALL_BRICKS;
+const PROPIDX_BYTES: u64 = PROP_COUNT * 4;
 // Window pixel count — the dispatch domain for `gtao_main`, sized from its
 // window-sized write image.
 const PXL_COUNT: u64 = 1280 * 800;
@@ -42,10 +44,10 @@ const PXL_COUNT: u64 = 1280 * 800;
 pub const EV_CAP: usize = 32;
 const EVENTS_BYTES: u64 = EV_CAP as u64 * 16;
 
-// Logical frame preparation advances state, builds ground geometry, and emits
-// visibility records for both cobble setts and wall bricks.
+// Logical frame preparation advances state, builds ground geometry, and emits one
+// visibility record per prop (cobble setts and wall blocks alike).
 const fn frame_prepare_out(binding: u32) -> u64 {
-    frame_prepare_out_bytes(binding, BIDX_BYTES, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES)
+    frame_prepare_out_bytes(binding, IIDX_BYTES, PIDX_BYTES, PROPIDX_BYTES, TIDX_BYTES)
 }
 
 // The GTAO pass writes only images (ao_work / occ_depth) — no sized buffer
@@ -58,7 +60,7 @@ const fn gtao_main_out(binding: u32) -> u64 {
 // stage entry names and per-stage dispatch rules come from the descriptor (via
 // the generated `*_stages`); only the seed byte sizes are authored here.
 static FRAME_PREPARE_STAGES: [ComputeStage; FRAME_PREPARE_STAGE_COUNT] =
-    frame_prepare_stages(BIDX_BYTES, IIDX_BYTES, OCC_COUNT, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES);
+    frame_prepare_stages(IIDX_BYTES, OCC_COUNT, PIDX_BYTES, PROPIDX_BYTES, TIDX_BYTES);
 static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_COUNT);
 
 pub const GRAPH: Graph = Graph {
@@ -143,14 +145,15 @@ pub const GRAPH: Graph = Graph {
             init: BufInit::Iota,
             indirect: false,
         }),
+        // The prop iota: one slot per cobble sett, then one per wall block.
         Resource::Buffer(BufferDef {
-            name: "bidx",
-            size: Some(BIDX_BYTES),
+            name: "propidx",
+            size: Some(PROPIDX_BYTES),
             init: BufInit::Iota,
             indirect: false,
         }),
         // Derived `step` outputs: ground geometry (two parallel (pos,kind)/(nrm,attr)
-        // streams) + its draw args; the per-instance sett records + their draw args.
+        // streams) + its draw args; the per-instance prop records + their draw args.
         Resource::Buffer(BufferDef {
             name: "geom_pos",
             size: None,
@@ -170,13 +173,13 @@ pub const GRAPH: Graph = Graph {
             indirect: true,
         }),
         Resource::Buffer(BufferDef {
-            name: "sett_inst",
+            name: "prop_inst",
             size: None,
             init: BufInit::Zeroed,
             indirect: false,
         }),
         Resource::Buffer(BufferDef {
-            name: "sett_args",
+            name: "prop_args",
             size: None,
             init: BufInit::Zeroed,
             indirect: true,
@@ -235,27 +238,6 @@ pub const GRAPH: Graph = Graph {
             init: BufInit::U32s(&[3, 1, 0, 0]),
             indirect: true,
         }),
-        // Brick buildings: `wbidx` is the candidate-brick iota; `walls` compacts the
-        // visible bricks into wall_brick_inst and writes wall_brick_args (its live
-        // instance count). Bricks are drawn into the G-buffer as real occluders.
-        Resource::Buffer(BufferDef {
-            name: "wbidx",
-            size: Some(WBIDX_BYTES),
-            init: BufInit::Iota,
-            indirect: false,
-        }),
-        Resource::Buffer(BufferDef {
-            name: "wall_brick_inst",
-            size: None,
-            init: BufInit::Zeroed,
-            indirect: false,
-        }),
-        Resource::Buffer(BufferDef {
-            name: "wall_brick_args",
-            size: None,
-            init: BufInit::Zeroed,
-            indirect: true,
-        }),
         // Shadow caster draws every candidate slot (brick_shadow_vertex regenerates each
         // from its index, camera-independent); dead slots self-cull. Static draw args:
         // 36 verts x WALL_BRICKS instances.
@@ -273,7 +255,7 @@ pub const GRAPH: Graph = Graph {
         ("tidx", "tidx"),
         ("pidx", "pidx"),
         ("iidx", "iidx"),
-        ("bidx", "bidx"),
+        ("propidx", "propidx"),
         ("uistate_in", "uistate"),
         ("points_in", "points"),
         ("items_in", "items"),
@@ -287,11 +269,12 @@ pub const GRAPH: Graph = Graph {
         ("frame_prepare_output_4", "geom_pos"),
         ("frame_prepare_output_5", "geom_nrm"),
         ("frame_prepare_output_6", "draw_args"),
-        ("frame_prepare_output_7", "sett_inst"),
-        ("frame_prepare_output_8", "sett_args"),
+        ("frame_prepare_output_7", "prop_inst"),
+        ("frame_prepare_output_8", "prop_args"),
         ("geom_pos", "geom_pos"),
         ("geom_nrm", "geom_nrm"),
-        ("sett_inst", "sett_inst"),
+        // The one instanced prop stream, read by both stages of the prop draw.
+        ("prop_inst", "prop_inst"),
         // Hi-Z occlusion image views (`sd`/`od` are the shader param names).
         ("od", "occ_depth"),
         ("sd", "scene_depth"),
@@ -304,11 +287,6 @@ pub const GRAPH: Graph = Graph {
         // GTAO view: ao_work (gtao_main writes `aw`, `resolve_fragment` samples `aw`
         // and denoises inline).
         ("aw", "ao_work"),
-        // Brick generator I/O + the instanced brick draw.
-        ("wbidx", "wbidx"),
-        ("frame_prepare_output_9", "wall_brick_inst"),
-        ("frame_prepare_output_10", "wall_brick_args"),
-        ("wall_brick_inst", "wall_brick_inst"),
     ],
 
     passes: &[
@@ -344,8 +322,9 @@ pub const GRAPH: Graph = Graph {
                 depth_write: true,
             }],
         }),
-        // Scene: the flat ground (materialized ribbon), then the instanced cobble
-        // setts. Both depth-tested; the setts protrude and self-occlude.
+        // Scene: the flat ground (materialized ribbon), then one instanced draw over
+        // every prop — cobble setts and wall blocks. Both depth-tested; the props
+        // protrude and self-occlude, and the wall blocks occlude the setts.
         Pass::Render(RenderPass {
             label: "scene",
             depth: Some("depth"),
@@ -381,23 +360,13 @@ pub const GRAPH: Graph = Graph {
                     depth_write: true,
                 },
                 RenderItem {
-                    label: "setts",
+                    label: "props",
                     module: "main",
-                    vs: "sett_vertex",
-                    fs: "sett_fragment",
-                    vs_bindings: SETT_VERTEX_BINDINGS,
-                    fs_bindings: SETT_FRAGMENT_BINDINGS,
-                    draw_args: "sett_args",
-                    depth_write: true,
-                },
-                RenderItem {
-                    label: "bricks",
-                    module: "main",
-                    vs: "brick_vertex",
-                    fs: "brick_fragment",
-                    vs_bindings: BRICK_VERTEX_BINDINGS,
-                    fs_bindings: BRICK_FRAGMENT_BINDINGS,
-                    draw_args: "wall_brick_args",
+                    vs: "prop_vertex",
+                    fs: "prop_fragment",
+                    vs_bindings: PROP_VERTEX_BINDINGS,
+                    fs_bindings: PROP_FRAGMENT_BINDINGS,
+                    draw_args: "prop_args",
                     depth_write: true,
                 },
             ],

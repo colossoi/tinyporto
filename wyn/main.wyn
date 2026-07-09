@@ -103,8 +103,7 @@ type frame_domains = {
   ground: []u32,
   points: []u32,
   items: []u32,
-  setts: []u32,
-  walls: []u32,
+  props: []u32,
 }
 
 -- Images that are intentionally read as history. `occ_depth` is produced after the
@@ -122,14 +121,11 @@ type scene_geometry = {
 }
 
 type visibility = {
-  sett_inst: []vec4f32,
-  sett_args: [4]u32,
-  wall_inst: []block,
-  wall_args: [4]u32,
+  prop_inst: []prop,
+  prop_args: [4]u32,
 }
 
-type sett_visibility = { inst: []vec4f32, args: [4]u32 }
-type wall_visibility = { inst: []block, args: [4]u32 }
+type prop_visibility = { inst: []prop, args: [4]u32 }
 
 type frame_state_scene = {
   world: world,
@@ -294,16 +290,23 @@ resource sun_depth: image2d {
 resource ao_work: image2d { format = rgba16float  size = window  usages = [storage_write, sampled] }
 
 ------------------------------------------------------------
--- Cull (Nine's simple path). One record per running-bond cell is built, then
--- `filter` keeps only the visible ones (in the cobble region, the view frustum,
--- AND not occluded) and COMPACTS them — so the instanced draw runs over the live
--- count, not the whole grid. The fused `filter` is one compute pipeline; it emits
--- the compacted records plus a scratch count, and we hand back draw args built
--- from `length`. Output 0 = compacted sett_inst, output 1 = sett_args.
+-- Cull (Nine's simple path). Every prop candidate — cobble setts first, then wall
+-- bricks/quoins/grout — is resolved into one `prop` record: placement, orientation,
+-- roundness, colour, and a visibility verdict. Culled slots are marked center.y <= 0
+-- and collapse to a degenerate vertex in the draw. `filter` will later COMPACT the
+-- live ones so the instanced draw runs over the live count rather than the whole
+-- domain. Output 0 = prop_inst, output 1 = prop_args.
 ------------------------------------------------------------
 
-def sett_candidate(frame: frame_globals, sc: painted,
-                   od: storage_image, i: i32) sett_inst =
+-- The prop domain: the running-bond sett grid, then the wall-brick slots.
+def PROP_SETTS: i32 = BCOLS * BROWS
+def PROP_WALLS: i32 = BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS
+def PROP_SLOTS: i32 = PROP_SETTS + PROP_WALLS
+
+-- One cobble sett. Its orientation is a random tilt basis and its colour three
+-- independent hashes, both keyed on the stable world centre (NOT the instance
+-- index, which reorders as culling changes), so a sett's look stays put.
+def sett_prop(frame: frame_globals, sc: painted, od: storage_image, i: i32) prop =
   let base = brick_center(i)
   -- No along-row (x) jitter: setts sit on the exact cell x so the clamped along-row
   -- half-extent (sett_hx) can guarantee they never overlap along their length. A
@@ -322,34 +325,67 @@ def sett_candidate(frame: frame_globals, sc: painted,
   let in_water = water_sdf(center, sc.items, sc.points) < 0.08
   let keep = visible && (!occluded) && (!in_water)
   let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
+  let ss = sett_scale(center.x, center.y)
+  let (right, up, fwd) = sett_basis(center.x, center.y)
+  let half = @[sett_hx(ss), height * 0.5, BRICK_L * 0.5 * ss]
   -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
-  let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919) in
-  { center = center, height = height, roundfrac = roundfrac }
+  let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919)
+  let radius = roundfrac * f32.min(half.x, f32.min(half.y, half.z))
+  -- Colour from three independent hashes: hue (warm greige <-> cool blue-grey),
+  -- saturation (mute toward grey <-> enrich the undertone), and lightness. Skewed a
+  -- touch dark (mean < 1) so the brightest setts don't blow out through the tonemap.
+  let seed = sett_seed(center.x, center.y)
+  let hued = mix(COBBLE_WARM, COBBLE_COOL, brick_hash(seed + 17))
+  let g = (hued.x + hued.y + hued.z) * 0.3333
+  let sat = 0.7 + 0.8 * brick_hash(seed + 29)
+  let albedo = mix(v3(g), hued, sat) * v3(0.5 + 0.9 * sett_var(center.x, center.y)) in
+  { center = @[center.x, height * 0.5, center.y], radius = radius, half = half,
+    right = right, up = up, fwd = fwd, albedo = albedo }
 
--- Keep-predicate for a candidate sett. Not yet wired: `cull` currently emits every
--- candidate (culled ones as degenerate height=0 records) rather than compacting.
+-- One wall block. Blocks carry their own half-extents and a yaw; a tiny corner
+-- radius keeps the edges crisp (just enough to catch a highlight). `kind` (0 brick,
+-- 1 quoin, 2 grout) only selects colour, so it is resolved here and not carried.
+def wall_prop(frame: frame_globals, i: i32) prop =
+  let brk = wall_brick(i)
+  let center = brk.center
+  let o = cam(frame)
+  let visible = center.y > 0.0 && frustum_keep(center, magnitude(brk.half), frame.resolution, o)
+  let (right, up, fwd) = yaw_basis(brk.yaw)
+  let kind = f32(brk.kind)
+  -- Tone seeds from the stable, baked centre — bricks mix two fired-clay tones by a
+  -- position hash; quoins are pale limestone with only a faint lightness wobble.
+  let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0))
+  let hue = brick_hash(i32(center.x * 97.0 + center.z * 57.0 + center.y * 181.0 + 10000.0))
+  let albedo = if kind > 1.5 then GROUT_COLOR
+               else if kind > 0.5 then QUOIN_COLOR * v3(0.90 + 0.16 * cv)
+               else mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * cv)
+  let c = if visible then center else @[center.x, 0.0 - 1.0, center.z] in
+  { center = c, radius = 0.004, half = brk.half,
+    right = right, up = up, fwd = fwd, albedo = albedo }
+
+def prop_candidate(frame: frame_globals, sc: painted, od: storage_image, i: i32) prop =
+  if i < PROP_SETTS then sett_prop(frame, sc, od, i)
+  else wall_prop(frame, i - PROP_SETTS)
+
+-- Keep-predicate for a candidate prop. Not yet wired: `cull` currently emits every
+-- candidate (culled ones as degenerate center.y <= 0 records) rather than compacting.
 -- This becomes the `filter` predicate when the compaction slice (PR 4) lands.
-def sett_visible(s: sett_inst) bool =
-  s.height > 0.0
+def prop_visible(p: prop) bool =
+  p.center.y > 0.0
 
-def sett_draw_args(n: i32) [4]u32 =
+def prop_draw_args(n: i32) [4]u32 =
   [36u32, u32(n), 0u32, 0u32]
 
-def build_visibility_setts(bidx: []u32, sc: painted,
+def build_visibility_props(propidx: []u32, sc: painted,
                            frame: frame_globals, od: storage_image)
-  ([]vec4f32, [4]u32) =
-  let cand =
-    map(|s|
-      let i = i32(s)
-      let inst = sett_candidate(frame, sc, od, i) in
-      pack_sett_inst(inst)
-      , bidx) in
-  (cand, sett_draw_args(BCOLS * BROWS))
+  ([]prop, [4]u32) =
+  let cand = map(|s| prop_candidate(frame, sc, od, i32(s)), propidx) in
+  (cand, prop_draw_args(PROP_SLOTS))
 
-def frame_sett_visibility_slice(sc: painted, frame: frame_globals,
+def frame_prop_visibility_slice(sc: painted, frame: frame_globals,
                                 history: frame_history, domains: frame_domains)
-  sett_visibility =
-  let (inst, args) = build_visibility_setts(domains.setts, sc, frame, history.occ_depth) in
+  prop_visibility =
+  let (inst, args) = build_visibility_props(domains.props, sc, frame, history.occ_depth) in
   { inst = inst, args = args }
 
 -- Coarse-depth reduction: mins the OCC_TILE^2 block of scene_depth under one
@@ -428,158 +464,98 @@ entry scene_fragment(#[varying(0)] kind: f32, #[varying(1)] attr: f32,
   (@[surf.x, surf.y, surf.z, 1.0], @[nrm.x, nrm.y, nrm.z, 1.0], fc.z)
 
 ------------------------------------------------------------
--- Cobble setts: instanced proxy boxes (Tiny-Glade "tons of tiny instances").
--- `cull` frustum-culls the running-bond cells and COMPACTS the visible ones into
--- sett_inst (center, height, roundfrac); the instanced draw runs over that live
--- count, so every instance reaching this vertex is visible. This vertex places one
--- proxy box per instance, scaled by the instance's random height. The fragment
--- sphere-traces a rounded box of `roundfrac` inside the proxy so the silhouette
--- rounds per instance; the proxy's outer extent IS the rounded box's, so the trace
--- starts on the proxy's front face.
+-- Props: instanced proxy boxes (Tiny-Glade "tons of tiny instances"). Cobble setts
+-- and wall bricks/quoins/grout are one stream of `prop` records, so ONE vertex +
+-- fragment pair draws them all. `cull` resolves each candidate's placement,
+-- orientation, roundness and colour; culled slots arrive with center.y <= 0 and
+-- collapse to a degenerate vertex. The vertex places the proxy box; the fragment
+-- sphere-traces the rounded box inside it, so the silhouette rounds per instance.
+-- The proxy's outer extent IS the rounded box's, so the trace starts on its front
+-- face. The wall blocks are real occluders for the cobbles.
 ------------------------------------------------------------
 
+-- Box-local proxy corner -> world, using the instance's own basis and half-extents.
+-- `box_pos` has y in [0,1]; centring it (y - 0.5) makes the box tilt about its middle.
+def prop_world(p: prop, local: vec3f32) vec3f32 =
+  let lc = @[local.x * (p.half.x * 2.0),
+             (local.y - 0.5) * (p.half.y * 2.0),
+             local.z * (p.half.z * 2.0)] in
+  p.center + sett_orient(lc, p.right, p.up, p.fwd)
+
 #[vertex]
-entry sett_vertex(#[builtin(vertex_index)] vid: i32,
+entry prop_vertex(#[builtin(vertex_index)] vid: i32,
                   #[builtin(instance_index)] iid: i32,
                   #[uniform(set=1, binding=0)] frame: frame_globals,
-                  #[storage(set=1, binding=10, access=read)] sett_inst: []vec4f32)
-  (#[builtin(position)] vec4f32, #[varying(0)] vec3f32, #[varying(1)] vec4f32,
-   #[varying(2)] f32) =
-  let inst = sett_inst_from_packed(sett_inst[iid])
-  let center = inst.center
-  let height = inst.height
-  -- Per-sett orientation (random-tilt basis) + footprint scale, keyed on the stable
-  -- centre. Cobbles are irregular: varied size, leaning in random directions.
-  let (right, up, fwd) = sett_basis(center.x, center.y)
-  let sc = sett_scale(center.x, center.y)
-  let local = box_pos[vid]
-  -- Centre the proxy box (y in [-h/2, h/2]) so it tilts about its middle. The along-
-  -- row (x) half is clamped (sett_hx) so setts never overlap along their length.
-  let lc = @[local.x * (sett_hx(sc) * 2.0), (local.y - 0.5) * height, local.z * BRICK_L * sc]
-  let bcenter = @[center.x, height * 0.5, center.y]
-  let world = bcenter + sett_orient(lc, right, up, fwd) in
-  if height <= 0.0 then
-    (@[2.0, 2.0, 2.0, 1.0], world, pack_sett_inst(inst), sett_var(center.x, center.y))
-  else
-    (world_to_clip(world, frame.resolution, cam(frame)), world, pack_sett_inst(inst), sett_var(center.x, center.y))
+                  #[storage(set=1, binding=10, access=read)] prop_inst: []prop)
+  (#[builtin(position)] vec4f32, #[varying(0)] vec3f32, #[varying(1)] f32) =
+  let p = prop_inst[iid]
+  let world = prop_world(p, box_pos[vid]) in
+  -- `iid` rides through as a varying: it is constant across the primitive, so any
+  -- interpolation returns it unchanged, and the fragment re-reads the instance
+  -- instead of carrying its whole record through the rasterizer.
+  if p.center.y <= 0.0 then (@[2.0, 2.0, 2.0, 1.0], world, f32(iid))
+  else (world_to_clip(world, frame.resolution, cam(frame)), world, f32(iid))
 
--- Sphere-trace the rounded box for this instance from the proxy front face. On a
--- hit, shade from the SDF normal and write the hit's true depth; on a miss (the
--- ray grazes a rounded-off corner) push frag_depth to the far plane so the
--- already-drawn ground wins the LessEqual depth test — that carves the silhouette.
+-- Sphere-trace this instance's rounded box from the proxy's front face. On a hit,
+-- shade from the SDF normal and write the hit's true depth; on a miss (the ray
+-- grazes a rounded-off corner) push frag_depth to the far plane so the already-drawn
+-- ground wins the LessEqual depth test — that carves the silhouette.
 #[fragment]
-entry sett_fragment(#[varying(0)] world: vec3f32, #[varying(1)] inst: vec4f32,
-                    #[varying(2)] var: f32,
-                    #[uniform(set=1, binding=0)] frame: frame_globals)
-  (#[target(g_albedo)] vec4f32, #[target(g_normal)] vec4f32, #[target(scene_depth)] f32, #[builtin(frag_depth)] f32) =
-  let sinst = sett_inst_from_packed(inst)
-  let center = sinst.center
-  let height = sinst.height
-  let bcenter = @[center.x, height * 0.5, center.y]
-  -- Same stable per-sett scale + orientation basis as the vertex, so the traced
-  -- box matches the proxy. Roundness is `roundfrac` of the min half-extent.
-  let sc = sett_scale(center.x, center.y)
-  let (right, up, fwd) = sett_basis(center.x, center.y)
-  let half = @[sett_hx(sc), height * 0.5, BRICK_L * 0.5 * sc]
-  let r = sinst.roundfrac * f32.min(half.x, f32.min(half.y, half.z))
-  let b = @[half.x - r, half.y - r, half.z - r]
-  -- Trace in box-local space: project the world offset onto the sett's basis.
+entry prop_fragment(#[varying(0)] world: vec3f32, #[varying(1)] iidf: f32,
+                    #[uniform(set=1, binding=0)] frame: frame_globals,
+                    #[storage(set=1, binding=10, access=read)] prop_inst: []prop)
+  (#[target(g_albedo)] vec4f32, #[target(g_normal)] vec4f32, #[target(scene_depth)] f32,
+   #[builtin(frag_depth)] f32) =
+  let p = prop_inst[i32(iidf + 0.5)]
+  let r = p.radius
+  let b = @[p.half.x - r, p.half.y - r, p.half.z - r]
+  -- Trace in box-local space: project the world offset onto the instance's basis.
   let rd = normalize(world - cam_eye(cam(frame)))
   let (t, hit) =
-    loop (t, hit) = (0.0, false) for _i < 16 do
+    loop (t, hit) = (0.0, false) for _i < 24 do
       if hit then (t, hit)
       else
-        let rel = (world + rd * t) - bcenter
-        let pl = sett_unorient(rel, right, up, fwd)
+        let rel = (world + rd * t) - p.center
+        let pl = sett_unorient(rel, p.right, p.up, p.fwd)
         let d = sd_round_box(pl, b, r) in
         if d < 0.0004 then (t, true) else (t + d, false)
   let pos = world + rd * t in
   if hit then
-    let rel = pos - bcenter
-    let pl = sett_unorient(rel, right, up, fwd)
+    let rel = pos - p.center
+    let pl = sett_unorient(rel, p.right, p.up, p.fwd)
     let nl = round_normal(pl, b, r)
-    let n = sett_orient(nl, right, up, fwd)
+    let n = sett_orient(nl, p.right, p.up, p.fwd)
     let clip = world_to_clip(pos, frame.resolution, cam(frame))
-    -- Per-sett colour from three independent hashes on the stable centre: hue (warm
-    -- greige <-> cool blue-grey), saturation (mute toward grey <-> enrich the undertone),
-    -- and lightness (`var`). Independent axes keep the field from reading uniform.
-    let seed = sett_seed(center.x, center.y)
-    let hued = mix(COBBLE_WARM, COBBLE_COOL, brick_hash(seed + 17))
-    let g = (hued.x + hued.y + hued.z) * 0.3333
-    let sat = 0.7 + 0.8 * brick_hash(seed + 29)          -- <1 mutes to grey, >1 enriches
-    -- Wide per-sett lightness (~2.8:1) so it reads through the sun + tonemap; skewed
-    -- a touch dark (mean < 1) so the brightest setts don't blow out to white.
-    let alb = mix(v3(g), hued, sat) * v3(0.5 + 0.9 * var)
     let d = clip.z / clip.w in
     -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
-    (@[alb.x, alb.y, alb.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)
+    (@[p.albedo.x, p.albedo.y, p.albedo.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)
   else
     -- Miss: invalid (a=0) so the resolve treats it as sky; depth to the far plane
     -- so the already-drawn ground wins the LessEqual depth test.
     (@[0.0, 0.0, 0.0, 0.0], @[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
 
-------------------------------------------------------------
--- Brick buildings. `walls` is Nine's simple path again, applied to wall bricks:
--- one candidate brick per grid slot (see walls.wyn for the running-bond layout),
--- filtered to the visible ones (alive, in frustum, not occluded) and compacted, so
--- the instanced draw runs over the live count. `brick_vertex`/`brick_fragment`
--- raymarch each brick as a yawed rounded box into the G-buffer — the same six-tri
--- last-LOD as the setts. These bricks are real occluders for the cobbles.
-------------------------------------------------------------
-
-def wall_candidate(frame: frame_globals, i: i32) block =
-  let brk = wall_brick(i)
-  let center = brk.center
-  let o = cam(frame)
-  let visible = center.y > 0.0 && frustum_keep(center, magnitude(brk.half), frame.resolution, o) in
-  if visible then brk
-  else { center = @[center.x, 0.0 - 1.0, center.z], yaw = brk.yaw, kind = brk.kind, half = brk.half }
-
--- Keep-predicate for a candidate wall brick (mirrors sett_visible). Not yet wired:
--- `walls` emits every brick, culled ones sunk to y = -1 (off-plate). Becomes the
--- `filter` predicate when wall compaction (PR 4) lands.
-def wall_visible(b: block) bool =
-  b.center.y > 0.0
-
-def wall_draw_args(n: i32) [4]u32 =
-  [36u32, u32(n), 0u32, 0u32]
-
-def build_visibility_walls(wbidx: []u32, frame: frame_globals) ([]block, [4]u32) =
-  let cand =
-    map(|s|
-      wall_candidate(frame, i32(s))
-      , wbidx) in
-  (cand, wall_draw_args(BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS))
-
-def frame_wall_visibility_slice(frame: frame_globals, domains: frame_domains)
-  wall_visibility =
-  let (inst, args) = build_visibility_walls(domains.walls, frame) in
-  { inst = inst, args = args }
-
 def frame_visibility_slice(sc: painted, frame: frame_globals,
                            history: frame_history, domains: frame_domains)
   visibility =
-  let setts = frame_sett_visibility_slice(sc, frame, history, domains)
-  let walls = frame_wall_visibility_slice(frame, domains) in
-  { sett_inst = setts.inst, sett_args = setts.args,
-    wall_inst = walls.inst, wall_args = walls.args }
+  let props = frame_prop_visibility_slice(sc, frame, history, domains) in
+  { prop_inst = props.inst, prop_args = props.args }
 
 #[compute]
-entry frame_prepare(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32, wbidx: []u32,
+entry frame_prepare(tidx: []u32, pidx: []u32, iidx: []u32, propidx: []u32,
                     uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
                     events: []vec4f32,
                     #[uniform(set=1, binding=0)] frame: frame_globals,
                     #[view(occ_depth, storage_read)] od: storage_image)
   ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32,
-   []vec4f32, [4]u32, []block, [4]u32) =
+   []prop, [4]u32) =
   let w = { ui = uistate_in, points = points_in, items = items_in, head = head_in }
-  let domains = { ground = tidx, points = pidx, items = iidx, setts = bidx, walls = wbidx }
+  let domains = { ground = tidx, points = pidx, items = iidx, props = propidx }
   let state_scene = frame_state_scene_slice(frame, events, w, domains)
   let sc = { points = points_in, items = items_in }
   let vis = frame_visibility_slice(sc, frame, { occ_depth = od }, domains) in
   (state_scene.world.ui, state_scene.world.points, state_scene.world.items, state_scene.world.head,
    state_scene.scene.geom_pos, state_scene.scene.geom_nrm, state_scene.scene.draw_args,
-   vis.sett_inst, vis.sett_args, vis.wall_inst, vis.wall_args)
+   vis.prop_inst, vis.prop_args)
 
 -- Canonical logical frame composition for the CPU/compute-owned portions of the
 -- renderer. Raster passes still sit at physical entry boundaries, but this is the
@@ -590,75 +566,6 @@ def render_frame(frame: frame_globals, events: []vec4f32, w: world,
   let sc = { points = w.points, items = w.items }
   let visibility = frame_visibility_slice(sc, frame, history, domains) in
   { state_scene = state_scene, visibility = visibility }
-
-#[vertex]
-entry brick_vertex(#[builtin(vertex_index)] vid: i32,
-                   #[builtin(instance_index)] iid: i32,
-                   #[uniform(set=1, binding=0)] frame: frame_globals,
-                   #[storage(set=1, binding=11, access=read)] wall_brick_inst: []block)
-  (#[builtin(position)] vec4f32, #[varying(0)] vec3f32, #[varying(1)] vec3f32,
-   #[varying(2)] f32, #[varying(3)] f32, #[varying(4)] f32, #[varying(5)] vec3f32) =
-  let inst = wall_brick_inst[iid]
-  let center = inst.center
-  let kind = f32(inst.kind)     -- 0 brick, 1 quoin, 2 grout (passed on for the fragment)
-  let yaw = inst.yaw
-  let hf = inst.half
-  let cw = f32.cos(yaw)
-  let sw = f32.sin(yaw)
-  let local = box_pos[vid]
-  let lx = local.x * (hf.x * 2.0)
-  let ly = (local.y - 0.5) * (hf.y * 2.0)
-  let lz = local.z * (hf.z * 2.0)
-  let world = @[center.x + cw * lx - sw * lz, center.y + ly, center.z + sw * lx + cw * lz]
-  -- Tone seed from the (stable, baked) brick centre — NOT iid, which is the
-  -- compaction order and would make a brick's colour shimmer as culling changes.
-  let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0)) in
-  if center.y <= 0.0 then
-    (@[2.0, 2.0, 2.0, 1.0], world, center, yaw, cv, kind, hf)
-  else
-    (world_to_clip(world, frame.resolution, cam(frame)), world, center, yaw, cv, kind, hf)
-
--- Sphere-trace the yawed brick box (local x = along the wall), writing the brick
--- G-buffer on a hit and a far-plane miss otherwise. Mirrors sett_fragment.
-#[fragment]
-entry brick_fragment(#[varying(0)] world: vec3f32, #[varying(1)] bcenter: vec3f32,
-                     #[varying(2)] yaw: f32, #[varying(3)] cv: f32, #[varying(4)] kind: f32,
-                     #[varying(5)] hf: vec3f32,
-                     #[uniform(set=1, binding=0)] frame: frame_globals)
-  (#[target(g_albedo)] vec4f32, #[target(g_normal)] vec4f32, #[target(scene_depth)] f32, #[builtin(frag_depth)] f32) =
-  -- Blocks carry their own half-extents. A tiny corner radius keeps the edges
-  -- crisp (just enough to catch a highlight). kind 0 brick, 1 quoin, 2 grout.
-  let rr = 0.004
-  let b = @[hf.x - rr, hf.y - rr, hf.z - rr]
-  let cw = f32.cos(yaw)
-  let sw = f32.sin(yaw)
-  let rd = normalize(world - cam_eye(cam(frame)))
-  let (t, hit) =
-    loop (t, hit) = (0.0, false) for _i < 24 do
-      if hit then (t, hit)
-      else
-        let rel = (world + rd * t) - bcenter
-        let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
-        let d = sd_round_box(pl, b, rr) in
-        if d < 0.0005 then (t, true) else (t + d, false)
-  let pos = world + rd * t in
-  if hit then
-    let rel = pos - bcenter
-    let pl = @[cw * rel.x + sw * rel.z, rel.y, 0.0 - sw * rel.x + cw * rel.z]
-    let nl = round_normal(pl, b, rr)
-    let n = @[cw * nl.x - sw * nl.z, nl.y, sw * nl.x + cw * nl.z]
-    let clip = world_to_clip(pos, frame.resolution, cam(frame))
-    -- Per-block variation: `cv` (from the stable centre) drives lightness. Bricks
-    -- also mix two fired-clay tones by a position hash; quoins are pale limestone
-    -- with only a faint lightness wobble.
-    let hue = brick_hash(i32(bcenter.x * 97.0 + bcenter.z * 57.0 + bcenter.y * 181.0 + 10000.0))
-    let alb = if kind > 1.5 then GROUT_COLOR
-              else if kind > 0.5 then QUOIN_COLOR * v3(0.90 + 0.16 * cv)
-              else mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * cv)
-    let d = clip.z / clip.w in
-    (@[alb.x, alb.y, alb.z, 1.0], @[n.x, n.y, n.z, 1.0], d, d)
-  else
-    (@[0.0, 0.0, 0.0, 0.0], @[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
 
 ------------------------------------------------------------
 -- Sun shadow map — caster pass. The wall-brick proxy boxes projected through the
