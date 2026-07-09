@@ -57,11 +57,12 @@ passing wgpu/naga) run it through the driver to catch validation errors.
 
 - **Unused whole-frame composition can perturb entry output-size inference.** Adding
   an unused `render_frame(frame, events, world, history, domains)` that composes
-  `frame_state_scene_slice`, sett visibility, and wall visibility caused the
-  generated Rust signature for `step_out_bytes` to drop one size parameter
-  (`step_out_bytes(binding, tidx_bytes)` instead of the expected
-  `step_out_bytes(binding, pidx_bytes, tidx_bytes)`). The physical `step` entry was
-  unchanged, so generic helper use should not change the entry ABI inference.
+  `frame_state_scene_slice`, sett visibility, and wall visibility caused
+  `step_output_1` (points) and `step_output_2` (items) to be reported as
+  `like_input` binding 0 (`tidx`) in the descriptor. Those outputs should be sized
+  from `pidx` and `iidx` respectively. This is distinct from a valid virtual-iota
+  optimization: the physical entry still accepts materialized `pidx`/`iidx`, but
+  descriptor output sizing loses those domains.
 
 ---
 
