@@ -367,19 +367,6 @@ def frame_sett_visibility_slice(sc: painted, frame: frame_globals,
   let (inst, args) = build_visibility_setts(domains.setts, sc, frame, history.occ_depth) in
   { inst = inst, args = args }
 
-#[compute]
-entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
-           #[uniform(set=1, binding=0)] frame: frame_globals,
-           #[view(occ_depth, storage_read)] od: storage_image)
-  ([]vec4f32, [4]u32) =
-  -- Build one candidate record per cell. Culled records are emitted as degenerate
-  -- height=0 setts (the sett raymarch skips them); the draw count is the full cell
-  -- grid. Compaction via `filter(sett_visible, ...)` down to the live count is PR 4.
-  let domains = { ground = bidx, points = bidx, items = bidx, setts = bidx, walls = bidx }
-  let vis = frame_sett_visibility_slice({ points = points_in, items = items_in },
-                                        frame, { occ_depth = od }, domains) in
-  (vis.inst, vis.args)
-
 -- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
 -- block of scene_depth under it. Runs after the scene pass; cull reads it next
 -- frame. The write target `od` is listed first so the dispatch is sized from it
@@ -603,12 +590,16 @@ def frame_wall_visibility_slice(frame: frame_globals, domains: frame_domains)
   { inst = inst, args = args }
 
 #[compute]
-entry walls(wbidx: []u32,
-            #[uniform(set=1, binding=0)] frame: frame_globals)
-  ([]block, [4]u32) =
-  let domains = { ground = wbidx, points = wbidx, items = wbidx, setts = wbidx, walls = wbidx }
-  let vis = frame_wall_visibility_slice(frame, domains) in
-  (vis.inst, vis.args)
+entry frame_visibility(bidx: []u32, wbidx: []u32,
+                       items_in: []vec4f32, points_in: []vec2f32,
+                       #[uniform(set=1, binding=0)] frame: frame_globals,
+                       #[view(occ_depth, storage_read)] od: storage_image)
+  ([]vec4f32, [4]u32, []block, [4]u32) =
+  let domains = { ground = bidx, points = bidx, items = bidx, setts = bidx, walls = wbidx }
+  let sc = { points = points_in, items = items_in }
+  let setts = frame_sett_visibility_slice(sc, frame, { occ_depth = od }, domains)
+  let walls = frame_wall_visibility_slice(frame, domains) in
+  (setts.inst, setts.args, walls.inst, walls.args)
 
 -- Canonical logical frame composition for the CPU/compute-owned portions of the
 -- renderer. Raster passes still sit at physical entry boundaries, but this is the

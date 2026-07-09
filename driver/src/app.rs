@@ -7,15 +7,15 @@
 //! per-frame schedule.
 
 use crate::generated::{
-    cull_out_bytes, cull_stages, gtao_depth_out_bytes, gtao_depth_stages, gtao_main_out_bytes,
-    gtao_main_stages, light_out_bytes, light_stages, occ_reduce_out_bytes, occ_reduce_stages,
-    step_out_bytes, step_stages, walls_out_bytes, walls_stages, BLIT_VERTEX_BINDINGS,
-    BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS, CULL_BINDINGS,
-    CULL_STAGE_COUNT, GTAO_DEPTH_BINDINGS, GTAO_DEPTH_STAGE_COUNT, GTAO_MAIN_BINDINGS,
-    GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS,
-    OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
-    SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
-    STEP_BINDINGS, STEP_STAGE_COUNT, WALLS_BINDINGS, WALLS_STAGE_COUNT,
+    frame_visibility_out_bytes, frame_visibility_stages, gtao_depth_out_bytes,
+    gtao_depth_stages, gtao_main_out_bytes, gtao_main_stages, light_out_bytes, light_stages,
+    occ_reduce_out_bytes, occ_reduce_stages, step_out_bytes, step_stages, BLIT_VERTEX_BINDINGS,
+    BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS,
+    FRAME_VISIBILITY_BINDINGS, FRAME_VISIBILITY_STAGE_COUNT, GTAO_DEPTH_BINDINGS,
+    GTAO_DEPTH_STAGE_COUNT, GTAO_MAIN_BINDINGS, GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS,
+    LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS,
+    SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS,
+    SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS, STEP_BINDINGS, STEP_STAGE_COUNT,
 };
 use crate::graph::*;
 
@@ -53,21 +53,14 @@ const fn step_out(binding: u32) -> u64 {
     step_out_bytes(binding, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
 }
 
-// `cull`'s output sizes (compacted sett records + draw args + scratch count),
-// derived from the brick-grid seed size.
-const fn cull_out(binding: u32) -> u64 {
-    cull_out_bytes(binding, BIDX_BYTES)
-}
-
 // `occ_reduce` writes only occ_depth (an image, not a buffer) — no sized outputs.
 const fn occ_out(binding: u32) -> u64 {
     occ_reduce_out_bytes(binding)
 }
 
-// `walls`' output sizes (compacted wall_brick records + draw args + filter scratch),
-// derived from the wall-brick iota size.
-const fn walls_out(binding: u32) -> u64 {
-    walls_out_bytes(binding, WBIDX_BYTES)
+// Logical visibility emits both cobble sett instances and wall-brick instances.
+const fn frame_visibility_out(binding: u32) -> u64 {
+    frame_visibility_out_bytes(binding, BIDX_BYTES, WBIDX_BYTES)
 }
 
 // `light` / GTAO passes write only images (lit / vdepth / ao_work) — no sized
@@ -87,9 +80,9 @@ const fn gtao_main_out(binding: u32) -> u64 {
 // the generated `*_stages`); only the seed byte sizes are authored here.
 static STEP_STAGES: [ComputeStage; STEP_STAGE_COUNT] =
     step_stages(IIDX_BYTES, PIDX_BYTES, TIDX_BYTES);
-static CULL_STAGES: [ComputeStage; CULL_STAGE_COUNT] = cull_stages(BIDX_BYTES);
 static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OCC_COUNT);
-static WALLS_STAGES: [ComputeStage; WALLS_STAGE_COUNT] = walls_stages(WBIDX_BYTES);
+static FRAME_VISIBILITY_STAGES: [ComputeStage; FRAME_VISIBILITY_STAGE_COUNT] =
+    frame_visibility_stages(BIDX_BYTES, OCC_COUNT, WBIDX_BYTES);
 static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_COUNT);
 static GTAO_DEPTH_STAGES: [ComputeStage; GTAO_DEPTH_STAGE_COUNT] = gtao_depth_stages(PXL_COUNT);
 static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_COUNT);
@@ -334,8 +327,8 @@ pub const GRAPH: Graph = Graph {
         ("step_output_4", "geom_pos"),
         ("step_output_5", "geom_nrm"),
         ("step_output_6", "draw_args"),
-        ("cull_output_0", "sett_inst"),
-        ("cull_output_1", "sett_args"),
+        ("frame_visibility_output_0", "sett_inst"),
+        ("frame_visibility_output_1", "sett_args"),
         ("geom_pos", "geom_pos"),
         ("geom_nrm", "geom_nrm"),
         ("sett_inst", "sett_inst"),
@@ -353,8 +346,8 @@ pub const GRAPH: Graph = Graph {
         ("aw", "ao_work"),
         // Brick generator I/O + the instanced brick draw.
         ("wbidx", "wbidx"),
-        ("walls_output_0", "wall_brick_inst"),
-        ("walls_output_1", "wall_brick_args"),
+        ("frame_visibility_output_2", "wall_brick_inst"),
+        ("frame_visibility_output_3", "wall_brick_args"),
         ("wall_brick_inst", "wall_brick_inst"),
         // Deferred lighting output: `light` writes `lit` (view `lt`); the resolve
         // fragment reads it.
@@ -370,24 +363,15 @@ pub const GRAPH: Graph = Graph {
             stages: &STEP_STAGES,
             out_bytes: step_out,
         }),
-        // Build one record per brick cell. Culled setts get height=0 and self-cull
-        // in the vertex; the candidate budget is small enough to avoid compacting.
+        // Logical visibility: build one record per cobble cell and wall slot.
+        // Culled setts/bricks self-cull in the vertex; the candidate budgets are
+        // small enough to avoid compacting.
         Pass::Compute(ComputePass {
-            label: "cull",
+            label: "frame_visibility",
             module: "main",
-            bindings: CULL_BINDINGS,
-            stages: &CULL_STAGES,
-            out_bytes: cull_out,
-        }),
-        // Brick-building generator: lay one record per candidate slot. Dead or
-        // off-frustum slots self-cull in the vertex; the candidate budget is small
-        // enough that wall bricks do not need a compacting filter stage.
-        Pass::Compute(ComputePass {
-            label: "walls",
-            module: "main",
-            bindings: WALLS_BINDINGS,
-            stages: &WALLS_STAGES,
-            out_bytes: walls_out,
+            bindings: FRAME_VISIBILITY_BINDINGS,
+            stages: &FRAME_VISIBILITY_STAGES,
+            out_bytes: frame_visibility_out,
         }),
         // Sun shadow map: rasterize the wall bricks through the sun's ortho light
         // camera, storing nearest light-space depth into sun_depth. Reuses the shared
