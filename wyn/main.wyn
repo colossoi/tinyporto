@@ -283,17 +283,13 @@ resource sun_depth: image2d {
 }
 
 ------------------------------------------------------------
--- GTAO (XeGTAO) ambient occlusion. Two per-pixel compute passes: gtao_depth
--- linearizes scene_depth to viewspace depth (vdepth); gtao_main integrates horizon
+-- GTAO (XeGTAO) ambient occlusion. One per-pixel compute pass
+-- linearizes sampled scene_depth values as needed and integrates horizon
 -- visibility + packs denoise edges into ao_work. The edge-aware denoise blur is not
 -- a pass of its own — it reads only gtao_main's ao_work, so `light` folds it in
--- inline. We call gtao.wyn's convenience wrappers, which keep the slice/step loops
--- inside library defs (so no loops live in our `map` bodies) and fetch depth with
--- texture_load (integer, no sampler). Working images are write+sample (like `lit`):
--- written via storage in one pass, read as a sampled texture2d in the next.
+-- inline.
 ------------------------------------------------------------
 
-resource vdepth:  image2d { format = r32float     size = window  usages = [storage_write, sampled] }
 resource ao_work: image2d { format = rgba16float  size = window  usages = [storage_write, sampled] }
 
 ------------------------------------------------------------
@@ -725,38 +721,59 @@ def gtao_consts: gtao.consts =
   gtao.make_constants(@[1280.0, 800.0], f32.tan(f32.radians(10.0)),
                       CLIP_NEAR, CLIP_FAR, 0u32, gtao.default_settings)
 
--- Pass 1: linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
+-- Linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
 -- to CLIP_FAR so it stays finite and never reads as an occluder.
-def gtao_depth_pixel(sd: storage_image, xy: vec2i32) vec4f32 =
-  let ndc = image_load(sd, xy).x
-  let vz = if ndc > 0.99999 then CLIP_FAR
-           else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts)) in
-  @[vz, 0.0, 0.0, 1.0]
+def gtao_scene_vdepth(sd: storage_image, xy: vec2i32) f32 =
+  let ndc = image_load(sd, xy).x in
+  if ndc > 0.99999 then CLIP_FAR
+  else gtao.clamp_depth(gtao.screen_to_viewspace_depth(ndc, gtao_consts))
 
-#[compute]
-entry gtao_depth(#[builtin(global_invocation_id)] gid: vec3u32,
-                 #[view(vdepth, storage_write)]     vd: *storage_image,
-                 #[view(scene_depth, storage_read)] sd: storage_image)
-  () =
-  let xy = pixel_xy(gid, 1280) in
-  vd with [xy] = gtao_depth_pixel(sd, xy)
+def gtao_load_scene_vdepth(sd: storage_image, x: i32, y: i32) f32 =
+  let cx = clampi(x, 0i32, i32(gtao_consts.viewport_size.x) - 1i32)
+  let cy = clampi(y, 0i32, i32(gtao_consts.viewport_size.y) - 1i32) in
+  gtao_scene_vdepth(sd, @[cx, cy])
 
--- Pass 2: GTAO main (High preset = 3 slices x 3 steps), normals reconstructed from
--- vdepth. Writes the raw visibility term (.x) + packed denoise edges (.y) to ao_work.
--- The slice/step loops live inside gtao.main_pass_single, not here.
-def gtao_main_pixel(vd: texture2d, xy: vec2i32) vec4f32 =
-  let nrm = gtao.compute_viewspace_normal(xy, vd, gtao_consts)
+def gtao_load_scene_vdepth_uv(sd: storage_image, uv: vec2f32) f32 =
+  gtao_load_scene_vdepth(sd,
+                         i32(f32.floor(uv.x * gtao_consts.viewport_size.x)),
+                         i32(f32.floor(uv.y * gtao_consts.viewport_size.y)))
+
+-- GTAO main (High preset = 3 slices x 3 steps), normals reconstructed from
+-- linearized scene depth. Writes raw visibility (.x) + packed denoise edges (.y).
+def gtao_main_pixel(sd: storage_image, xy: vec2i32) vec4f32 =
+  let cz = gtao_load_scene_vdepth(sd, xy.x, xy.y)
+  let lz = gtao_load_scene_vdepth(sd, xy.x - 1i32, xy.y)
+  let rz = gtao_load_scene_vdepth(sd, xy.x + 1i32, xy.y)
+  let tz = gtao_load_scene_vdepth(sd, xy.x, xy.y - 1i32)
+  let bz = gtao_load_scene_vdepth(sd, xy.x, xy.y + 1i32)
+  let nrm = gtao.viewspace_normal_from_depths(xy, cz, lz, rz, tz, bz, gtao_consts)
+  let packed_edges = gtao.pack_edges(gtao.calculate_edges(cz, lz, rz, tz, bz))
+  let p = gtao.setup_pixel(xy, cz, gtao_consts)
   let noise = gtao.spatiotemporal_noise(@[u32(xy.x), u32(xy.y)], 0u32)
-  let (vis, edg) = gtao.main_pass_single(xy, 3, 3, noise, nrm, gtao_consts, vd) in
-  @[vis, edg, 0.0, 1.0]
+  let visibility =
+    loop vis = p.visibility_base for slice < 3 do
+      let s = gtao.setup_slice(p, slice, 3, noise.x, nrm) in
+      let (hc0, hc1) =
+        loop (hc0, hc1) = (s.low_horizon_cos0, s.low_horizon_cos1)
+        for step < 3 do
+          let (off, _) = gtao.step_sample(p, s, slice, step, 3, noise.y, gtao_consts)
+          let uv0 = p.nsp + off
+          let uv1 = p.nsp - off
+          let sz0 = gtao_load_scene_vdepth_uv(sd, uv0)
+          let sz1 = gtao_load_scene_vdepth_uv(sd, uv1) in
+          gtao.horizon_fold(p, s, uv0, sz0, uv1, sz1, hc0, hc1, gtao_consts)
+      in
+      vis + gtao.slice_visibility(s, hc0, hc1)
+  let vis = gtao.finalize_visibility(visibility, 3, gtao_consts) in
+  @[vis, packed_edges, 0.0, 1.0]
 
 #[compute]
 entry gtao_main(#[builtin(global_invocation_id)] gid: vec3u32,
                 #[view(ao_work, storage_write)] aw: *storage_image,
-                #[view(vdepth, sampled)]        vd: texture2d)
+                #[view(scene_depth, storage_read)] sd: storage_image)
   () =
   let xy = pixel_xy(gid, 1280) in
-  aw with [xy] = gtao_main_pixel(vd, xy)
+  aw with [xy] = gtao_main_pixel(sd, xy)
 
 -- The GTAO edge-aware denoise (final blur of ao_work) is NOT a separate pass — it
 -- reads only gtao_main's output, so `light` folds it in inline (see its `ao`).

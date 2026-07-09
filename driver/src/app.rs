@@ -7,14 +7,13 @@
 //! per-frame schedule.
 
 use crate::generated::{
-    frame_prepare_out_bytes, frame_prepare_stages, gtao_depth_out_bytes, gtao_depth_stages,
-    gtao_main_out_bytes, gtao_main_stages, light_out_bytes, light_stages, occ_reduce_out_bytes,
-    occ_reduce_stages, BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS,
-    BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS,
-    FRAME_PREPARE_STAGE_COUNT, GTAO_DEPTH_BINDINGS, GTAO_DEPTH_STAGE_COUNT, GTAO_MAIN_BINDINGS,
-    GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS,
-    OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
-    SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
+    frame_prepare_out_bytes, frame_prepare_stages, gtao_main_out_bytes, gtao_main_stages,
+    light_out_bytes, light_stages, occ_reduce_out_bytes, occ_reduce_stages, BLIT_VERTEX_BINDINGS,
+    BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS,
+    FRAME_PREPARE_BINDINGS, FRAME_PREPARE_STAGE_COUNT, GTAO_MAIN_BINDINGS, GTAO_MAIN_STAGE_COUNT,
+    LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT,
+    RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS,
+    SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
 };
 use crate::graph::*;
 
@@ -38,7 +37,7 @@ const OCC_COUNT: u64 = 160 * 100;
 const WALL_BRICKS: u64 = 2632;
 const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
 // Window pixel count — the dispatch domain for the per-pixel compute passes
-// (gtao_depth/main, light), each sized from its window-sized write image.
+// (gtao_main, light), each sized from its window-sized write image.
 const PXL_COUNT: u64 = 1280 * 800;
 // Input event stream: EV_CAP events (must match `step`'s EV_CAP in main.wyn), one
 // vec4f32 (16 bytes) each. The host zero-pads unused slots to None each frame.
@@ -56,13 +55,10 @@ const fn frame_prepare_out(binding: u32) -> u64 {
     frame_prepare_out_bytes(binding, BIDX_BYTES, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES)
 }
 
-// `light` / GTAO passes write only images (lit / vdepth / ao_work) — no sized
+// `light` / GTAO passes write only images (lit / ao_work) — no sized
 // buffer outputs, so their out-size calcs take just the binding.
 const fn light_out(binding: u32) -> u64 {
     light_out_bytes(binding)
-}
-const fn gtao_depth_out(binding: u32) -> u64 {
-    gtao_depth_out_bytes(binding)
 }
 const fn gtao_main_out(binding: u32) -> u64 {
     gtao_main_out_bytes(binding)
@@ -75,7 +71,6 @@ static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OC
 static FRAME_PREPARE_STAGES: [ComputeStage; FRAME_PREPARE_STAGE_COUNT] =
     frame_prepare_stages(BIDX_BYTES, IIDX_BYTES, OCC_COUNT, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES);
 static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_COUNT);
-static GTAO_DEPTH_STAGES: [ComputeStage; GTAO_DEPTH_STAGE_COUNT] = gtao_depth_stages(PXL_COUNT);
 static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_COUNT);
 
 pub const GRAPH: Graph = Graph {
@@ -223,14 +218,8 @@ pub const GRAPH: Graph = Graph {
             size: ImgSize::Window,
             mips: 1,
         },
-        // GTAO working images (all window-sized, write+sample like `lit`): viewspace
-        // depth, the raw AO+edges term, and the denoised AO the light pass reads.
-        Resource::Image {
-            name: "vdepth",
-            format: TexFormat::R32Float,
-            size: ImgSize::Window,
-            mips: 1,
-        },
+        // GTAO working image: raw AO+edges term, sampled by the light pass for the
+        // edge-aware denoise.
         Resource::Image {
             name: "ao_work",
             format: TexFormat::Rgba16Float,
@@ -331,9 +320,8 @@ pub const GRAPH: Graph = Graph {
         ("gn", "g_normal"),
         // Sun shadow map (`shm` in `light`; written as the sun_shadow color target).
         ("shm", "sun_depth"),
-        // GTAO views: vdepth (write `vd` / sample `vd`), ao_work (gtao_main writes `aw`,
-        // `light` samples `aw` and denoises inline).
-        ("vd", "vdepth"),
+        // GTAO view: ao_work (gtao_main writes `aw`, `light` samples `aw` and
+        // denoises inline).
         ("aw", "ao_work"),
         // Brick generator I/O + the instanced brick draw.
         ("wbidx", "wbidx"),
@@ -446,16 +434,9 @@ pub const GRAPH: Graph = Graph {
             stages: &OCC_STAGES,
             out_bytes: occ_out,
         }),
-        // GTAO: linearize scene depth to viewspace, then integrate horizon AO into
-        // ao_work. Runs after the scene pass (needs scene_depth) and before `light`,
-        // which reads ao_work and folds the edge-aware denoise into its shading.
-        Pass::Compute(ComputePass {
-            label: "gtao_depth",
-            module: "main",
-            bindings: GTAO_DEPTH_BINDINGS,
-            stages: &GTAO_DEPTH_STAGES,
-            out_bytes: gtao_depth_out,
-        }),
+        // GTAO: integrate horizon AO directly from scene_depth into ao_work. Runs
+        // after the scene pass and before `light`, which reads ao_work and folds
+        // the edge-aware denoise into its shading.
         Pass::Compute(ComputePass {
             label: "gtao_main",
             module: "main",
