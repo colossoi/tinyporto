@@ -224,6 +224,15 @@ def build_scene(w: world, tidx: []u32) ([]vec4f32, []vec4f32, [4]u32) =
    ground_normals(w.items, w.points, tidx),
    ground_draw_args)
 
+-- State + generated ground scene slice of the logical frame. The physical `step`
+-- entry projects this record back to today's ABI tuple.
+def frame_state_scene_slice(frame: frame_globals, events: []vec4f32,
+                            w: world, domains: frame_domains) frame_state_scene =
+  let w2 = update_world(frame, events, w, domains.points, domains.items)
+  let (geom_pos, geom_nrm, draw_args) = build_scene(w, domains.ground) in
+  { world = w2,
+    scene = { geom_pos = geom_pos, geom_nrm = geom_nrm, draw_args = draw_args } }
+
 #[compute]
 entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
@@ -231,9 +240,10 @@ entry step(tidx: []u32, pidx: []u32, iidx: []u32,
            #[uniform(set=1, binding=0)] frame: frame_globals)
   ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
   let w = { ui = uistate_in, points = points_in, items = items_in, head = head_in }
-  let w2 = update_world(frame, events, w, pidx, iidx)
-  let (geom_pos, geom_nrm, draw_args) = build_scene(w, tidx) in
-  (w2.ui, w2.points, w2.items, w2.head, geom_pos, geom_nrm, draw_args)
+  let domains = { ground = tidx, points = pidx, items = iidx, setts = tidx, walls = tidx }
+  let out = frame_state_scene_slice(frame, events, w, domains) in
+  (out.world.ui, out.world.points, out.world.items, out.world.head,
+   out.scene.geom_pos, out.scene.geom_nrm, out.scene.draw_args)
 
 ------------------------------------------------------------
 -- Hi-Z occlusion (Nine, simple single-level form). The scene writes window-space
