@@ -95,6 +95,47 @@ type world = { ui: []f32, points: []vec2f32, items: []vec4f32, head: []f32 }
 -- their two storage inputs into this to evaluate the canal SDF against one value.
 type painted = { points: []vec2f32, items: []vec4f32 }
 
+-- Explicit logical frame domains. These are still backed by the same iota seed
+-- buffers at the physical entry boundary, but the frame program names them by
+-- meaning instead of by individual entry argument.
+type frame_domains = {
+  ground: []u32,
+  points: []u32,
+  items: []u32,
+  setts: []u32,
+  walls: []u32,
+}
+
+-- Images that are intentionally read as history. `occ_depth` is produced after the
+-- scene pass and consumed by next frame's visibility pass; keeping it in this
+-- record makes the temporal edge visible in source even before the descriptor can
+-- tag it as a previous-frame read.
+type frame_history = {
+  occ_depth: storage_image,
+}
+
+type scene_geometry = {
+  geom_pos: []vec4f32,
+  geom_nrm: []vec4f32,
+  draw_args: [4]u32,
+}
+
+type visibility = {
+  sett_inst: []vec4f32,
+  sett_args: [4]u32,
+  wall_inst: []block,
+  wall_args: [4]u32,
+}
+
+type frame_state_scene = {
+  world: world,
+  scene: scene_geometry,
+}
+
+type frame_visibility = {
+  visibility: visibility,
+}
+
 type state_update = {
   ui: ui_state,
   head: stroke_head,
