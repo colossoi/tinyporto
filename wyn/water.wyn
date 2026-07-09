@@ -54,9 +54,12 @@ def water_sdf(p: vec2f32, items: []vec4f32, points: []vec2f32) f32 =
       let dmin =
         if pcount <= 1 then magnitude(p - points[pstart])
         else
-          loop d = 100.0 for s < MAX_SEG do
-            if s >= pcount - 1 then d
-            else f32.min(d, seg_dist(p, points[pstart + s], points[pstart + s + 1]))
+          -- Live segment count, still capped at MAX_SEG (a longer stroke truncates,
+          -- as before). Iterating the cap and discarding the tail cost every pixel
+          -- MAX_SEG steps no matter how short the stroke.
+          let nseg = if pcount - 1 < MAX_SEG then pcount - 1 else MAX_SEG in
+          loop d = 100.0 for s < nseg do
+            f32.min(d, seg_dist(p, points[pstart + s], points[pstart + s + 1]))
         in
       f32.min(best, dmin - hw)
     else best
