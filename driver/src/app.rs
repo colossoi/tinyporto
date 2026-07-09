@@ -50,7 +50,7 @@ const EVENTS_BYTES: u64 = EV_CAP as u64 * 16;
 // baked in). The driver pairs this with the binding table to size each output
 // buffer by name — no output binding numbers appear here.
 const fn step_out(binding: u32) -> u64 {
-    step_out_bytes(binding, PIDX_BYTES, TIDX_BYTES)
+    step_out_bytes(binding, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
 }
 
 // `cull`'s output sizes (compacted sett records + draw args + scratch count),

@@ -53,21 +53,13 @@ passing wgpu/naga) run it through the driver to catch validation errors.
 
 ---
 
-## Whole-frame composition blockers
-
-- **Unused whole-frame composition can perturb entry output-size inference.** Adding
-  an unused `render_frame(frame, events, world, history, domains)` that composes
-  `frame_state_scene_slice`, sett visibility, and wall visibility caused
-  `step_output_1` (points) and `step_output_2` (items) to be reported as
-  `like_input` binding 0 (`tidx`) in the descriptor. Those outputs should be sized
-  from `pidx` and `iidx` respectively. This is distinct from a valid virtual-iota
-  optimization: the physical entry still accepts materialized `pidx`/`iidx`, but
-  descriptor output sizing loses those domains.
-
----
-
 ## Fixed this session (kept as regression repros)
 
+- **Function defs now generalize over array sizes.** Whole-frame helper composition
+  previously reused one set of size variables across call sites, so adding an unused
+  `render_frame` could collapse distinct `step` output domains onto `tidx`. Def
+  generalization now walks array sizes, and monomorphization keys can distinguish
+  Skolem sizes from filter existentials.
 - **`filter` was serial, now shards** into flags/scan/scatter. `repro/r4_filter.wyn`,
   `repro/r5_filter_count.wyn`.
 - **`filter` output element size** was taken from the input element, wrong when a

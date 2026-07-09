@@ -139,6 +139,11 @@ type frame_visibility = {
   visibility: visibility,
 }
 
+type frame_outputs = {
+  state_scene: frame_state_scene,
+  visibility: visibility,
+}
+
 type lighting_inputs = {
   g_albedo: storage_image,
   g_normal: storage_image,
@@ -604,6 +609,19 @@ entry walls(wbidx: []u32,
   let domains = { ground = wbidx, points = wbidx, items = wbidx, setts = wbidx, walls = wbidx }
   let vis = frame_wall_visibility_slice(frame, domains) in
   (vis.inst, vis.args)
+
+-- Canonical logical frame composition for the CPU/compute-owned portions of the
+-- renderer. Raster passes still sit at physical entry boundaries, but this is the
+-- source-level shape they should eventually be lowered from.
+def render_frame(frame: frame_globals, events: []vec4f32, w: world,
+                 history: frame_history, domains: frame_domains) frame_outputs =
+  let state_scene = frame_state_scene_slice(frame, events, w, domains)
+  let sc = { points = w.points, items = w.items }
+  let setts = frame_sett_visibility_slice(sc, frame, history, domains)
+  let walls = frame_wall_visibility_slice(frame, domains) in
+  { state_scene = state_scene,
+    visibility = { sett_inst = setts.inst, sett_args = setts.args,
+                   wall_inst = walls.inst, wall_args = walls.args } }
 
 #[vertex]
 entry brick_vertex(#[builtin(vertex_index)] vid: i32,
