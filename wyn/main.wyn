@@ -91,8 +91,9 @@ def pixel_xy(gid: vec3u32, w: i32) vec2i32 =
 type world = { ui: []f32, points: []vec2f32, items: []vec4f32, head: []f32 }
 
 -- The painted geometry the render passes read: the control points and the packed
--- items — the read-only geometry view of the `world`. `cull` and `light` bundle
--- their two storage inputs into this to evaluate the canal SDF against one value.
+-- items — the read-only geometry view of the `world`. `cull` and `resolve_fragment`
+-- bundle their two storage inputs into this to evaluate the canal SDF against one
+-- value.
 type painted = { points: []vec2f32, items: []vec4f32 }
 
 -- Explicit logical frame domains. These are still backed by the same iota seed
@@ -274,8 +275,8 @@ resource occ_depth: image2d {
 
 -- Sun shadow map: the caster pass writes light-space depth here (as an R32Float
 -- color target, nearest kept by the depth test — the same write+sample pattern as
--- scene_depth); the deferred `light` pass reads it back for directional cast
--- shadows. Window-sized so it reuses the shared depth buffer with no driver work.
+-- scene_depth); `resolve_fragment` reads it back for directional cast shadows.
+-- Window-sized so it reuses the shared depth buffer with no driver work.
 resource sun_depth: image2d {
   format = r32float
   size   = window
@@ -286,8 +287,8 @@ resource sun_depth: image2d {
 -- GTAO (XeGTAO) ambient occlusion. One per-pixel compute pass
 -- linearizes sampled scene_depth values as needed and integrates horizon
 -- visibility + packs denoise edges into ao_work. The edge-aware denoise blur is not
--- a pass of its own — it reads only gtao_main's ao_work, so `light` folds it in
--- inline.
+-- a pass of its own — it reads only gtao_main's ao_work, so `resolve_fragment`
+-- folds it in inline.
 ------------------------------------------------------------
 
 resource ao_work: image2d { format = rgba16float  size = window  usages = [storage_write, sampled] }
@@ -383,15 +384,6 @@ resource g_normal: image2d {
   format = rgba16float
   size   = window
   usages = [storage_read]
-}
-
--- Final lit image: the `light` compute pass writes it (deferred lighting + AO over
--- the whole frame), the resolve fragment samples it to the surface. Write + sample
--- (not read-write storage, which is r32-only) — the standard multi-pass image path.
-resource lit: image2d {
-  format = rgba16float
-  size   = window
-  usages = [storage_write, sampled]
 }
 
 ------------------------------------------------------------
@@ -672,7 +664,8 @@ entry brick_fragment(#[varying(0)] world: vec3f32, #[varying(1)] bcenter: vec3f3
 -- Sun shadow map — caster pass. The wall-brick proxy boxes projected through the
 -- sun's orthographic light camera (world_to_light) into the sun_depth map. The
 -- fragment writes its light-space depth (frag_coord.z); the depth test keeps the
--- nearest caster per texel. `light` reads this back to cast long directional shadows.
+-- nearest caster per texel. `resolve_fragment` reads this back to cast long
+-- directional shadows.
 --
 -- CRITICAL: this pass regenerates each candidate brick directly from its index via
 -- wall_brick(iid) — it does NOT read the compacted wall_brick_inst. The shadow map is
@@ -775,13 +768,14 @@ entry gtao_main(#[builtin(global_invocation_id)] gid: vec3u32,
   aw with [xy] = gtao_main_pixel(sd, xy)
 
 -- The GTAO edge-aware denoise (final blur of ao_work) is NOT a separate pass — it
--- reads only gtao_main's output, so `light` folds it in inline (see its `ao`).
+-- reads only gtao_main's output, so `shade_frame` folds it in inline (see its `ao`).
 ------------------------------------------------------------
--- Deferred lighting (Nine Phase 3, the compute stage). One invocation per pixel
--- reads the thin G-buffer, estimates screen-space ambient occlusion from the depth
--- neighbourhood, lights the albedo by the stored normal (sun + AO-attenuated sky),
--- tonemaps, and writes the final `lit` image. Sky pixels pass through unlit. This
--- is the unified shading home — AO here, contact shadows / local lights later.
+-- Deferred lighting (Nine Phase 3). Per pixel, read the thin G-buffer, estimate
+-- screen-space ambient occlusion from the depth neighbourhood, light the albedo by
+-- the stored normal (sun + AO-attenuated sky), and tonemap. Sky pixels pass through
+-- unlit. `resolve_fragment` runs this for every pixel of the fullscreen triangle
+-- straight to the surface. This is the unified shading home — AO here, contact
+-- shadows / local lights later.
 ------------------------------------------------------------
 
 -- Sky shade for a G-buffer miss (alb.w < 0.5): raymarch the static volumetric
@@ -835,30 +829,10 @@ def frame_lighting_pixel(inputs: lighting_inputs, frame: frame_globals,
   shade_frame(inputs.g_albedo, inputs.g_normal, inputs.scene_depth,
               inputs.sun_depth, inputs.ao_work, frame, sc, xy.x, xy.y)
 
--- The entry is just the dispatch: one invocation per pixel calls shade_frame and
--- writes the result to `lit`. `lt` (the write target) is listed first so the
--- dispatch is sized from it (all its images are window-sized, so the choice is
--- moot for size, but keeping the output first matches the other passes).
-#[compute]
-entry light(#[builtin(global_invocation_id)] gid: vec3u32,
-            items_in: []vec4f32, points_in: []vec2f32,
-            #[uniform(set=1, binding=0)] frame: frame_globals,
-            #[view(lit, storage_write)]       lt: *storage_image,
-            #[view(g_albedo, storage_read)]  ga: storage_image,
-            #[view(g_normal, storage_read)]  gn: storage_image,
-            #[view(scene_depth, storage_read)] sd: storage_image,
-            #[view(sun_depth, storage_read)]  shm: storage_image,
-            #[view(ao_work, sampled)]         aw: texture2d)
-  () =
-  let w = i32(frame.resolution.x)
-  let xy = pixel_xy(gid, w)
-  let inputs = { g_albedo = ga, g_normal = gn, scene_depth = sd, sun_depth = shm, ao_work = aw }
-  let col = frame_lighting_pixel(inputs, frame, { points = points_in, items = items_in }, xy) in
-  lt with [xy] = col
-
 ------------------------------------------------------------
--- Deferred resolve. One fullscreen triangle copies the finished `lit` image to the
--- surface — the lighting already happened in the `light` compute pass above.
+-- Deferred resolve. One fullscreen triangle covers every pixel and its fragment
+-- lights that pixel straight to the surface, reading the thin G-buffer, the depth
+-- images, and the painted buffers the canal SDF needs.
 ------------------------------------------------------------
 
 -- Fullscreen triangle from the vertex index: (-1,-1), (3,-1), (-1,3) covers the
@@ -872,6 +846,14 @@ entry blit_vertex(#[builtin(vertex_index)] vid: i32)
 
 #[fragment]
 entry resolve_fragment(#[builtin(frag_coord)] fc: vec4f32,
-                       #[view(lit, sampled)] lt: texture2d)
+                       items_in: []vec4f32, points_in: []vec2f32,
+                       #[uniform(set=1, binding=0)] frame: frame_globals,
+                       #[view(g_albedo, storage_read)]  ga: storage_image,
+                       #[view(g_normal, storage_read)]  gn: storage_image,
+                       #[view(scene_depth, storage_read)] sd: storage_image,
+                       #[view(sun_depth, storage_read)]  shm: storage_image,
+                       #[view(ao_work, sampled)]         aw: texture2d)
   #[target(surface)] vec4f32 =
-  texture_load(lt, @[i32(fc.x), i32(fc.y)], 0)
+  let xy = @[i32(fc.x), i32(fc.y)]
+  let inputs = { g_albedo = ga, g_normal = gn, scene_depth = sd, sun_depth = shm, ao_work = aw } in
+  frame_lighting_pixel(inputs, frame, { points = points_in, items = items_in }, xy)

@@ -8,11 +8,10 @@
 
 use crate::generated::{
     frame_prepare_out_bytes, frame_prepare_stages, gtao_main_out_bytes, gtao_main_stages,
-    light_out_bytes, light_stages, BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS,
-    BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS,
-    FRAME_PREPARE_STAGE_COUNT, GTAO_MAIN_BINDINGS, GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS,
-    LIGHT_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS,
-    SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
+    BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS,
+    BRICK_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS, FRAME_PREPARE_STAGE_COUNT, GTAO_MAIN_BINDINGS,
+    GTAO_MAIN_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
+    SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
 };
 use crate::graph::*;
 
@@ -35,8 +34,8 @@ const OCC_COUNT: u64 = 160 * 100;
 // domain the `walls` generator maps over (one slot per candidate block).
 const WALL_BRICKS: u64 = 2632;
 const WBIDX_BYTES: u64 = WALL_BRICKS * 4;
-// Window pixel count — the dispatch domain for the per-pixel compute passes
-// (gtao_main, light), each sized from its window-sized write image.
+// Window pixel count — the dispatch domain for `gtao_main`, sized from its
+// window-sized write image.
 const PXL_COUNT: u64 = 1280 * 800;
 // Input event stream: EV_CAP events (must match `step`'s EV_CAP in main.wyn), one
 // vec4f32 (16 bytes) each. The host zero-pads unused slots to None each frame.
@@ -49,11 +48,8 @@ const fn frame_prepare_out(binding: u32) -> u64 {
     frame_prepare_out_bytes(binding, BIDX_BYTES, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES)
 }
 
-// `light` / GTAO passes write only images (lit / ao_work / occ_depth) — no sized
-// buffer outputs, so their out-size calcs take just the binding.
-const fn light_out(binding: u32) -> u64 {
-    light_out_bytes(binding)
-}
+// The GTAO pass writes only images (ao_work / occ_depth) — no sized buffer
+// outputs, so its out-size calc takes just the binding.
 const fn gtao_main_out(binding: u32) -> u64 {
     gtao_main_out_bytes(binding)
 }
@@ -63,7 +59,6 @@ const fn gtao_main_out(binding: u32) -> u64 {
 // the generated `*_stages`); only the seed byte sizes are authored here.
 static FRAME_PREPARE_STAGES: [ComputeStage; FRAME_PREPARE_STAGE_COUNT] =
     frame_prepare_stages(BIDX_BYTES, IIDX_BYTES, OCC_COUNT, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES);
-static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_COUNT);
 static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_COUNT);
 
 pub const GRAPH: Graph = Graph {
@@ -234,14 +229,6 @@ pub const GRAPH: Graph = Graph {
             size: ImgSize::Window,
             mips: 1,
         },
-        // Deferred lighting: `light` writes the final `lit` image (one invocation per
-        // window pixel); the resolve fragment copies it to the surface.
-        Resource::Image {
-            name: "lit",
-            format: TexFormat::Rgba16Float,
-            size: ImgSize::Window,
-            mips: 1,
-        },
         Resource::Buffer(BufferDef {
             name: "blit_args",
             size: Some(16),
@@ -311,19 +298,17 @@ pub const GRAPH: Graph = Graph {
         // G-buffer views read by the deferred resolve fragment.
         ("ga", "g_albedo"),
         ("gn", "g_normal"),
-        // Sun shadow map (`shm` in `light`; written as the sun_shadow color target).
+        // Sun shadow map (`shm` in `resolve_fragment`; written as the sun_shadow
+        // color target).
         ("shm", "sun_depth"),
-        // GTAO view: ao_work (gtao_main writes `aw`, `light` samples `aw` and
-        // denoises inline).
+        // GTAO view: ao_work (gtao_main writes `aw`, `resolve_fragment` samples `aw`
+        // and denoises inline).
         ("aw", "ao_work"),
         // Brick generator I/O + the instanced brick draw.
         ("wbidx", "wbidx"),
         ("frame_prepare_output_9", "wall_brick_inst"),
         ("frame_prepare_output_10", "wall_brick_args"),
         ("wall_brick_inst", "wall_brick_inst"),
-        // Deferred lighting output: `light` writes `lit` (view `lt`); the resolve
-        // fragment reads it.
-        ("lt", "lit"),
     ],
 
     passes: &[
@@ -419,8 +404,8 @@ pub const GRAPH: Graph = Graph {
         }),
         // GTAO + Hi-Z reduce: one pass over the scene depth written above. Every
         // invocation integrates horizon AO into ao_work; the first OCC_COUNT also min
-        // their coarse occ_depth tile, which `cull` reads next frame. Runs before
-        // `light`, which reads ao_work and folds the edge-aware denoise into shading.
+        // their coarse occ_depth tile, which `cull` reads next frame. Runs before the
+        // resolve, which reads ao_work and folds the edge-aware denoise into shading.
         Pass::Compute(ComputePass {
             label: "gtao_main",
             module: "main",
@@ -428,19 +413,10 @@ pub const GRAPH: Graph = Graph {
             stages: &GTAO_MAIN_STAGES,
             out_bytes: gtao_main_out,
         }),
-        // Deferred lighting: one compute invocation per pixel reads the G-buffer,
+        // Deferred resolve: one fullscreen triangle whose fragment reads the G-buffer,
         // folds in the GTAO term (including the edge-aware denoise of ao_work) and
-        // writes the final `lit` image (sun + shadows +
-        // AO-attenuated sky, tonemapped).
-        Pass::Compute(ComputePass {
-            label: "light",
-            module: "main",
-            bindings: LIGHT_BINDINGS,
-            stages: &LIGHT_STAGES,
-            out_bytes: light_out,
-        }),
-        // Deferred resolve: one fullscreen triangle copies the lit image to the
-        // surface. No depth (it covers every pixel unconditionally).
+        // writes the final colour (sun + shadows + AO-attenuated sky, tonemapped)
+        // straight to the surface. No depth (it covers every pixel unconditionally).
         Pass::Render(RenderPass {
             label: "resolve",
             depth: None,
