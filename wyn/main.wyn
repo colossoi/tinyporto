@@ -127,6 +127,9 @@ type visibility = {
   wall_args: [4]u32,
 }
 
+type sett_visibility = { inst: []vec4f32, args: [4]u32 }
+type wall_visibility = { inst: []block, args: [4]u32 }
+
 type frame_state_scene = {
   world: world,
   scene: scene_geometry,
@@ -345,6 +348,12 @@ def build_visibility_setts(bidx: []u32, sc: painted,
       , bidx) in
   (cand, sett_draw_args(BCOLS * BROWS))
 
+def frame_sett_visibility_slice(sc: painted, frame: frame_globals,
+                                history: frame_history, domains: frame_domains)
+  sett_visibility =
+  let (inst, args) = build_visibility_setts(domains.setts, sc, frame, history.occ_depth) in
+  { inst = inst, args = args }
+
 #[compute]
 entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
            #[uniform(set=1, binding=0)] frame: frame_globals,
@@ -353,7 +362,10 @@ entry cull(bidx: []u32, items_in: []vec4f32, points_in: []vec2f32,
   -- Build one candidate record per cell. Culled records are emitted as degenerate
   -- height=0 setts (the sett raymarch skips them); the draw count is the full cell
   -- grid. Compaction via `filter(sett_visible, ...)` down to the live count is PR 4.
-  build_visibility_setts(bidx, { points = points_in, items = items_in }, frame, od)
+  let domains = { ground = bidx, points = bidx, items = bidx, setts = bidx, walls = bidx }
+  let vis = frame_sett_visibility_slice({ points = points_in, items = items_in },
+                                        frame, { occ_depth = od }, domains) in
+  (vis.inst, vis.args)
 
 -- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
 -- block of scene_depth under it. Runs after the scene pass; cull reads it next
@@ -572,11 +584,18 @@ def build_visibility_walls(wbidx: []u32, frame: frame_globals) ([]block, [4]u32)
       , wbidx) in
   (cand, wall_draw_args(BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS))
 
+def frame_wall_visibility_slice(frame: frame_globals, domains: frame_domains)
+  wall_visibility =
+  let (inst, args) = build_visibility_walls(domains.walls, frame) in
+  { inst = inst, args = args }
+
 #[compute]
 entry walls(wbidx: []u32,
             #[uniform(set=1, binding=0)] frame: frame_globals)
   ([]block, [4]u32) =
-  build_visibility_walls(wbidx, frame)
+  let domains = { ground = wbidx, points = wbidx, items = wbidx, setts = wbidx, walls = wbidx }
+  let vis = frame_wall_visibility_slice(frame, domains) in
+  (vis.inst, vis.args)
 
 #[vertex]
 entry brick_vertex(#[builtin(vertex_index)] vid: i32,
