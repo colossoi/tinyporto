@@ -53,6 +53,18 @@ passing wgpu/naga) run it through the driver to catch validation errors.
 
 ---
 
+## Whole-frame composition blockers
+
+- **Unused whole-frame composition can perturb entry output-size inference.** Adding
+  an unused `render_frame(frame, events, world, history, domains)` that composes
+  `frame_state_scene_slice`, sett visibility, and wall visibility caused the
+  generated Rust signature for `step_out_bytes` to drop one size parameter
+  (`step_out_bytes(binding, tidx_bytes)` instead of the expected
+  `step_out_bytes(binding, pidx_bytes, tidx_bytes)`). The physical `step` entry was
+  unchanged, so generic helper use should not change the entry ABI inference.
+
+---
+
 ## Fixed this session (kept as regression repros)
 
 - **`filter` was serial, now shards** into flags/scan/scatter. `repro/r4_filter.wyn`,
