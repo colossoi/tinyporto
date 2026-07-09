@@ -8,11 +8,10 @@
 
 use crate::generated::{
     frame_prepare_out_bytes, frame_prepare_stages, gtao_main_out_bytes, gtao_main_stages,
-    light_out_bytes, light_stages, occ_reduce_out_bytes, occ_reduce_stages, BLIT_VERTEX_BINDINGS,
-    BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS,
-    FRAME_PREPARE_BINDINGS, FRAME_PREPARE_STAGE_COUNT, GTAO_MAIN_BINDINGS, GTAO_MAIN_STAGE_COUNT,
-    LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT,
-    RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS,
+    light_out_bytes, light_stages, BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS,
+    BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS,
+    FRAME_PREPARE_STAGE_COUNT, GTAO_MAIN_BINDINGS, GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS,
+    LIGHT_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS,
     SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
 };
 use crate::graph::*;
@@ -28,8 +27,8 @@ const TIDX_BYTES: u64 = TESS_CAP * 4;
 const PIDX_BYTES: u64 = POINTS_CAP * 4;
 const IIDX_BYTES: u64 = ITEMS_CAP * 4;
 const BIDX_BYTES: u64 = BRICK_COUNT * 4;
-// Coarse occlusion grid (Hi-Z simple): window (1280x800) / 8. `occ_reduce`
-// dispatches one invocation per coarse texel (sized from occ_depth's pixel count).
+// Coarse occlusion grid (Hi-Z simple): window (1280x800) / 8. `gtao_main`'s first
+// OCC_COUNT invocations reduce one coarse texel each.
 const OCC_COUNT: u64 = 160 * 100;
 // Wall-brick budget (must match walls.wyn: BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS =
 // N_WALL*PER_COURSE*COURSES + 128 + 8 = 8*13*24 + 136 = 2632). `wbidx` is the iota
@@ -44,18 +43,13 @@ const PXL_COUNT: u64 = 1280 * 800;
 pub const EV_CAP: usize = 32;
 const EVENTS_BYTES: u64 = EV_CAP as u64 * 16;
 
-// `occ_reduce` writes only occ_depth (an image, not a buffer) — no sized outputs.
-const fn occ_out(binding: u32) -> u64 {
-    occ_reduce_out_bytes(binding)
-}
-
 // Logical frame preparation advances state, builds ground geometry, and emits
 // visibility records for both cobble setts and wall bricks.
 const fn frame_prepare_out(binding: u32) -> u64 {
     frame_prepare_out_bytes(binding, BIDX_BYTES, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES)
 }
 
-// `light` / GTAO passes write only images (lit / ao_work) — no sized
+// `light` / GTAO passes write only images (lit / ao_work / occ_depth) — no sized
 // buffer outputs, so their out-size calcs take just the binding.
 const fn light_out(binding: u32) -> u64 {
     light_out_bytes(binding)
@@ -67,7 +61,6 @@ const fn gtao_main_out(binding: u32) -> u64 {
 // Ordered compute stages per entry, dispatch sized from the seed counts. The
 // stage entry names and per-stage dispatch rules come from the descriptor (via
 // the generated `*_stages`); only the seed byte sizes are authored here.
-static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OCC_COUNT);
 static FRAME_PREPARE_STAGES: [ComputeStage; FRAME_PREPARE_STAGE_COUNT] =
     frame_prepare_stages(BIDX_BYTES, IIDX_BYTES, OCC_COUNT, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES);
 static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_COUNT);
@@ -195,8 +188,8 @@ pub const GRAPH: Graph = Graph {
         }),
         Resource::Depth,
         // Nine Phase 2 (Hi-Z): the scene writes window-space depth here as a second
-        // MRT target; `occ_reduce` mins it into the coarse occ_depth, which `cull`
-        // reads to occlusion-test candidates. `otile` is occ_reduce's iota domain.
+        // MRT target; `gtao_main` mins it into the coarse occ_depth, which `cull`
+        // reads to occlusion-test candidates.
         Resource::Image {
             name: "scene_depth",
             format: TexFormat::R32Float,
@@ -424,19 +417,10 @@ pub const GRAPH: Graph = Graph {
                 },
             ],
         }),
-        // Hi-Z reduce: min the scene depth (written by the pass above) into the
-        // coarse occ_depth. Runs last so it sees this frame's depth; `cull` reads
-        // the result next frame. No visible output — pure occlusion bookkeeping.
-        Pass::Compute(ComputePass {
-            label: "occ_reduce",
-            module: "main",
-            bindings: OCC_REDUCE_BINDINGS,
-            stages: &OCC_STAGES,
-            out_bytes: occ_out,
-        }),
-        // GTAO: integrate horizon AO directly from scene_depth into ao_work. Runs
-        // after the scene pass and before `light`, which reads ao_work and folds
-        // the edge-aware denoise into its shading.
+        // GTAO + Hi-Z reduce: one pass over the scene depth written above. Every
+        // invocation integrates horizon AO into ao_work; the first OCC_COUNT also min
+        // their coarse occ_depth tile, which `cull` reads next frame. Runs before
+        // `light`, which reads ao_work and folds the edge-aware denoise into shading.
         Pass::Compute(ComputePass {
             label: "gtao_main",
             module: "main",

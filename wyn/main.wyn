@@ -351,10 +351,9 @@ def frame_sett_visibility_slice(sc: painted, frame: frame_globals,
   let (inst, args) = build_visibility_setts(domains.setts, sc, frame, history.occ_depth) in
   { inst = inst, args = args }
 
--- Coarse-depth reduction: one invocation per occ_depth texel mins the OCC_TILE^2
--- block of scene_depth under it. Runs after the scene pass; cull reads it next
--- frame. The write target `od` is listed first so the dispatch is sized from it
--- (occ_depth = OCC_W x OCC_H), not the window-sized scene_depth it reads.
+-- Coarse-depth reduction: mins the OCC_TILE^2 block of scene_depth under one
+-- occ_depth texel. Dispatched from `gtao_main` (both read scene_depth right after
+-- the scene pass); `cull` reads the result next frame.
 def occ_reduce_tile(sd: storage_image, tile: vec2i32) vec4f32 =
   let tx = tile.x
   let ty = tile.y
@@ -365,14 +364,6 @@ def occ_reduce_tile(sd: storage_image, tile: vec2i32) vec4f32 =
       let v = image_load(sd, @[sx, sy]) in
       f32.min(m, v.x) in
   @[m, m, m, m]
-
-#[compute]
-entry occ_reduce(#[builtin(global_invocation_id)] gid: vec3u32,
-                 #[view(occ_depth, storage_write)]  od: *storage_image,
-                 #[view(scene_depth, storage_read)] sd: storage_image)
-  () =
-  let xy = pixel_xy(gid, OCC_W) in
-  od with [xy] = occ_reduce_tile(sd, xy)
 
 ------------------------------------------------------------
 -- Deferred G-buffer (Nine Phase 3, the "thin raster waist"). The scene fragments
@@ -767,11 +758,19 @@ def gtao_main_pixel(sd: storage_image, xy: vec2i32) vec4f32 =
   let vis = gtao.finalize_visibility(visibility, 3, gtao_consts) in
   @[vis, packed_edges, 0.0, 1.0]
 
+-- One post-scene pass over scene_depth. Every invocation integrates AO for its
+-- pixel into ao_work; the first OCC_W * OCC_H of them also reduce one coarse
+-- occ_depth tile. `aw` is listed first so the dispatch is sized from it (the
+-- window), which covers the smaller occ_depth grid.
 #[compute]
 entry gtao_main(#[builtin(global_invocation_id)] gid: vec3u32,
                 #[view(ao_work, storage_write)] aw: *storage_image,
+                #[view(occ_depth, storage_write)] od: *storage_image,
                 #[view(scene_depth, storage_read)] sd: storage_image)
   () =
+  let i = i32(gid.x)
+  let tile = @[i % OCC_W, i / OCC_W]
+  let _od = if i < OCC_W * OCC_H then od with [tile] = occ_reduce_tile(sd, tile) else od
   let xy = pixel_xy(gid, 1280) in
   aw with [xy] = gtao_main_pixel(sd, xy)
 
