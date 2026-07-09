@@ -7,15 +7,14 @@
 //! per-frame schedule.
 
 use crate::generated::{
-    frame_visibility_out_bytes, frame_visibility_stages, gtao_depth_out_bytes,
-    gtao_depth_stages, gtao_main_out_bytes, gtao_main_stages, light_out_bytes, light_stages,
-    occ_reduce_out_bytes, occ_reduce_stages, step_out_bytes, step_stages, BLIT_VERTEX_BINDINGS,
-    BRICK_FRAGMENT_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS,
-    FRAME_VISIBILITY_BINDINGS, FRAME_VISIBILITY_STAGE_COUNT, GTAO_DEPTH_BINDINGS,
-    GTAO_DEPTH_STAGE_COUNT, GTAO_MAIN_BINDINGS, GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS,
-    LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS, OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS,
-    SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS,
-    SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS, STEP_BINDINGS, STEP_STAGE_COUNT,
+    frame_prepare_out_bytes, frame_prepare_stages, gtao_depth_out_bytes, gtao_depth_stages,
+    gtao_main_out_bytes, gtao_main_stages, light_out_bytes, light_stages, occ_reduce_out_bytes,
+    occ_reduce_stages, BLIT_VERTEX_BINDINGS, BRICK_FRAGMENT_BINDINGS,
+    BRICK_SHADOW_VERTEX_BINDINGS, BRICK_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS,
+    FRAME_PREPARE_STAGE_COUNT, GTAO_DEPTH_BINDINGS, GTAO_DEPTH_STAGE_COUNT, GTAO_MAIN_BINDINGS,
+    GTAO_MAIN_STAGE_COUNT, LIGHT_BINDINGS, LIGHT_STAGE_COUNT, OCC_REDUCE_BINDINGS,
+    OCC_REDUCE_STAGE_COUNT, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
+    SCENE_VERTEX_BINDINGS, SETT_FRAGMENT_BINDINGS, SETT_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
 };
 use crate::graph::*;
 
@@ -46,21 +45,15 @@ const PXL_COUNT: u64 = 1280 * 800;
 pub const EV_CAP: usize = 32;
 const EVENTS_BYTES: u64 = EV_CAP as u64 * 16;
 
-// `step`'s output sizes, by binding, from the generated calc (the seed sizes are
-// baked in). The driver pairs this with the binding table to size each output
-// buffer by name — no output binding numbers appear here.
-const fn step_out(binding: u32) -> u64 {
-    step_out_bytes(binding, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES)
-}
-
 // `occ_reduce` writes only occ_depth (an image, not a buffer) — no sized outputs.
 const fn occ_out(binding: u32) -> u64 {
     occ_reduce_out_bytes(binding)
 }
 
-// Logical visibility emits both cobble sett instances and wall-brick instances.
-const fn frame_visibility_out(binding: u32) -> u64 {
-    frame_visibility_out_bytes(binding, BIDX_BYTES, WBIDX_BYTES)
+// Logical frame preparation advances state, builds ground geometry, and emits
+// visibility records for both cobble setts and wall bricks.
+const fn frame_prepare_out(binding: u32) -> u64 {
+    frame_prepare_out_bytes(binding, BIDX_BYTES, IIDX_BYTES, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES)
 }
 
 // `light` / GTAO passes write only images (lit / vdepth / ao_work) — no sized
@@ -78,11 +71,9 @@ const fn gtao_main_out(binding: u32) -> u64 {
 // Ordered compute stages per entry, dispatch sized from the seed counts. The
 // stage entry names and per-stage dispatch rules come from the descriptor (via
 // the generated `*_stages`); only the seed byte sizes are authored here.
-static STEP_STAGES: [ComputeStage; STEP_STAGE_COUNT] =
-    step_stages(IIDX_BYTES, PIDX_BYTES, TIDX_BYTES);
 static OCC_STAGES: [ComputeStage; OCC_REDUCE_STAGE_COUNT] = occ_reduce_stages(OCC_COUNT);
-static FRAME_VISIBILITY_STAGES: [ComputeStage; FRAME_VISIBILITY_STAGE_COUNT] =
-    frame_visibility_stages(BIDX_BYTES, OCC_COUNT, WBIDX_BYTES);
+static FRAME_PREPARE_STAGES: [ComputeStage; FRAME_PREPARE_STAGE_COUNT] =
+    frame_prepare_stages(BIDX_BYTES, IIDX_BYTES, OCC_COUNT, PIDX_BYTES, TIDX_BYTES, WBIDX_BYTES);
 static LIGHT_STAGES: [ComputeStage; LIGHT_STAGE_COUNT] = light_stages(PXL_COUNT);
 static GTAO_DEPTH_STAGES: [ComputeStage; GTAO_DEPTH_STAGE_COUNT] = gtao_depth_stages(PXL_COUNT);
 static GTAO_MAIN_STAGES: [ComputeStage; GTAO_MAIN_STAGE_COUNT] = gtao_main_stages(PXL_COUNT);
@@ -320,15 +311,15 @@ pub const GRAPH: Graph = Graph {
         ("head_in", "head"),
         ("events", "events"),
         ("frame", "frame"),
-        ("step_output_0", "uistate"),
-        ("step_output_1", "points"),
-        ("step_output_2", "items"),
-        ("step_output_3", "head"),
-        ("step_output_4", "geom_pos"),
-        ("step_output_5", "geom_nrm"),
-        ("step_output_6", "draw_args"),
-        ("frame_visibility_output_0", "sett_inst"),
-        ("frame_visibility_output_1", "sett_args"),
+        ("frame_prepare_output_0", "uistate"),
+        ("frame_prepare_output_1", "points"),
+        ("frame_prepare_output_2", "items"),
+        ("frame_prepare_output_3", "head"),
+        ("frame_prepare_output_4", "geom_pos"),
+        ("frame_prepare_output_5", "geom_nrm"),
+        ("frame_prepare_output_6", "draw_args"),
+        ("frame_prepare_output_7", "sett_inst"),
+        ("frame_prepare_output_8", "sett_args"),
         ("geom_pos", "geom_pos"),
         ("geom_nrm", "geom_nrm"),
         ("sett_inst", "sett_inst"),
@@ -346,8 +337,8 @@ pub const GRAPH: Graph = Graph {
         ("aw", "ao_work"),
         // Brick generator I/O + the instanced brick draw.
         ("wbidx", "wbidx"),
-        ("frame_visibility_output_2", "wall_brick_inst"),
-        ("frame_visibility_output_3", "wall_brick_args"),
+        ("frame_prepare_output_9", "wall_brick_inst"),
+        ("frame_prepare_output_10", "wall_brick_args"),
         ("wall_brick_inst", "wall_brick_inst"),
         // Deferred lighting output: `light` writes `lit` (view `lt`); the resolve
         // fragment reads it.
@@ -355,23 +346,14 @@ pub const GRAPH: Graph = Graph {
     ],
 
     passes: &[
-        // Advance all persistent state + tessellate the ribbon (one kernel).
+        // Logical frame preparation: advance persistent state, tessellate the
+        // ground ribbon, and build visibility records for cobble/wall instances.
         Pass::Compute(ComputePass {
-            label: "step",
+            label: "frame_prepare",
             module: "main",
-            bindings: STEP_BINDINGS,
-            stages: &STEP_STAGES,
-            out_bytes: step_out,
-        }),
-        // Logical visibility: build one record per cobble cell and wall slot.
-        // Culled setts/bricks self-cull in the vertex; the candidate budgets are
-        // small enough to avoid compacting.
-        Pass::Compute(ComputePass {
-            label: "frame_visibility",
-            module: "main",
-            bindings: FRAME_VISIBILITY_BINDINGS,
-            stages: &FRAME_VISIBILITY_STAGES,
-            out_bytes: frame_visibility_out,
+            bindings: FRAME_PREPARE_BINDINGS,
+            stages: &FRAME_PREPARE_STAGES,
+            out_bytes: frame_prepare_out,
         }),
         // Sun shadow map: rasterize the wall bricks through the sun's ortho light
         // camera, storing nearest light-space depth into sun_depth. Reuses the shared

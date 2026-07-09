@@ -249,18 +249,6 @@ def frame_state_scene_slice(frame: frame_globals, events: []vec4f32,
   { world = w2,
     scene = { geom_pos = geom_pos, geom_nrm = geom_nrm, draw_args = draw_args } }
 
-#[compute]
-entry step(tidx: []u32, pidx: []u32, iidx: []u32,
-           uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
-           events: []vec4f32,
-           #[uniform(set=1, binding=0)] frame: frame_globals)
-  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32) =
-  let w = { ui = uistate_in, points = points_in, items = items_in, head = head_in }
-  let domains = { ground = tidx, points = pidx, items = iidx, setts = tidx, walls = tidx }
-  let out = frame_state_scene_slice(frame, events, w, domains) in
-  (out.world.ui, out.world.points, out.world.items, out.world.head,
-   out.scene.geom_pos, out.scene.geom_nrm, out.scene.draw_args)
-
 ------------------------------------------------------------
 -- Hi-Z occlusion (Nine, simple single-level form). The scene writes window-space
 -- depth into scene_depth (MRT); `occ_reduce` mins it down to a coarse occ_depth
@@ -598,15 +586,21 @@ def frame_visibility_slice(sc: painted, frame: frame_globals,
     wall_inst = walls.inst, wall_args = walls.args }
 
 #[compute]
-entry frame_visibility(bidx: []u32, wbidx: []u32,
-                       items_in: []vec4f32, points_in: []vec2f32,
-                       #[uniform(set=1, binding=0)] frame: frame_globals,
-                       #[view(occ_depth, storage_read)] od: storage_image)
-  ([]vec4f32, [4]u32, []block, [4]u32) =
-  let domains = { ground = bidx, points = bidx, items = bidx, setts = bidx, walls = wbidx }
+entry frame_prepare(tidx: []u32, pidx: []u32, iidx: []u32, bidx: []u32, wbidx: []u32,
+                    uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
+                    events: []vec4f32,
+                    #[uniform(set=1, binding=0)] frame: frame_globals,
+                    #[view(occ_depth, storage_read)] od: storage_image)
+  ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32,
+   []vec4f32, [4]u32, []block, [4]u32) =
+  let w = { ui = uistate_in, points = points_in, items = items_in, head = head_in }
+  let domains = { ground = tidx, points = pidx, items = iidx, setts = bidx, walls = wbidx }
+  let state_scene = frame_state_scene_slice(frame, events, w, domains)
   let sc = { points = points_in, items = items_in }
   let vis = frame_visibility_slice(sc, frame, { occ_depth = od }, domains) in
-  (vis.sett_inst, vis.sett_args, vis.wall_inst, vis.wall_args)
+  (state_scene.world.ui, state_scene.world.points, state_scene.world.items, state_scene.world.head,
+   state_scene.scene.geom_pos, state_scene.scene.geom_nrm, state_scene.scene.draw_args,
+   vis.sett_inst, vis.sett_args, vis.wall_inst, vis.wall_args)
 
 -- Canonical logical frame composition for the CPU/compute-owned portions of the
 -- renderer. Raster passes still sit at physical entry boundaries, but this is the
