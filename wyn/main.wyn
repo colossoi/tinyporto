@@ -139,6 +139,14 @@ type frame_visibility = {
   visibility: visibility,
 }
 
+type lighting_inputs = {
+  g_albedo: storage_image,
+  g_normal: storage_image,
+  scene_depth: storage_image,
+  sun_depth: storage_image,
+  ao_work: texture2d,
+}
+
 type state_update = {
   ui: ui_state,
   head: stroke_head,
@@ -799,6 +807,11 @@ def shade_frame(ga: storage_image, gn: storage_image, sd: storage_image,
       let shm_frac = sun_shadow_pcf(shm, p, rx, ry) in
       shade_surface(base, n, ao, shc, shm_frac)
 
+def frame_lighting_pixel(inputs: lighting_inputs, frame: frame_globals,
+                         sc: painted, xy: vec2i32) vec4f32 =
+  shade_frame(inputs.g_albedo, inputs.g_normal, inputs.scene_depth,
+              inputs.sun_depth, inputs.ao_work, frame, sc, xy.x, xy.y)
+
 -- The entry is just the dispatch: one invocation per pixel calls shade_frame and
 -- writes the result to `lit`. `lt` (the write target) is listed first so the
 -- dispatch is sized from it (all its images are window-sized, so the choice is
@@ -816,7 +829,8 @@ entry light(#[builtin(global_invocation_id)] gid: vec3u32,
   () =
   let w = i32(frame.resolution.x)
   let xy = pixel_xy(gid, w)
-  let col = shade_frame(ga, gn, sd, shm, aw, frame, { points = points_in, items = items_in }, xy.x, xy.y) in
+  let inputs = { g_albedo = ga, g_normal = gn, scene_depth = sd, sun_depth = shm, ao_work = aw }
+  let col = frame_lighting_pixel(inputs, frame, { points = points_in, items = items_in }, xy) in
   lt with [xy] = col
 
 ------------------------------------------------------------
