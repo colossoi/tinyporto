@@ -164,6 +164,31 @@ fn id(s: &str) -> Ident {
     Ident::new(s, Span::call_site())
 }
 
+// Resolve `wyn` the way the shell will: scan PATH, honouring PATHEXT on Windows so
+// `wyn` matches `wyn.exe`. Returns the first hit, or None if PATH has no match.
+fn which_wyn() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    // On Windows a bare `wyn` resolves against PATHEXT; elsewhere the name is literal.
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE".into())
+            .split(';')
+            .map(|e| e.to_ascii_lowercase())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in &exts {
+            let cand = dir.join(format!("wyn{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 fn rerun_if_wyn_changed(dir: &std::path::Path) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
         let path = entry.expect("read_dir entry").path();
@@ -451,6 +476,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     rerun_if_wyn_changed(&repo.join("wyn"));
 
+    // Recompile when the compiler itself changes (reinstalled from a new HEAD), not
+    // only when a `.wyn` source does — otherwise a fresh `wyn` links stale SPIR-V.
+    // Track the resolved binary's mtime, and PATH so swapping which `wyn` is found
+    // also counts. Fall back to the bare name if resolution fails.
+    let wyn = which_wyn().unwrap_or_else(|| PathBuf::from("wyn"));
+    println!("cargo:rerun-if-changed={}", wyn.display());
+    println!("cargo:rerun-if-env-changed=PATH");
+
     // One codegen path (quote). Each root contributes its embedded-SPIR-V row and
     // its descriptor translation; everything is emitted into a single file.
     let mut shader_rows: Vec<TokenStream> = Vec::new();
@@ -459,7 +492,7 @@ fn main() {
     for (key, rel) in ROOTS {
         let src = repo.join(rel);
         let spv = out_dir.join(format!("{key}.spv"));
-        let status = Command::new("wyn")
+        let status = Command::new(&wyn)
             .args(["compile"])
             .arg(&src)
             .arg("-o")
