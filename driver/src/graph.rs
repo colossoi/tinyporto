@@ -104,8 +104,6 @@ pub enum Resource {
         size: ImgSize,
         mips: u32,
     },
-    /// A filtering sampler bound to `sampler` params.
-    Sampler { name: &'static str },
 }
 
 /// How a binding resolves a ping-pong resource for the current frame.
@@ -122,18 +120,16 @@ pub enum Role {
 pub enum TexFormat {
     Rgba8Unorm,
     Rgba16Float,
-    Rgba32Float,
     R32Float,
 }
 
 impl TexFormat {
-    /// Whether a sampled view of this format supports linear filtering. The
-    /// single-/four-channel 32-bit float formats are unfilterable on the default
-    /// feature set, so a sampled `texture2d` over them must declare
-    /// `Float { filterable: false }` (they are read via `texture_load`, not a
-    /// filtering sampler).
+    /// Whether a sampled view of this format supports linear filtering. 32-bit
+    /// float formats are unfilterable on the default feature set, so a sampled
+    /// `texture2d` over them must declare `Float { filterable: false }` (they are
+    /// read via `texture_load`, not a filtering sampler).
     pub fn filterable(self) -> bool {
-        !matches!(self, TexFormat::R32Float | TexFormat::Rgba32Float)
+        !matches!(self, TexFormat::R32Float)
     }
 }
 
@@ -163,14 +159,8 @@ pub enum BindingKind {
     Uniform,
     StorageRead,
     StorageWrite,
-    /// Read and written by the shader (e.g. a fused `filter`'s scan/gather scratch,
-    /// which one stage fills and a later stage consumes in place). Non-read-only in
-    /// the layout; auto-sized/allocated as scratch like a StorageWrite output.
-    StorageReadWrite,
     /// A sampled `texture2d` (f32, 2D, filterable — Wyn's texture2d is monomorphic).
     Texture,
-    /// A filtering `sampler`.
-    Sampler,
     /// A `storage_image` view: fixed `vec4f32` texels; `format` is the on-GPU pixel
     /// format and `access` is how the shader reads/writes it.
     StorageImage {

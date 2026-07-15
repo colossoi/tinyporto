@@ -96,9 +96,7 @@ enum BuiltPass {
 struct Renderer {
     gfx: Gfx,
     buffers: HashMap<&'static str, wgpu::Buffer>,
-    images: HashMap<&'static str, wgpu::Texture>,
     image_views: HashMap<&'static str, wgpu::TextureView>,
-    samplers: HashMap<&'static str, wgpu::Sampler>,
     /// Uniform blocks to fill each frame: (buffer name, members, std140 layout).
     blocks: Vec<(
         &'static str,
@@ -112,13 +110,12 @@ struct Renderer {
 }
 
 /// Borrowed bundle of the physical GPU resources a bind group resolves against —
-/// storage/uniform buffers, ping-pong pairs, image views, and samplers.
+/// storage/uniform buffers, ping-pong pairs, and image views.
 #[derive(Clone, Copy)]
 struct Res<'a> {
     buffers: &'a HashMap<&'static str, wgpu::Buffer>,
     pp: &'a HashMap<&'static str, [wgpu::Buffer; 2]>,
     views: &'a HashMap<&'static str, wgpu::TextureView>,
-    samplers: &'a HashMap<&'static str, wgpu::Sampler>,
     /// On-GPU pixel format of each image resource, keyed by name — lets a sampled
     /// `texture2d` binding declare the correct `filterable` sample type.
     img_formats: &'a HashMap<&'static str, TexFormat>,
@@ -141,10 +138,7 @@ impl Renderer {
         for pass in &graph.passes {
             if let Pass::Compute(cp) = pass {
                 for &(_, binding, kind, name) in cp.bindings {
-                    if matches!(
-                        kind,
-                        BindingKind::StorageWrite | BindingKind::StorageReadWrite
-                    ) {
+                    if matches!(kind, BindingKind::StorageWrite) {
                         derived.insert(name_to_resource(graph, name), (cp.out_bytes)(binding));
                     }
                 }
@@ -161,10 +155,8 @@ impl Renderer {
         // Resources.
         let mut buffers: HashMap<&'static str, wgpu::Buffer> = HashMap::new();
         let mut pingpong: HashMap<&'static str, [wgpu::Buffer; 2]> = HashMap::new();
-        let mut images: HashMap<&'static str, wgpu::Texture> = HashMap::new();
         let mut image_views: HashMap<&'static str, wgpu::TextureView> = HashMap::new();
         let mut img_formats: HashMap<&'static str, TexFormat> = HashMap::new();
-        let mut samplers: HashMap<&'static str, wgpu::Sampler> = HashMap::new();
         let mut blocks: Vec<(
             &'static str,
             &'static [BlockMember],
@@ -218,11 +210,7 @@ impl Renderer {
                         name,
                         tex.create_view(&wgpu::TextureViewDescriptor::default()),
                     );
-                    images.insert(name, tex);
                     img_formats.insert(name, format);
-                }
-                Resource::Sampler { name } => {
-                    samplers.insert(name, make_sampler(device, name));
                 }
                 Resource::Depth => has_depth = true,
             }
@@ -242,7 +230,6 @@ impl Renderer {
             buffers: &buffers,
             pp: &pingpong,
             views: &image_views,
-            samplers: &samplers,
             img_formats: &img_formats,
         };
 
@@ -283,9 +270,7 @@ impl Renderer {
         Ok(Self {
             gfx,
             buffers,
-            images,
             image_views,
-            samplers,
             blocks,
             depth_view,
             passes,
@@ -740,7 +725,6 @@ fn wgpu_format(f: TexFormat) -> wgpu::TextureFormat {
     match f {
         TexFormat::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
         TexFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
-        TexFormat::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
         TexFormat::R32Float => wgpu::TextureFormat::R32Float,
     }
 }
@@ -800,19 +784,6 @@ fn create_image(
         format: wgpu_format(format),
         usage,
         view_formats: &[],
-    })
-}
-
-fn make_sampler(device: &wgpu::Device, label: &str) -> wgpu::Sampler {
-    device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some(label),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
     })
 }
 
@@ -920,8 +891,7 @@ fn variant_count(bindings: &[Binding]) -> usize {
 
 /// Resolve a buffer binding to its physical buffer for `parity`. Ping-pong: this
 /// frame's buffer is index `parity` (Next); last frame's is `1 - parity` (Prev).
-/// Only called for buffer kinds; image/sampler kinds resolve via `res.views` /
-/// `res.samplers`.
+/// Only called for buffer kinds; image kinds resolve via `res.views`.
 fn resolve<'a>(b: &Binding, parity: usize, res: Res<'a>) -> &'a wgpu::Buffer {
     match b.role {
         Role::Plain => res
@@ -949,21 +919,18 @@ fn layout_type(kind: BindingKind, filterable: bool) -> wgpu::BindingType {
             has_dynamic_offset: false,
             min_binding_size: None,
         },
-        BindingKind::StorageRead | BindingKind::StorageWrite | BindingKind::StorageReadWrite => {
-            wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage {
-                    read_only: matches!(kind, BindingKind::StorageRead),
-                },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            }
-        }
+        BindingKind::StorageRead | BindingKind::StorageWrite => wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage {
+                read_only: matches!(kind, BindingKind::StorageRead),
+            },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
         BindingKind::Texture => wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable },
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },
-        BindingKind::Sampler => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         BindingKind::StorageImage { format, access } => wgpu::BindingType::StorageTexture {
             access: match access {
                 ImgAccess::Read => wgpu::StorageTextureAccess::ReadOnly,
@@ -1021,11 +988,6 @@ fn build_sets(
                                 .unwrap_or_else(|| panic!("no image view '{}'", b.resource)),
                         )
                     }
-                    BindingKind::Sampler => wgpu::BindingResource::Sampler(
-                        res.samplers
-                            .get(b.resource)
-                            .unwrap_or_else(|| panic!("no sampler '{}'", b.resource)),
-                    ),
                     _ => resolve(b, parity, res).as_entire_binding(),
                 };
                 wgpu::BindGroupEntry {

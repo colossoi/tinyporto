@@ -87,10 +87,11 @@ impl Binding {
         match (self.ty.as_str(), self.access.as_deref()) {
             ("uniform", _) => quote! { BindingKind::Uniform },
             ("storage_buffer", Some("write_only")) => quote! { BindingKind::StorageWrite },
-            ("storage_buffer", Some("read_write")) => quote! { BindingKind::StorageReadWrite },
+            ("storage_buffer", Some("read_write")) => {
+                panic!("descriptor: read_write storage bindings are not supported")
+            }
             ("storage_buffer", _) => quote! { BindingKind::StorageRead },
             ("texture", _) => quote! { BindingKind::Texture },
-            ("sampler", _) => quote! { BindingKind::Sampler },
             ("storage_texture", acc) => {
                 let format = self.format_tokens();
                 let access = match acc {
@@ -110,7 +111,6 @@ impl Binding {
         match self.format.as_deref() {
             Some("rgba8_unorm") => quote! { TexFormat::Rgba8Unorm },
             Some("rgba16_float") => quote! { TexFormat::Rgba16Float },
-            Some("rgba32_float") => quote! { TexFormat::Rgba32Float },
             Some("r32_float") => quote! { TexFormat::R32Float },
             other => panic!("descriptor: storage_texture format {other:?}"),
         }
