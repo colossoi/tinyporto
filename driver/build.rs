@@ -139,6 +139,10 @@ struct Stage {
     entry_point: String,
     #[serde(default)]
     dispatch_size: Option<DispatchSize>,
+    /// Binding slots this stage writes; associates a `same_as_dispatch` output
+    /// with the (unique) domain-derived stage that produces it.
+    #[serde(default)]
+    writes: Vec<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -152,12 +156,14 @@ enum DispatchSize {
 }
 
 /// The domain a `DerivedFrom` dispatch is sized from. A storage-buffer input
-/// (`ceil(len_elems / wg)`) or a storage image (`ceil(width*height / wg)`).
+/// (`ceil(len_elems / wg)`), a storage image (`ceil(width*height / wg)`), or a
+/// compile-time element count (`ceil(count / wg)`, an `iota` domain).
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Len {
     InputBinding { binding: u32, elem_bytes: u64 },
     StorageImage { set: u32, binding: u32 },
+    Fixed { count: u64 },
 }
 
 fn id(s: &str) -> Ident {
@@ -226,6 +232,28 @@ fn dispatch_input(p: &Pipeline) -> (u32, u64) {
         }
     }
     found.expect("same_as_dispatch needs a buffer-derived dispatch")
+}
+
+/// The dispatch domain of the stage that writes output `binding` — the domain a
+/// `same_as_dispatch` output is sized by. With mixed domains in one pipeline
+/// (several iota maps), each output must be sized from ITS producing stage, not
+/// a pipeline-wide domain. Fixed{1,1,1} prelude stages list every output as a
+/// write, so only domain-derived stages count; None falls back to the legacy
+/// pipeline-wide `dispatch_input`.
+fn output_domain<'a>(p: &'a Pipeline, binding: u32) -> Option<&'a Len> {
+    let mut found: Option<&Len> = None;
+    for s in &p.stages {
+        if let Some(DispatchSize::DerivedFrom { len, .. }) = s.dispatch_size.as_ref() {
+            if s.writes.contains(&binding) {
+                assert!(
+                    found.is_none(),
+                    "output binding {binding} written by more than one domain-derived stage"
+                );
+                found = Some(len);
+            }
+        }
+    }
+    found
 }
 
 /// The pipeline's canonical entry name — the stage every stage name is prefixed
@@ -324,6 +352,11 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
                             disp_params.insert(param.to_string());
                             quote! { [(#param as u32).div_ceil(#wg), 1, 1] }
                         }
+                        // Compile-time count (an iota domain): a constant grid,
+                        // no argument needed.
+                        Len::Fixed { count } => {
+                            quote! { [(#count as u32).div_ceil(#wg), 1, 1] }
+                        }
                     }
                 }
             };
@@ -356,12 +389,28 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
                     params.insert(src.to_string());
                     quote! { (#src / #src_elem_bytes) * #elem_bytes }
                 }
-                Length::SameAsDispatch { elem_bytes } => {
-                    let (binding, src_elem_bytes) = dispatch_input(p);
-                    let src = input_param(p, binding);
-                    params.insert(src.to_string());
-                    quote! { (#src / #src_elem_bytes) * #elem_bytes }
-                }
+                Length::SameAsDispatch { elem_bytes } => match output_domain(p, b) {
+                    Some(Len::Fixed { count }) => quote! { #count * #elem_bytes },
+                    Some(Len::InputBinding {
+                        binding,
+                        elem_bytes: src_elem_bytes,
+                    }) => {
+                        let src = input_param(p, *binding);
+                        params.insert(src.to_string());
+                        quote! { (#src / #src_elem_bytes) * #elem_bytes }
+                    }
+                    Some(Len::StorageImage { set, binding }) => {
+                        let src = image_pixels_param(p, *set, *binding);
+                        params.insert(src.to_string());
+                        quote! { #src * #elem_bytes }
+                    }
+                    None => {
+                        let (binding, src_elem_bytes) = dispatch_input(p);
+                        let src = input_param(p, binding);
+                        params.insert(src.to_string());
+                        quote! { (#src / #src_elem_bytes) * #elem_bytes }
+                    }
+                },
             };
             quote! { #b => #expr }
         })

@@ -78,12 +78,10 @@ def pixel_xy(gid: vec3u32, w: i32) vec2i32 =
 
 -- One frame's whole state update. Reads the previous state (ping-pong prev) and
 -- the inputs; returns the next state. Output order: uistate, points, items, head.
--- pidx/iidx are iota index seeds so each `map` recovers its element index.
--- tidx is the iota seed for the tessellated-ribbon output (the geometry the
--- ground draw consumes). It tessellates the PREVIOUS points/items, so the
--- rendered geometry lags input by one frame (imperceptible).
--- tidx is first so the compiler derives the dispatch from it: it's the largest
--- map (the ribbon), and the smaller maps (points/items) run guarded within it.
+-- Each map runs over an `iota` index space so the lane knows its element index;
+-- the compiler folds the iota into the dispatch size (no index buffer exists).
+-- The ribbon tessellates the PREVIOUS points/items, so the rendered geometry
+-- lags input by one frame (imperceptible).
 -- The persistent painted-scene state, ping-ponged prev -> next each frame: the
 -- packed UI buffer, the control points, the packed items, and the packed capture
 -- head. One value threaded through the frame instead of four parallel buffers; the
@@ -95,16 +93,6 @@ type world = { ui: []f32, points: []vec2f32, items: []vec4f32, head: []f32 }
 -- bundle their two storage inputs into this to evaluate the canal SDF against one
 -- value.
 type painted = { points: []vec2f32, items: []vec4f32 }
-
--- Explicit logical frame domains. These are still backed by the same iota seed
--- buffers at the physical entry boundary, but the frame program names them by
--- meaning instead of by individual entry argument.
-type frame_domains = {
-  ground: []u32,
-  points: []u32,
-  items: []u32,
-  props: []u32,
-}
 
 -- Images that are intentionally read as history. `occ_depth` is produced after the
 -- scene pass and consumed by next frame's visibility pass; keeping it in this
@@ -186,16 +174,14 @@ def next_state(frame: frame_globals, events: []vec4f32,
      prev_point_count = pc, prev_item_count = ic },
    em)
 
-def update_points<[pn]>(prev_points: [pn]vec2f32, update: state_update,
-                        emitted: [16]vec2f32, indices: [pn]u32) [pn]vec2f32 =
-  map(|s| let i = i32(s)
-          let pc = update.prev_point_count in
+def update_points(prev_points: []vec2f32, update: state_update,
+                  emitted: [16]vec2f32) []vec2f32 =
+  map(|i| let pc = update.prev_point_count in
           if i >= pc && i - pc < update.emit_count then emitted[i - pc] else prev_points[i]
-      , indices)
+      , iota(POINTS_CAP))
 
-def update_items<[ni]>(prev_items: [ni]vec4f32, update: state_update, indices: [ni]u32) [ni]vec4f32 =
-  map(|s| let i = i32(s)
-          let pc = update.prev_point_count
+def update_items(prev_items: []vec4f32, update: state_update) []vec4f32 =
+  map(|i| let pc = update.prev_point_count
           let ic = update.prev_item_count
           let ec = update.emit_count in
           if update.press > 0.5 && i == ic then
@@ -205,44 +191,43 @@ def update_items<[ni]>(prev_items: [ni]vec4f32, update: state_update, indices: [
             pack_paint_item({ kind = it.kind, point_start = it.point_start,
                               point_count = it.point_count + ec, param = it.param })
           else prev_items[i]
-      , indices)
+      , iota(ITEMS_CAP))
 
-def ground_positions<[tn]>(items: []vec4f32, points: []vec2f32, indices: [tn]u32) [tn]vec4f32 =
-  map(|s| ground_pos(i32(s), items, points), indices)
+def ground_positions(items: []vec4f32, points: []vec2f32) []vec4f32 =
+  map(|s| ground_pos(s, items, points), iota(TESS_CAP))
 
-def ground_normals<[tn]>(items: []vec4f32, points: []vec2f32, indices: [tn]u32) [tn]vec4f32 =
-  map(|s| ground_nrm(i32(s), items, points), indices)
+def ground_normals(items: []vec4f32, points: []vec2f32) []vec4f32 =
+  map(|s| ground_nrm(s, items, points), iota(TESS_CAP))
 
 def ground_draw_args: [4]u32 =
   [u32(TESS_CAP), 1u32, 0u32, 0u32]
 
 -- Advance ALL persistent state one frame: fold events into the UI and capture head,
 -- append this frame's committed points, create/extend the current item. Reads the
--- previous `world` and returns the next. pidx/iidx are iota seeds so the point/item
--- maps recover their element index (and size their outputs to those domains).
-def update_world(frame: frame_globals, events: []vec4f32, w: world,
-                 pidx: []u32, iidx: []u32) world =
+-- previous `world` and returns the next. The point/item maps run over their own
+-- iota domains (POINTS_CAP / ITEMS_CAP), which also size their outputs.
+def update_world(frame: frame_globals, events: []vec4f32, w: world) world =
   let (update, emitted) = next_state(frame, events, w.ui, w.head) in
   { ui = pack_ui_state(update.ui),
-    points = update_points(w.points, update, emitted, pidx),
-    items = update_items(w.items, update, iidx),
+    points = update_points(w.points, update, emitted),
+    items = update_items(w.items, update),
     head = pack_stroke_head(update.head) }
 
 -- Ground geometry derived from the (previous) world: two parallel vertex streams
 -- (geom_pos = pos.xyz+kind, geom_nrm = nrm.xyz+attr) over the tessellation domain,
 -- plus the non-indexed ground draw args. Tessellates the PREVIOUS points/items, so
 -- rendered geometry lags input by one frame (imperceptible).
-def build_scene(w: world, tidx: []u32) ([]vec4f32, []vec4f32, [4]u32) =
-  (ground_positions(w.items, w.points, tidx),
-   ground_normals(w.items, w.points, tidx),
+def build_scene(w: world) ([]vec4f32, []vec4f32, [4]u32) =
+  (ground_positions(w.items, w.points),
+   ground_normals(w.items, w.points),
    ground_draw_args)
 
 -- State + generated ground scene slice of the logical frame. The physical `step`
 -- entry projects this record back to today's ABI tuple.
 def frame_state_scene_slice(frame: frame_globals, events: []vec4f32,
-                            w: world, domains: frame_domains) frame_state_scene =
-  let w2 = update_world(frame, events, w, domains.points, domains.items)
-  let (geom_pos, geom_nrm, draw_args) = build_scene(w, domains.ground) in
+                            w: world) frame_state_scene =
+  let w2 = update_world(frame, events, w)
+  let (geom_pos, geom_nrm, draw_args) = build_scene(w) in
   { world = w2,
     scene = { geom_pos = geom_pos, geom_nrm = geom_nrm, draw_args = draw_args } }
 
@@ -376,16 +361,15 @@ def prop_visible(p: prop) bool =
 def prop_draw_args(n: i32) [4]u32 =
   [36u32, u32(n), 0u32, 0u32]
 
-def build_visibility_props(propidx: []u32, sc: painted,
-                           frame: frame_globals, od: storage_image)
+def build_visibility_props(sc: painted, frame: frame_globals, od: storage_image)
   ([]prop, [4]u32) =
-  let cand = map(|s| prop_candidate(frame, sc, od, i32(s)), propidx) in
+  let cand = map(|s| prop_candidate(frame, sc, od, s), iota(PROP_SLOTS)) in
   (cand, prop_draw_args(PROP_SLOTS))
 
 def frame_prop_visibility_slice(sc: painted, frame: frame_globals,
-                                history: frame_history, domains: frame_domains)
+                                history: frame_history)
   prop_visibility =
-  let (inst, args) = build_visibility_props(domains.props, sc, frame, history.occ_depth) in
+  let (inst, args) = build_visibility_props(sc, frame, history.occ_depth) in
   { inst = inst, args = args }
 
 -- Coarse-depth reduction: mins the OCC_TILE^2 block of scene_depth under one
@@ -540,24 +524,22 @@ entry prop_fragment(#[varying(0)] world: vec3f32, #[varying(1)] iidf: f32,
     (@[0.0, 0.0, 0.0, 0.0], @[0.0, 0.0, 0.0, 0.0], 1.0, 1.0)
 
 def frame_visibility_slice(sc: painted, frame: frame_globals,
-                           history: frame_history, domains: frame_domains)
+                           history: frame_history)
   visibility =
-  let props = frame_prop_visibility_slice(sc, frame, history, domains) in
+  let props = frame_prop_visibility_slice(sc, frame, history) in
   { prop_inst = props.inst, prop_args = props.args }
 
 #[compute]
-entry frame_prepare(tidx: []u32, pidx: []u32, iidx: []u32, propidx: []u32,
-                    uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
+entry frame_prepare(uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32, head_in: []f32,
                     events: []vec4f32,
                     #[uniform(set=1, binding=0)] frame: frame_globals,
                     #[view(occ_depth, storage_read)] od: storage_image)
   ([]f32, []vec2f32, []vec4f32, []f32, []vec4f32, []vec4f32, []u32,
    []prop, [4]u32) =
   let w = { ui = uistate_in, points = points_in, items = items_in, head = head_in }
-  let domains = { ground = tidx, points = pidx, items = iidx, props = propidx }
-  let state_scene = frame_state_scene_slice(frame, events, w, domains)
+  let state_scene = frame_state_scene_slice(frame, events, w)
   let sc = { points = points_in, items = items_in }
-  let vis = frame_visibility_slice(sc, frame, { occ_depth = od }, domains) in
+  let vis = frame_visibility_slice(sc, frame, { occ_depth = od }) in
   (state_scene.world.ui, state_scene.world.points, state_scene.world.items, state_scene.world.head,
    state_scene.scene.geom_pos, state_scene.scene.geom_nrm, state_scene.scene.draw_args,
    vis.prop_inst, vis.prop_args)
@@ -566,10 +548,10 @@ entry frame_prepare(tidx: []u32, pidx: []u32, iidx: []u32, propidx: []u32,
 -- renderer. Raster passes still sit at physical entry boundaries, but this is the
 -- source-level shape they should eventually be lowered from.
 def render_frame(frame: frame_globals, events: []vec4f32, w: world,
-                 history: frame_history, domains: frame_domains) frame_outputs =
-  let state_scene = frame_state_scene_slice(frame, events, w, domains)
+                 history: frame_history) frame_outputs =
+  let state_scene = frame_state_scene_slice(frame, events, w)
   let sc = { points = w.points, items = w.items }
-  let visibility = frame_visibility_slice(sc, frame, history, domains) in
+  let visibility = frame_visibility_slice(sc, frame, history) in
   { state_scene = state_scene, visibility = visibility }
 
 ------------------------------------------------------------

@@ -58,8 +58,6 @@ pub struct DescriptorPassInfo {
 #[derive(Clone, Copy, Debug)]
 pub enum BufInit {
     Zeroed,
-    /// 0u32, 1u32, 2u32, … — a generic index seed for `map`.
-    Iota,
     /// Fixed u32 contents (e.g. a static draw_indirect args buffer).
     U32s(&'static [u32]),
 }
