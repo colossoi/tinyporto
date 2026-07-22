@@ -124,11 +124,6 @@ type frame_visibility = {
   visibility: visibility,
 }
 
-type frame_outputs = {
-  state_scene: frame_state_scene,
-  visibility: visibility,
-}
-
 type lighting_inputs = {
   g_albedo: storage_image,
   g_normal: storage_image,
@@ -543,16 +538,6 @@ entry frame_prepare(uistate_in: []f32, points_in: []vec2f32, items_in: []vec4f32
   (state_scene.world.ui, state_scene.world.points, state_scene.world.items, state_scene.world.head,
    state_scene.scene.geom_pos, state_scene.scene.geom_nrm, state_scene.scene.draw_args,
    vis.prop_inst, vis.prop_args)
-
--- Canonical logical frame composition for the CPU/compute-owned portions of the
--- renderer. Raster passes still sit at physical entry boundaries, but this is the
--- source-level shape they should eventually be lowered from.
-def render_frame(frame: frame_globals, events: []vec4f32, w: world,
-                 history: frame_history) frame_outputs =
-  let state_scene = frame_state_scene_slice(frame, events, w)
-  let sc = { points = w.points, items = w.items }
-  let visibility = frame_visibility_slice(sc, frame, history) in
-  { state_scene = state_scene, visibility = visibility }
 
 ------------------------------------------------------------
 -- Sun shadow map — caster pass. The wall-brick proxy boxes projected through the
