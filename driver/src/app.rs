@@ -7,10 +7,9 @@
 //! schedule.
 
 use crate::generated::{
-    frame_prepare_out_bytes, frame_prepare_stages, gtao_main_out_bytes, gtao_main_stages,
-    BLIT_VERTEX_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, FRAME_PREPARE_BINDINGS, GTAO_MAIN_BINDINGS,
-    GTAO_MAIN_STAGE_COUNT, PROP_FRAGMENT_BINDINGS, PROP_VERTEX_BINDINGS, RESOLVE_FRAGMENT_BINDINGS,
-    SCENE_FRAGMENT_BINDINGS, SCENE_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
+    BLIT_VERTEX_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, PROP_FRAGMENT_BINDINGS,
+    PROP_VERTEX_BINDINGS, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
+    SCENE_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
 };
 use crate::graph::*;
 
@@ -32,17 +31,12 @@ const WALL_BRICKS: u64 = 2632;
 pub const EV_CAP: usize = 32;
 const EVENTS_BYTES: u64 = EV_CAP as u64 * 16;
 
-// The GTAO pass writes only images (ao_work / occ_depth) — no sized buffer
-// outputs, so its out-size calc takes just the binding.
-const fn gtao_main_out(binding: u32) -> u64 {
-    gtao_main_out_bytes(binding)
-}
-
-// Ordered compute stages per entry. The stage entry names and per-stage dispatch
-// rules come from the descriptor (via the generated `*_stages`); the image-sized
-// ones take the live window, so nothing bakes a resolution.
-fn gtao_main_stage_list(w: u32, h: u32) -> [ComputeStage; GTAO_MAIN_STAGE_COUNT] {
-    gtao_main_stages((w as u64) * (h as u64))
+// Compute pass construction is descriptor-owned: bindings, lowered stages, and
+// output-size rules come from generated code. The host contributes only the live
+// surface pixel count for image-sized dispatches.
+fn compute_entry(module: &'static str, entry: &'static str, w: u32, h: u32) -> ComputePass {
+    crate::generated::descriptor_compute_entry(module, entry, (w as u64) * (h as u64))
+        .unwrap_or_else(|| panic!("descriptor has no constructible compute entry {module}:{entry}"))
 }
 
 // Draw lists, hoisted out of `graph` because a RenderItem reads the generated
@@ -297,13 +291,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
         passes: vec![
             // Logical frame preparation: advance persistent state, tessellate the
             // ground ribbon, and build visibility records for cobble/wall instances.
-            Pass::Compute(ComputePass {
-                label: "frame_prepare",
-                module: "main",
-                bindings: FRAME_PREPARE_BINDINGS,
-                stages: frame_prepare_stages().to_vec(),
-                out_bytes: frame_prepare_out_bytes,
-            }),
+            Pass::Compute(compute_entry("main", "frame_prepare", w, h)),
             // Sun shadow map: rasterize the wall bricks through the sun's ortho light
             // camera, storing nearest light-space depth into sun_depth. Reuses the shared
             // window depth buffer (cleared here, then re-cleared by the scene pass). Runs
@@ -350,13 +338,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
             // invocation integrates horizon AO into ao_work; the first occ_w*occ_h also min
             // their coarse occ_depth tile, which `cull` reads next frame. Runs before the
             // resolve, which reads ao_work and folds the edge-aware denoise into shading.
-            Pass::Compute(ComputePass {
-                label: "gtao_main",
-                module: "main",
-                bindings: GTAO_MAIN_BINDINGS,
-                stages: gtao_main_stage_list(w, h).to_vec(),
-                out_bytes: gtao_main_out,
-            }),
+            Pass::Compute(compute_entry("main", "gtao_main", w, h)),
             // Deferred resolve: one fullscreen triangle whose fragment reads the G-buffer,
             // folds in the GTAO term (including the edge-aware denoise of ao_work) and
             // writes the final colour (sun + shadows + AO-attenuated sky, tonemapped)

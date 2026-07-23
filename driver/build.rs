@@ -611,6 +611,33 @@ fn has_fixed_compute_factory(p: &Pipeline) -> bool {
             .all(|binding| matches!(binding.length, Some(Length::Fixed { .. })))
 }
 
+fn compute_stage_args(p: &Pipeline) -> Option<Vec<TokenStream>> {
+    let mut params = std::collections::BTreeSet::new();
+    for stage in &p.stages {
+        let Some(DispatchSize::DerivedFrom { len, .. }) = stage.dispatch_size.as_ref() else {
+            continue;
+        };
+        match len {
+            Len::Fixed { .. } => {}
+            Len::InputBinding { binding, .. } => {
+                intermediate_fixed_bytes(p, *binding)?;
+            }
+            Len::StorageImage { .. } => {
+                params.insert("window_pixels".to_string());
+            }
+        }
+    }
+    Some(
+        params
+            .into_iter()
+            .map(|param| {
+                let ident = id(&param);
+                quote! { #ident }
+            })
+            .collect(),
+    )
+}
+
 fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
     let Some(fg) = desc.frame_graph.as_ref() else {
         return quote! {};
@@ -651,6 +678,27 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
                     out_bytes: #out_bytes,
                 })
             }
+        });
+
+    let compute_entry_arms = desc
+        .pipelines
+        .iter()
+        .filter(|pipeline| pipeline.kind == "compute")
+        .filter_map(|pipeline| {
+            let entry = base_entry(pipeline);
+            let args = compute_stage_args(pipeline)?;
+            let bindings = id(&format!("{}_BINDINGS", entry.to_uppercase()));
+            let stages = id(&format!("{entry}_stages"));
+            let out_bytes = id(&format!("{entry}_out_bytes"));
+            Some(quote! {
+                (#key, #entry) => Some(crate::graph::ComputePass {
+                    label: #entry,
+                    module: #key,
+                    bindings: #bindings,
+                    stages: #stages(#(#args),*).to_vec(),
+                    out_bytes: #out_bytes,
+                })
+            })
         });
 
     let mut resource_arms = Vec::new();
@@ -713,6 +761,17 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
                 descriptor_prerequisite_pipelines,
                 descriptor_compute_pass,
             );
+        }
+
+        pub fn descriptor_compute_entry(
+            module: &'static str,
+            entry: &'static str,
+            window_pixels: u64,
+        ) -> Option<crate::graph::ComputePass> {
+            match (module, entry) {
+                #(#compute_entry_arms,)*
+                _ => None,
+            }
         }
 
         pub fn descriptor_resource(
