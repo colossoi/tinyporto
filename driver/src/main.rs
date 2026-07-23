@@ -11,7 +11,7 @@ mod wync;
 /// table (`SHADER_MODULES`), the per-pipeline binding tables (`*_BINDINGS`), and
 /// the dispatch/output-size calculations as `const fn`.
 mod generated {
-    #![allow(dead_code)]
+    #![allow(dead_code, non_snake_case)]
     include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 }
 
@@ -63,15 +63,18 @@ struct Args {
     /// effects (e.g. the water) for a still. The window path uses real elapsed time.
     #[arg(long, default_value_t = 0.0)]
     time: f32,
+    /// After a screenshot render, read these storage buffers back and print their
+    /// contents as u32 words (debug aid for compute outputs / compiler scratch).
+    #[arg(long, value_delimiter = ',')]
+    dump: Vec<String>,
 }
 
 // ---- built (concrete GPU) passes ----
 
 // `sets` is indexed by frame parity (len 1 if the pass has no ping-pong
-// binding, else 2). Each entry is the (set, bind group) list for that parity.
-// `stages` are the ordered (pipeline, dispatch-dims) the entry lowered to; they
-// share `sets` (one binding interface) and run sequentially.
+// binding, else 2). Ordered stages share the descriptor pipeline's union layout.
 struct BuiltCompute {
+    label: &'static str,
     stages: Vec<(wgpu::ComputePipeline, [u32; 3])>,
     sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
 }
@@ -137,9 +140,15 @@ impl Renderer {
         let mut derived: HashMap<&'static str, u64> = HashMap::new();
         for pass in &graph.passes {
             if let Pass::Compute(cp) = pass {
-                for &(_, binding, kind, name) in cp.bindings {
-                    if matches!(kind, BindingKind::StorageWrite) {
-                        derived.insert(name_to_resource(graph, name), (cp.out_bytes)(binding));
+                for &(_, binding, kind, _, name) in cp.bindings {
+                    if matches!(
+                        kind,
+                        BindingKind::StorageWrite | BindingKind::StorageReadWrite
+                    ) {
+                        derived.insert(
+                            name_to_resource(graph, cp.module, name),
+                            (cp.out_bytes)(binding),
+                        );
                     }
                 }
             }
@@ -346,13 +355,10 @@ impl Renderer {
             match pass {
                 BuiltPass::Compute(c) => {
                     let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("compute"),
+                        label: Some(c.label),
                         timestamp_writes: None,
                     });
                     let set_list = &c.sets[parity % c.sets.len()];
-                    // Stages share the binding interface; each writes disjoint
-                    // outputs from the shared inputs, so order is free — run them
-                    // in sequence within the one pass.
                     for (pipeline, groups) in &c.stages {
                         cp.set_pipeline(pipeline);
                         for (set, bg) in set_list {
@@ -451,6 +457,49 @@ impl Renderer {
         self.gfx.queue.submit(Some(enc.finish()));
         frame.present();
         self.frame = self.frame.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Debug: read a storage buffer back and print its contents as u32 words
+    /// (head, middle, and tail). Headless-path only — stalls the GPU.
+    fn dump_buffer(&self, name: &str) -> Result<()> {
+        let buf = self
+            .buffers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("no buffer '{name}' to dump"))?;
+        let size = buf.size();
+        let staging = self.gfx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dump"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .gfx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dump"),
+            });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        self.gfx.queue.submit(Some(enc.finish()));
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.gfx.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let data = slice.get_mapped_range();
+        let words: &[u32] = bytemuck::cast_slice(&data);
+        eprintln!("{name}: {size} bytes / {} words", words.len());
+        let show = |label: &str, start: usize, n: usize| {
+            let end = (start + n).min(words.len());
+            eprintln!("  {label} [{start}..{end}]: {:?}", &words[start..end]);
+        };
+        show("head", 0, 48);
+        if words.len() > 96 {
+            show("mid ", words.len() / 2, 24);
+            show("tail", words.len() - 24, 24);
+        }
         Ok(())
     }
 
@@ -593,41 +642,43 @@ impl Renderer {
 }
 
 fn validate_descriptor_graph(graph: &Graph) -> Result<()> {
-    let mut expected: Vec<(&'static str, &'static str)> = Vec::new();
+    let mut expected: Vec<(&'static str, &'static str, &'static str)> = Vec::new();
     for pass in &graph.passes {
         match pass {
             Pass::Compute(cp) => {
                 for stage in &cp.stages {
-                    expected.push((stage.entry, "compute"));
+                    expected.push((cp.module, stage.entry, "compute"));
                 }
             }
             Pass::Render(rp) => {
                 for item in rp.items {
-                    expected.push((item.vs, "vertex"));
-                    expected.push((item.fs, "fragment"));
+                    expected.push((item.module, item.vs, "vertex"));
+                    expected.push((item.module, item.fs, "fragment"));
                 }
             }
         }
     }
 
-    for &(name, kind) in &expected {
+    for &(module, name, kind) in &expected {
         if !generated::DESCRIPTOR_PASSES
             .iter()
-            .any(|p| p.name == name && p.kind == kind)
+            .any(|p| p.module == module && p.name == name && p.kind == kind)
         {
-            anyhow::bail!("graph references {kind} stage '{name}', but it is not in the Wyn descriptor frame_graph");
+            anyhow::bail!(
+                "graph references {kind} stage '{name}' in module '{module}', but it is not in the Wyn descriptor frame_graph"
+            );
         }
     }
 
     for pass in generated::DESCRIPTOR_PASSES {
-        if !expected
-            .iter()
-            .any(|(name, kind)| *name == pass.name && *kind == pass.kind)
-        {
+        if !expected.iter().any(|(module, name, kind)| {
+            *module == pass.module && *name == pass.name && *kind == pass.kind
+        }) {
             anyhow::bail!(
-                "Wyn descriptor frame_graph contains {} stage '{}', but the driver graph does not schedule it",
+                "Wyn descriptor frame_graph contains {} stage '{}' in module '{}', but the driver graph does not schedule it",
                 pass.kind,
-                pass.name
+                pass.name,
+                pass.module
             );
         }
     }
@@ -675,7 +726,9 @@ fn make_uniform(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
 }
 
 fn make_storage_raw(device: &wgpu::Device, label: &str, size: u64, indirect: bool) -> wgpu::Buffer {
-    let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    // COPY_SRC lets `--dump` read any storage buffer back for inspection.
+    let mut usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
     if indirect {
         usage |= wgpu::BufferUsages::INDIRECT;
     }
@@ -734,9 +787,9 @@ fn wgpu_format(f: TexFormat) -> wgpu::TextureFormat {
 /// it as a color target, plus COPY_DST/COPY_SRC (seed + readback).
 fn image_usage(graph: &Graph, name: &str) -> wgpu::TextureUsages {
     let mut u = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
-    let touch = |t: BindTable, u: &mut wgpu::TextureUsages| {
-        for &(_, _, kind, bname) in t {
-            if name_to_resource(graph, bname) == name {
+    let touch = |module: &'static str, t: BindTable, u: &mut wgpu::TextureUsages| {
+        for &(_, _, kind, _, bname) in t {
+            if name_to_resource(graph, module, bname) == name {
                 match kind {
                     BindingKind::StorageImage { .. } => *u |= wgpu::TextureUsages::STORAGE_BINDING,
                     BindingKind::Texture => *u |= wgpu::TextureUsages::TEXTURE_BINDING,
@@ -747,14 +800,14 @@ fn image_usage(graph: &Graph, name: &str) -> wgpu::TextureUsages {
     };
     for pass in &graph.passes {
         match pass {
-            Pass::Compute(cp) => touch(cp.bindings, &mut u),
+            Pass::Compute(cp) => touch(cp.module, cp.bindings, &mut u),
             Pass::Render(rp) => {
                 if rp.color.iter().any(|ct| ct.target == Some(name)) {
                     u |= wgpu::TextureUsages::RENDER_ATTACHMENT;
                 }
                 for it in rp.items {
-                    touch(it.vs_bindings, &mut u);
-                    touch(it.fs_bindings, &mut u);
+                    touch(it.module, it.vs_bindings, &mut u);
+                    touch(it.module, it.fs_bindings, &mut u);
                 }
             }
         }
@@ -789,16 +842,33 @@ fn create_image(
 
 // ---- bind groups (shared by compute + render) ----
 
-/// Map a shader binding name to its resource name (via `graph.names`). An
-/// unmapped name is a compiler-internal scratch buffer (e.g. a `filter`'s gather
-/// buffer); it resolves to itself and is auto-allocated.
-fn name_to_resource(graph: &Graph, binding_name: &'static str) -> &'static str {
-    graph
-        .names
+/// Map a shader binding name to its physical graph resource. Authored aliases
+/// win; otherwise the descriptor groups compiler-created producer/consumer names
+/// that refer to one resource. Unclaimed compiler scratch is auto-allocated under
+/// the descriptor resource's opaque identity.
+fn name_to_resource(
+    graph: &Graph,
+    module: &'static str,
+    binding_name: &'static str,
+) -> &'static str {
+    let authored = |name: &str| {
+        graph
+            .names
+            .iter()
+            .find(|(binding, _)| *binding == name)
+            .map(|(_, resource)| *resource)
+    };
+    if let Some(resource) = authored(binding_name) {
+        return resource;
+    }
+    let Some(descriptor) = generated::descriptor_resource(module, binding_name) else {
+        return binding_name;
+    };
+    descriptor
+        .binding_names
         .iter()
-        .find(|(n, _)| *n == binding_name)
-        .map(|(_, r)| *r)
-        .unwrap_or(binding_name)
+        .find_map(|alias| authored(alias))
+        .unwrap_or(descriptor.name)
 }
 
 /// Union of the storage-image accesses of `resource` across the whole graph. The
@@ -808,10 +878,10 @@ fn name_to_resource(graph: &Graph, binding_name: &'static str) -> &'static str {
 /// access the descriptor records.
 fn image_union_access(graph: &Graph, resource: &str) -> ImgAccess {
     let (mut r, mut w) = (false, false);
-    let mut scan = |t: BindTable| {
-        for &(_, _, kind, bname) in t {
+    let mut scan = |module: &'static str, t: BindTable| {
+        for &(_, _, kind, _, bname) in t {
             if let BindingKind::StorageImage { access, .. } = kind {
-                if name_to_resource(graph, bname) == resource {
+                if name_to_resource(graph, module, bname) == resource {
                     match access {
                         ImgAccess::Read => r = true,
                         ImgAccess::Write => w = true,
@@ -826,11 +896,11 @@ fn image_union_access(graph: &Graph, resource: &str) -> ImgAccess {
     };
     for pass in &graph.passes {
         match pass {
-            Pass::Compute(cp) => scan(cp.bindings),
+            Pass::Compute(cp) => scan(cp.module, cp.bindings),
             Pass::Render(rp) => {
                 for it in rp.items {
-                    scan(it.vs_bindings);
-                    scan(it.fs_bindings);
+                    scan(it.module, it.vs_bindings);
+                    scan(it.module, it.fs_bindings);
                 }
             }
         }
@@ -848,14 +918,15 @@ fn image_union_access(graph: &Graph, resource: &str) -> ImgAccess {
 /// (StorageWrite); everything else is Plain. Storage-image accesses are widened to
 /// the resource's graph-wide union (see `image_union_access`).
 fn resolve_table(
+    module: &'static str,
     table: BindTable,
     graph: &Graph,
     pp: &HashMap<&'static str, [wgpu::Buffer; 2]>,
 ) -> Vec<Binding> {
     table
         .iter()
-        .map(|&(set, binding, kind, name)| {
-            let resource = name_to_resource(graph, name);
+        .map(|&(set, binding, kind, usage, name)| {
+            let resource = name_to_resource(graph, module, name);
             let kind = match kind {
                 BindingKind::StorageImage { format, .. } => BindingKind::StorageImage {
                     format,
@@ -864,9 +935,12 @@ fn resolve_table(
                 other => other,
             };
             let is_pp = pp.contains_key(resource);
-            let role = match kind {
-                BindingKind::StorageWrite if is_pp => Role::Next,
-                BindingKind::StorageRead if is_pp => Role::Prev,
+            let role = match (is_pp, usage, kind) {
+                (true, BindingUsage::Output, _) => Role::Next,
+                (true, BindingUsage::Input, _) => Role::Prev,
+                // Compatibility for descriptors predating explicit buffer usage.
+                (true, _, BindingKind::StorageWrite) => Role::Next,
+                (true, _, BindingKind::StorageRead) => Role::Prev,
                 _ => Role::Plain,
             };
             Binding {
@@ -919,13 +993,15 @@ fn layout_type(kind: BindingKind, filterable: bool) -> wgpu::BindingType {
             has_dynamic_offset: false,
             min_binding_size: None,
         },
-        BindingKind::StorageRead | BindingKind::StorageWrite => wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage {
-                read_only: matches!(kind, BindingKind::StorageRead),
-            },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
+        BindingKind::StorageRead | BindingKind::StorageWrite | BindingKind::StorageReadWrite => {
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage {
+                    read_only: matches!(kind, BindingKind::StorageRead),
+                },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            }
+        }
         BindingKind::Texture => wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable },
             view_dimension: wgpu::TextureViewDimension::D2,
@@ -1014,7 +1090,7 @@ fn build_compute(
     res: Res,
     graph: &Graph,
 ) -> BuiltCompute {
-    let binds = resolve_table(cp.bindings, graph, res.pp);
+    let binds = resolve_table(cp.module, cp.bindings, graph, res.pp);
     let (layouts, sets0) = build_sets(
         device,
         cp.label,
@@ -1024,20 +1100,18 @@ fn build_compute(
         0,
     );
     let layout_refs: Vec<&wgpu::BindGroupLayout> = layouts.iter().collect();
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(cp.label),
         bind_group_layouts: &layout_refs,
         push_constant_ranges: &[],
     });
-    // One pipeline per ordered stage, all sharing the pass's layout (the full
-    // binding interface; a stage that touches only some bindings is fine).
     let stages = cp
         .stages
         .iter()
         .map(|st| {
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(st.entry),
-                layout: Some(&pl),
+                layout: Some(&layout),
                 module,
                 entry_point: Some(st.entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -1047,7 +1121,7 @@ fn build_compute(
         })
         .collect();
     let mut sets = vec![sets0];
-    for p in 1..variant_count(&binds) {
+    for parity in 1..variant_count(&binds) {
         sets.push(
             build_sets(
                 device,
@@ -1055,12 +1129,16 @@ fn build_compute(
                 &binds,
                 wgpu::ShaderStages::COMPUTE,
                 res,
-                p,
+                parity,
             )
             .1,
         );
     }
-    BuiltCompute { stages, sets }
+    BuiltCompute {
+        label: cp.label,
+        stages,
+        sets,
+    }
 }
 
 fn build_item(
@@ -1075,8 +1153,8 @@ fn build_item(
 ) -> BuiltItem {
     // Vertex + fragment share one pipeline layout: merge their binding tables,
     // deduping shared (set, binding) slots (e.g. the `frame` block in both stages).
-    let mut binds = resolve_table(it.vs_bindings, graph, res.pp);
-    for b in resolve_table(it.fs_bindings, graph, res.pp) {
+    let mut binds = resolve_table(it.module, it.vs_bindings, graph, res.pp);
+    for b in resolve_table(it.module, it.fs_bindings, graph, res.pp) {
         if !binds
             .iter()
             .any(|x| x.set == b.set && x.binding == b.binding)
@@ -1356,7 +1434,11 @@ fn main() -> Result<()> {
         let mut renderer = Renderer::new(gfx, &app::graph(gw, gh))?;
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
-        return renderer.screenshot(&path, &cam, args.mods, args.time);
+        renderer.screenshot(&path, &cam, args.mods, args.time)?;
+        for name in &args.dump {
+            renderer.dump_buffer(name)?;
+        }
+        return Ok(());
     }
 
     let event_loop = EventLoop::new()?;

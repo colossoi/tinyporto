@@ -270,12 +270,10 @@ resource sun_depth: image2d {
 resource ao_work: image2d { format = rgba16float  size = window  usages = [storage_write, sampled] }
 
 ------------------------------------------------------------
--- Cull (Nine's simple path). Every prop candidate — cobble setts first, then wall
--- bricks/quoins/grout — is resolved into one `prop` record: placement, orientation,
--- roundness, colour, and a visibility verdict. Culled slots are marked center.y <= 0
--- and collapse to a degenerate vertex in the draw. `filter` will later COMPACT the
--- live ones so the instanced draw runs over the live count rather than the whole
--- domain. Output 0 = prop_inst, output 1 = prop_args.
+-- Cull (Nine's simple path). A lightweight predicate filters original candidate
+-- indices — cobble setts first, then wall bricks/quoins/grout. Only surviving indices
+-- are resolved into complete `prop` records, so rejected candidates pay no basis,
+-- roundness, colour, or draw cost. Output 0 = prop_inst, output 1 = prop_args.
 ------------------------------------------------------------
 
 -- The prop domain: the running-bond sett grid, then the wall-brick slots.
@@ -283,28 +281,38 @@ def PROP_SETTS: i32 = BCOLS * BROWS
 def PROP_WALLS: i32 = BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS
 def PROP_SLOTS: i32 = PROP_SETTS + PROP_WALLS
 
--- One cobble sett. Its orientation is a random tilt basis and its colour three
--- independent hashes, both keyed on the stable world centre (NOT the instance
--- index, which reorders as culling changes), so a sett's look stays put.
-def sett_prop(frame: frame_globals, sc: painted, od: storage_image, i: i32) prop =
+-- Stable world centre shared by the visibility predicate and live-prop builder.
+-- The compacted stream can reorder instance IDs, so all variation remains keyed on
+-- this centre or the original candidate index.
+def sett_center(i: i32) vec2f32 =
   let base = brick_center(i)
   -- No along-row (x) jitter: setts sit on the exact cell x so the clamped along-row
   -- half-extent (sett_hx) can guarantee they never overlap along their length. A
   -- small cross-row (z) jitter keeps the courses from reading as a rigid grid.
-  let jz = (brick_hash(i + 53) - 0.5) * 0.016
-  let center = @[base.x, base.y + jz]
-  let c3 = @[center.x, BRICK_H * 0.5, center.y]
-  let o = cam(frame)
-  -- 0.25 ≈ the sett proxy's bounding radius (footprint + tilt), generous.
-  let visible = magnitude(center) < 8.0 && frustum_keep(c3, 0.25, frame.resolution, o)
-  -- Occlusion: hidden if the nearest recorded surface beats the sett across its
-  -- whole tile neighbourhood (hiz.wyn's occ_test), so a partly-visible sett stays.
-  let occluded = occ_test(od, world_to_clip(c3, frame.resolution, o), frame.resolution)
-  -- Water converts cobble to canal: drop any sett within a hair of a painted canal
-  -- so no partial setts comb over the quay edge.
-  let in_water = water_sdf(center, sc.items, sc.points) < 0.08
-  let keep = visible && (!occluded) && (!in_water)
-  let height = if keep then BRICK_H * (0.9625 + 0.075 * brick_hash(i)) else 0.0
+  let jz = (brick_hash(i + 53) - 0.5) * 0.016 in
+  @[base.x, base.y + jz]
+
+-- Visibility is intentionally a cheapest-first control-flow ladder. In particular,
+-- the water SDF scans the painted stroke data only after distance, frustum, and
+-- coarse-occlusion rejection. The clip projection is shared by the latter two tests.
+def sett_visible(frame: frame_globals, sc: painted, od: storage_image, i: i32) bool =
+  let center = sett_center(i) in
+  if dot(center, center) >= 64.0 then false
+  else
+    let c3 = @[center.x, BRICK_H * 0.5, center.y]
+    let clip = world_to_clip(c3, frame.resolution, cam(frame)) in
+    -- 0.25 ≈ the sett proxy's bounding radius (footprint + tilt), generous.
+    if !frustum_keep_clip(clip, 0.25, frame.resolution) then false
+    -- Hidden only if the nearest recorded surface wins across the whole tile
+    -- neighbourhood, so a partly-visible sett stays.
+    else if occ_test(od, clip, frame.resolution) then false
+    -- Water converts cobble to canal: reject setts near a painted canal edge.
+    else water_sdf(center, sc.items, sc.points) >= 0.08
+
+-- Build the complete record only after the candidate index survives compaction.
+def sett_prop(i: i32) prop =
+  let center = sett_center(i)
+  let height = BRICK_H * (0.9625 + 0.075 * brick_hash(i))
   let ss = sett_scale(center.x, center.y)
   let (right, up, fwd) = sett_basis(center.x, center.y)
   let half = @[sett_hx(ss), height * 0.5, BRICK_L * 0.5 * ss]
@@ -322,14 +330,19 @@ def sett_prop(frame: frame_globals, sc: painted, od: storage_image, i: i32) prop
   { center = @[center.x, height * 0.5, center.y], radius = radius, half = half,
     right = right, up = up, fwd = fwd, albedo = albedo }
 
--- One wall block. Blocks carry their own half-extents and a yaw; a tiny corner
--- radius keeps the edges crisp (just enough to catch a highlight). `kind` (0 brick,
--- 1 quoin, 2 grout) only selects colour, so it is resolved here and not carried.
-def wall_prop(frame: frame_globals, i: i32) prop =
+-- Wall visibility stays camera-frustum-only, matching the previous behaviour.
+def wall_visible(frame: frame_globals, i: i32) bool =
+  let brk = wall_brick(i)
+  let center = brk.center in
+  if center.y <= 0.0 then false
+  else frustum_keep(center, magnitude(brk.half), frame.resolution, cam(frame))
+
+-- One surviving wall block. Blocks carry their own half-extents and a yaw; a tiny
+-- corner radius keeps the edges crisp. `kind` (0 brick, 1 quoin, 2 grout) selects
+-- colour here and is not carried into the draw stream.
+def wall_prop(i: i32) prop =
   let brk = wall_brick(i)
   let center = brk.center
-  let o = cam(frame)
-  let visible = center.y > 0.0 && frustum_keep(center, magnitude(brk.half), frame.resolution, o)
   let (right, up, fwd) = yaw_basis(brk.yaw)
   let kind = f32(brk.kind)
   -- Tone seeds from the stable, baked centre — bricks mix two fired-clay tones by a
@@ -339,27 +352,29 @@ def wall_prop(frame: frame_globals, i: i32) prop =
   let albedo = if kind > 1.5 then GROUT_COLOR
                else if kind > 0.5 then QUOIN_COLOR * v3(0.90 + 0.16 * cv)
                else mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * cv)
-  let c = if visible then center else @[center.x, 0.0 - 1.0, center.z] in
-  { center = c, radius = 0.004, half = brk.half,
+  in
+  { center = center, radius = 0.004, half = brk.half,
     right = right, up = up, fwd = fwd, albedo = albedo }
 
-def prop_candidate(frame: frame_globals, sc: painted, od: storage_image, i: i32) prop =
-  if i < PROP_SETTS then sett_prop(frame, sc, od, i)
-  else wall_prop(frame, i - PROP_SETTS)
+-- Filter original candidate indices before constructing their full prop records.
+def prop_index_visible(frame: frame_globals, sc: painted, od: storage_image,
+                       i: i32) bool =
+  if i < PROP_SETTS then sett_visible(frame, sc, od, i)
+  else wall_visible(frame, i - PROP_SETTS)
 
--- Keep-predicate for a candidate prop. Not yet wired: `cull` currently emits every
--- candidate (culled ones as degenerate center.y <= 0 records) rather than compacting.
--- This becomes the `filter` predicate when the compaction slice (PR 4) lands.
-def prop_visible(p: prop) bool =
-  p.center.y > 0.0
+def prop_from_index(i: i32) prop =
+  if i < PROP_SETTS then sett_prop(i)
+  else wall_prop(i - PROP_SETTS)
 
 def prop_draw_args(n: i32) [4]u32 =
   [36u32, u32(n), 0u32, 0u32]
 
 def build_visibility_props(sc: painted, frame: frame_globals, od: storage_image)
   ([]prop, [4]u32) =
-  let cand = map(|s| prop_candidate(frame, sc, od, s), iota(PROP_SLOTS)) in
-  (cand, prop_draw_args(PROP_SLOTS))
+  let live_indices =
+    filter(|i| prop_index_visible(frame, sc, od, i), iota(PROP_SLOTS))
+  let live = map(prop_from_index, live_indices) in
+  (live, prop_draw_args(length(live_indices)))
 
 def frame_prop_visibility_slice(sc: painted, frame: frame_globals,
                                 history: frame_history)
@@ -450,9 +465,9 @@ entry scene_fragment(#[varying(0)] kind: f32, #[varying(1)] attr: f32,
 ------------------------------------------------------------
 -- Props: instanced proxy boxes (Tiny-Glade "tons of tiny instances"). Cobble setts
 -- and wall bricks/quoins/grout are one stream of `prop` records, so ONE vertex +
--- fragment pair draws them all. `cull` resolves each candidate's placement,
--- orientation, roundness and colour; culled slots arrive with center.y <= 0 and
--- collapse to a degenerate vertex. The vertex places the proxy box; the fragment
+-- fragment pair draws them all. `cull` first compacts visible candidate indices,
+-- then resolves placement, orientation, roundness, and colour only for survivors.
+-- The vertex places the proxy box; the fragment
 -- sphere-traces the rounded box inside it, so the silhouette rounds per instance.
 -- The proxy's outer extent IS the rounded box's, so the trace starts on its front
 -- face. The wall blocks are real occluders for the cobbles.
@@ -476,9 +491,9 @@ entry prop_vertex(#[builtin(vertex_index)] vid: i32,
   let world = prop_world(p, box_pos[vid]) in
   -- `iid` rides through as a varying: it is constant across the primitive, so any
   -- interpolation returns it unchanged, and the fragment re-reads the instance
-  -- instead of carrying its whole record through the rasterizer.
-  if p.center.y <= 0.0 then (@[2.0, 2.0, 2.0, 1.0], world, f32(iid))
-  else (world_to_clip(world, frame.resolution, cam(frame)), world, f32(iid))
+  -- instead of carrying its whole record through the rasterizer. The compacted
+  -- stream contains no center.y <= 0 tombstones.
+  (world_to_clip(world, frame.resolution, cam(frame)), world, f32(iid))
 
 -- Sphere-trace this instance's rounded box from the proxy's front face. On a hit,
 -- shade from the SDF normal and write the hit's true depth; on a miss (the ray

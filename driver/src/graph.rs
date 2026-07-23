@@ -50,8 +50,18 @@ pub struct UniformBlockLayout {
 /// One physical stage from the Wyn descriptor's `frame_graph`.
 #[derive(Clone, Copy, Debug)]
 pub struct DescriptorPassInfo {
+    pub module: &'static str,
     pub name: &'static str,
     pub kind: &'static str,
+}
+
+/// One descriptor frame-graph resource and all shader binding names that refer
+/// to it. Compiler-created producer/consumer names can differ while still naming
+/// one physical buffer; generated descriptor data supplies that aliasing.
+#[derive(Clone, Copy, Debug)]
+pub struct DescriptorResourceInfo {
+    pub name: &'static str,
+    pub binding_names: &'static [&'static str],
 }
 
 /// How a storage buffer's initial contents are set.
@@ -159,6 +169,10 @@ pub enum BindingKind {
     Uniform,
     StorageRead,
     StorageWrite,
+    /// A storage buffer both read and written across a pass's stages —
+    /// compiler-internal `intermediate` scratch (e.g. a `filter`'s flag/scan/
+    /// gather buffers), auto-allocated at its descriptor-fixed capacity.
+    StorageReadWrite,
     /// A sampled `texture2d` (f32, 2D, filterable — Wyn's texture2d is monomorphic).
     Texture,
     /// A `storage_image` view: fixed `vec4f32` texels; `format` is the on-GPU pixel
@@ -169,9 +183,20 @@ pub enum BindingKind {
     },
 }
 
-/// One generated binding row: (set, binding, kind, shader-param name). The driver
-/// maps `name` to a resource (via `Graph::names`) and derives the role.
-pub type BindTable = &'static [(u32, u32, BindingKind, &'static str)];
+/// Descriptor role of a binding within its pipeline. Unlike storage access, this
+/// says whether a ping-pong resource is the prior-frame input or current-frame
+/// output even when the shader must declare the slot `read_write`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BindingUsage {
+    Input,
+    Output,
+    Intermediate,
+    Other,
+}
+
+/// One generated binding row: (set, binding, kind, usage, shader-param name).
+/// The driver maps `name` to a resource and uses `usage` to derive ping-pong role.
+pub type BindTable = &'static [(u32, u32, BindingKind, BindingUsage, &'static str)];
 
 /// A binding resolved against the resource graph (driver-internal).
 #[derive(Clone, Copy, Debug)]
@@ -267,4 +292,76 @@ pub struct Graph {
     pub resources: Vec<Resource>,
     pub passes: Vec<Pass>,
     pub names: &'static [(&'static str, &'static str)],
+}
+
+impl Graph {
+    /// Expand compiler-declared compute prerequisites immediately before the
+    /// authored pass that needs them. The callbacks are generated entirely from
+    /// the descriptor: handwritten graph code continues to name only Wyn source
+    /// entries, never physical materialization stages or pipeline indices.
+    pub fn insert_compute_prerequisites(
+        &mut self,
+        pipeline_index: fn(&str, &str) -> Option<usize>,
+        prerequisite_pipelines: fn(&str, &str) -> &'static [usize],
+        compute_pass: fn(&str, usize) -> Option<ComputePass>,
+    ) {
+        let mut authored = std::collections::HashSet::new();
+        for pass in &self.passes {
+            match pass {
+                Pass::Compute(compute) => {
+                    for stage in &compute.stages {
+                        if let Some(index) = pipeline_index(compute.module, stage.entry) {
+                            authored.insert((compute.module, index));
+                        }
+                    }
+                }
+                Pass::Render(render) => {
+                    for item in render.items {
+                        for entry in [item.vs, item.fs] {
+                            if let Some(index) = pipeline_index(item.module, entry) {
+                                authored.insert((item.module, index));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut inserted = std::collections::HashSet::new();
+        let mut expanded = Vec::new();
+        for pass in std::mem::take(&mut self.passes) {
+            let mut required = Vec::new();
+            let mut require = |module: &'static str, entry: &'static str| {
+                for &index in prerequisite_pipelines(module, entry) {
+                    if !authored.contains(&(module, index)) && inserted.insert((module, index)) {
+                        required.push((module, index));
+                    }
+                }
+            };
+            match &pass {
+                Pass::Compute(compute) => {
+                    for stage in &compute.stages {
+                        require(compute.module, stage.entry);
+                    }
+                }
+                Pass::Render(render) => {
+                    for item in render.items {
+                        require(item.module, item.vs);
+                        require(item.module, item.fs);
+                    }
+                }
+            }
+            for (module, index) in required {
+                let prerequisite = compute_pass(module, index).unwrap_or_else(|| {
+                    panic!(
+                        "descriptor compute prerequisite pipeline {index} in module {module:?} \
+                         requires runtime sizing and cannot be inserted automatically"
+                    )
+                });
+                expanded.push(Pass::Compute(prerequisite));
+            }
+            expanded.push(pass);
+        }
+        self.passes = expanded;
+    }
 }

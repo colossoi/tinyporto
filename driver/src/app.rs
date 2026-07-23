@@ -95,7 +95,7 @@ static RESOLVE_ITEMS: [RenderItem; 1] = [RenderItem {
 /// The frame graph for a `w` x `h` surface. Image extents and image-sized compute
 /// dispatches derive from it; no resolution is hardcoded here or in the shaders.
 pub fn graph(w: u32, h: u32) -> Graph {
-    Graph {
+    let mut graph = Graph {
         resources: vec![
             // Per-frame globals, one std140 uniform block (see `frame_globals` in
             // main.wyn). The driver fills each member by name at the descriptor's
@@ -372,5 +372,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
                 items: &RESOLVE_ITEMS,
             }),
         ],
-    }
+    };
+    crate::generated::insert_descriptor_prerequisites(&mut graph);
+    graph
 }
