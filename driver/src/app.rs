@@ -6,15 +6,12 @@
 //! resources exist, the binding-name -> resource mapping, and the per-frame
 //! schedule.
 
-use crate::generated::{
-    BLIT_VERTEX_BINDINGS, BRICK_SHADOW_VERTEX_BINDINGS, PROP_FRAGMENT_BINDINGS,
-    PROP_VERTEX_BINDINGS, RESOLVE_FRAGMENT_BINDINGS, SCENE_FRAGMENT_BINDINGS,
-    SCENE_VERTEX_BINDINGS, SHADOW_FRAGMENT_BINDINGS,
-};
+use crate::generated::{PIPELINE_2_ITEM, PIPELINE_3_ITEM, PIPELINE_4_ITEM, PIPELINE_6_ITEM};
 use crate::graph::*;
 
 // Coarse occlusion grid (Hi-Z simple): one texel per OCC_TILE^2 window block,
-// rounded up. `gtao_main`'s first occ_w*occ_h invocations reduce one texel each.
+// rounded up. The unified GTAO compute pipeline's first occ_w*occ_h invocations
+// reduce one texel each.
 // Must match OCC_TILE / occ_w / occ_h in wyn/hiz.wyn.
 const OCC_TILE: u32 = 8;
 const fn occ_w(w: u32) -> u32 {
@@ -35,56 +32,25 @@ const EVENTS_BYTES: u64 = EV_CAP as u64 * 16;
 // output-size rules come from generated code. The host contributes only the live
 // surface pixel count for image-sized dispatches.
 fn compute_entry(module: &'static str, entry: &'static str, w: u32, h: u32) -> ComputePass {
-    crate::generated::descriptor_compute_entry(module, entry, (w as u64) * (h as u64))
-        .unwrap_or_else(|| panic!("descriptor has no constructible compute entry {module}:{entry}"))
+    crate::generated::descriptor_compute_entry(
+        module,
+        entry,
+        u64::from(w) * u64::from(h),
+        u64::from(occ_w(w)) * u64::from(occ_h(h)),
+    )
+    .unwrap_or_else(|| panic!("descriptor has no constructible compute entry {module}:{entry}"))
 }
 
 // Draw lists, hoisted out of `graph` because a RenderItem reads the generated
 // binding-table statics and so cannot be const-promoted inside a function body.
-static SUN_SHADOW_ITEMS: [RenderItem; 1] = [RenderItem {
-    label: "brick_shadow",
-    module: "main",
-    vs: "brick_shadow_vertex",
-    fs: "shadow_fragment",
-    vs_bindings: BRICK_SHADOW_VERTEX_BINDINGS,
-    fs_bindings: SHADOW_FRAGMENT_BINDINGS,
-    draw_args: "shadow_args",
-    depth_write: true,
-}];
+static SUN_SHADOW_ITEMS: [RenderItem; 1] = [RenderItem { ..PIPELINE_2_ITEM }];
 
 static SCENE_ITEMS: [RenderItem; 2] = [
-    RenderItem {
-        label: "ground",
-        module: "main",
-        vs: "scene_vertex",
-        fs: "scene_fragment",
-        vs_bindings: SCENE_VERTEX_BINDINGS,
-        fs_bindings: SCENE_FRAGMENT_BINDINGS,
-        draw_args: "draw_args",
-        depth_write: true,
-    },
-    RenderItem {
-        label: "props",
-        module: "main",
-        vs: "prop_vertex",
-        fs: "prop_fragment",
-        vs_bindings: PROP_VERTEX_BINDINGS,
-        fs_bindings: PROP_FRAGMENT_BINDINGS,
-        draw_args: "prop_args",
-        depth_write: true,
-    },
+    RenderItem { ..PIPELINE_3_ITEM },
+    RenderItem { ..PIPELINE_4_ITEM },
 ];
 
-static RESOLVE_ITEMS: [RenderItem; 1] = [RenderItem {
-    label: "resolve",
-    module: "main",
-    vs: "blit_vertex",
-    fs: "resolve_fragment",
-    vs_bindings: BLIT_VERTEX_BINDINGS,
-    fs_bindings: RESOLVE_FRAGMENT_BINDINGS,
-    draw_args: "blit_args",
-    depth_write: false,
-}];
+static RESOLVE_ITEMS: [RenderItem; 1] = [RenderItem { ..PIPELINE_6_ITEM }];
 
 /// The frame graph for a `w` x `h` surface. Image extents and image-sized compute
 /// dispatches derive from it; no resolution is hardcoded here or in the shaders.
@@ -152,6 +118,10 @@ pub fn graph(w: u32, h: u32) -> Graph {
                 name: "head",
                 size: None,
             },
+            Resource::PingPong {
+                name: "occ",
+                size: None,
+            },
             // Derived `step` outputs: ground geometry (two parallel (pos,kind)/(nrm,attr)
             // streams) + its draw args; the per-instance prop records + their draw args.
             Resource::Buffer(BufferDef {
@@ -186,21 +156,12 @@ pub fn graph(w: u32, h: u32) -> Graph {
             }),
             Resource::Depth,
             // Nine Phase 2 (Hi-Z): the scene writes window-space depth here as a second
-            // MRT target; `gtao_main` mins it into the coarse occ_depth, which `cull`
-            // reads to occlusion-test candidates.
+            // MRT target; the unified GTAO compute pipeline mins it into the coarse
+            // occ_depth, which `cull` reads to occlusion-test candidates.
             Resource::Image {
                 name: "scene_depth",
                 format: TexFormat::R32Float,
                 size: ImgSize::Window,
-                mips: 1,
-            },
-            Resource::Image {
-                name: "occ_depth",
-                format: TexFormat::R32Float,
-                size: ImgSize::Fixed {
-                    w: occ_w(w),
-                    h: occ_h(h),
-                },
                 mips: 1,
             },
             // Sun shadow map: the `sun_shadow` pass writes light-space depth here (R32Float
@@ -212,14 +173,14 @@ pub fn graph(w: u32, h: u32) -> Graph {
                 size: ImgSize::Window,
                 mips: 1,
             },
-            // GTAO working image: raw AO+edges term, sampled by the light pass for the
-            // edge-aware denoise.
-            Resource::Image {
+            // GTAO working array: raw AO+edges term, consumed by the resolve fragment
+            // for the edge-aware denoise.
+            Resource::Buffer(BufferDef {
                 name: "ao_work",
-                format: TexFormat::Rgba16Float,
-                size: ImgSize::Window,
-                mips: 1,
-            },
+                size: None,
+                init: BufInit::Zeroed,
+                indirect: false,
+            }),
             // Nine Phase 3 (deferred): the scene writes a thin G-buffer here (albedo +
             // world normal); `resolve_fragment` reads it back and lights it. `blit_args`
             // is the fullscreen-triangle draw (3 verts, 1 instance).
@@ -231,7 +192,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
             },
             Resource::Image {
                 name: "g_normal",
-                format: TexFormat::Rgba16Float,
+                format: TexFormat::Rgba32Float,
                 size: ImgSize::Window,
                 mips: 1,
             },
@@ -259,39 +220,38 @@ pub fn graph(w: u32, h: u32) -> Graph {
             ("points_in", "points"),
             ("items_in", "items"),
             ("head_in", "head"),
+            ("occ_in", "occ"),
             ("events", "events"),
             ("frame", "frame"),
-            ("frame_prepare_output_0", "uistate"),
-            ("frame_prepare_output_1", "points"),
-            ("frame_prepare_output_2", "items"),
-            ("frame_prepare_output_3", "head"),
-            ("frame_prepare_output_4", "geom_pos"),
-            ("frame_prepare_output_5", "geom_nrm"),
-            ("frame_prepare_output_6", "draw_args"),
-            ("frame_prepare_output_7", "prop_inst"),
-            ("frame_prepare_output_8", "prop_args"),
+            ("tinyporto_frame__compute_0_output_0", "uistate"),
+            ("tinyporto_frame__compute_0_output_1", "points"),
+            ("tinyporto_frame__compute_0_output_2", "items"),
+            ("tinyporto_frame__compute_0_output_3", "head"),
+            ("tinyporto_frame__compute_0_output_4", "geom_pos"),
+            ("tinyporto_frame__compute_0_output_5", "geom_nrm"),
+            ("tinyporto_frame__compute_0_output_6", "draw_args"),
+            ("tinyporto_frame__compute_0_output_7", "prop_inst"),
+            ("tinyporto_frame__compute_0_output_8", "prop_args"),
+            ("tinyporto_frame__compute_1_output_0", "points"),
+            ("tinyporto_frame__compute_1_output_1", "items"),
+            ("tinyporto_frame__compute_2_output_0", "ao_work"),
+            ("tinyporto_frame__compute_2_output_1", "occ"),
             ("geom_pos", "geom_pos"),
             ("geom_nrm", "geom_nrm"),
             // The one instanced prop stream, read by both stages of the prop draw.
             ("prop_inst", "prop_inst"),
-            // Hi-Z occlusion image views (`sd`/`od` are the shader param names).
-            ("od", "occ_depth"),
-            ("sd", "scene_depth"),
             // G-buffer views read by the deferred resolve fragment.
-            ("ga", "g_albedo"),
-            ("gn", "g_normal"),
+            ("scene_albedo", "g_albedo"),
+            ("scene_normal", "g_normal"),
             // Sun shadow map (`shm` in `resolve_fragment`; written as the sun_shadow
             // color target).
-            ("shm", "sun_depth"),
-            // GTAO view: ao_work (gtao_main writes `aw`, `resolve_fragment` samples `aw`
-            // and denoises inline).
-            ("aw", "ao_work"),
+            ("sun", "sun_depth"),
         ],
 
         passes: vec![
             // Logical frame preparation: advance persistent state, tessellate the
             // ground ribbon, and build visibility records for cobble/wall instances.
-            Pass::Compute(compute_entry("main", "frame_prepare", w, h)),
+            Pass::Compute(compute_entry("main", "tinyporto_frame__compute_0", w, h)),
             // Sun shadow map: rasterize the wall bricks through the sun's ortho light
             // camera, storing nearest light-space depth into sun_depth. Reuses the shared
             // window depth buffer (cleared here, then re-cleared by the scene pass). Runs
@@ -323,7 +283,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
                     },
                     ColorTarget {
                         target: Some("g_normal"),
-                        format: Some(TexFormat::Rgba16Float),
+                        format: Some(TexFormat::Rgba32Float),
                         clear: [0.0, 0.0, 0.0, 0.0],
                     },
                     ColorTarget {
@@ -338,7 +298,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
             // invocation integrates horizon AO into ao_work; the first occ_w*occ_h also min
             // their coarse occ_depth tile, which `cull` reads next frame. Runs before the
             // resolve, which reads ao_work and folds the edge-aware denoise into shading.
-            Pass::Compute(compute_entry("main", "gtao_main", w, h)),
+            Pass::Compute(compute_entry("main", "tinyporto_frame__compute_2", w, h)),
             // Deferred resolve: one fullscreen triangle whose fragment reads the G-buffer,
             // folds in the GTAO term (including the edge-aware denoise of ao_work) and
             // writes the final colour (sun + shadows + AO-attenuated sky, tonemapped)

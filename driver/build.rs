@@ -1,6 +1,6 @@
 //! Build-time shader compilation + pipeline-descriptor codegen.
 //!
-//! For each Wyn root, runs `wyn compile` (emitting SPIR-V + a `.json` pipeline
+//! For each Wyn root, runs `wyn build --graphics` (emitting SPIR-V + a `.json` pipeline
 //! descriptor into OUT_DIR) and emits one `generated.rs` via `quote`: the
 //! embedded-SPIR-V table, the dispatch/output-size rules specialized into inlined
 //! `const fn` formulas (`codegen_pipeline`), and each pipeline's binding interface
@@ -60,6 +60,56 @@ struct Pipeline {
     bindings: Vec<Binding>,
     #[serde(default)]
     stages: Vec<Stage>,
+    #[serde(default)]
+    invocation: Option<Invocation>,
+    #[serde(default)]
+    fragment_outputs: Vec<FragmentOutput>,
+}
+
+#[derive(serde::Deserialize)]
+struct FragmentOutput {
+    location: u32,
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct Invocation {
+    topology: String,
+    draw: DrawInvocation,
+    fragment_state: FragmentState,
+}
+
+#[derive(serde::Deserialize)]
+struct FragmentState {
+    depth_test: String,
+    depth_write: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DrawInvocation {
+    Direct {
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    },
+    Indirect {
+        commands: IndirectCommands,
+        offset: u64,
+        draw_count: DrawCount,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct IndirectCommands {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DrawCount {
+    kind: String,
+    count: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -121,6 +171,31 @@ impl Binding {
         }
     }
 
+    /// Binding kind as used by one physical compute stage. The pipeline-level
+    /// descriptor access is the union across all synthesized stages, while wgpu
+    /// validates each entry point against its own exact storage access.
+    fn stage_kind_tokens(&self, reads: bool, writes: bool) -> TokenStream {
+        match self.ty.as_str() {
+            "storage_buffer" => match (reads, writes) {
+                (true, false) => quote! { BindingKind::StorageRead },
+                (false, true) => quote! { BindingKind::StorageWrite },
+                (true, true) => quote! { BindingKind::StorageReadWrite },
+                (false, false) => panic!("descriptor: unused stage storage buffer"),
+            },
+            "storage_texture" => {
+                let format = self.format_tokens();
+                let access = match (reads, writes) {
+                    (true, false) => quote! { ImgAccess::Read },
+                    (false, true) => quote! { ImgAccess::Write },
+                    (true, true) => quote! { ImgAccess::ReadWrite },
+                    (false, false) => panic!("descriptor: unused stage storage texture"),
+                };
+                quote! { BindingKind::StorageImage { format: #format, access: #access } }
+            }
+            _ => self.kind_tokens(),
+        }
+    }
+
     fn usage_tokens(&self) -> TokenStream {
         match self.usage.as_deref() {
             Some("input") => quote! { BindingUsage::Input },
@@ -135,6 +210,7 @@ impl Binding {
         match self.format.as_deref() {
             Some("rgba8_unorm") => quote! { TexFormat::Rgba8Unorm },
             Some("rgba16_float") => quote! { TexFormat::Rgba16Float },
+            Some("rgba32_float") => quote! { TexFormat::Rgba32Float },
             Some("r32_float") => quote! { TexFormat::R32Float },
             other => panic!("descriptor: storage_texture format {other:?}"),
         }
@@ -161,8 +237,17 @@ enum Length {
 #[derive(serde::Deserialize)]
 struct Stage {
     entry_point: String,
+    owner: String,
+    #[serde(default)]
+    workgroup_size: [u32; 3],
+    #[serde(default)]
+    stage: Option<String>,
     #[serde(default)]
     dispatch_size: Option<DispatchSize>,
+    /// Indices into the parent pipeline's `bindings` array read by this physical
+    /// stage. Together with `writes`, this defines its exact bind interface.
+    #[serde(default)]
+    reads: Vec<usize>,
     /// Indices into the parent pipeline's `bindings` array that this stage writes;
     /// associates a `same_as_dispatch` output with the domain-derived stage that
     /// produces it. These are descriptor-array indices, not Vulkan binding numbers.
@@ -294,23 +379,108 @@ fn output_domain<'a>(p: &'a Pipeline, output: &Binding) -> Option<&'a Len> {
     found
 }
 
-/// The pipeline's canonical entry name — the stage every stage name is prefixed
-/// by (the source entry). Its lowered stages are named `<entry>`, `<entry>_…`, so
-/// the base is the shortest stage name; it can appear anywhere in the ordered list
-/// (e.g. `step` runs first, but a fused `filter`'s primary `cull` runs last after
-/// its `cull_filter_flags`/`cull_filter_scan` helpers). Names all generated items.
-fn base_entry(p: &Pipeline) -> &str {
-    let base = p
+/// The compiler-provided logical owner shared by every physical stage in one
+/// compute pipeline. Generated helper names use this identity; they must not
+/// infer ownership from lowered entry-point spelling.
+fn pipeline_owner(p: &Pipeline) -> &str {
+    let owner = p
         .stages
-        .iter()
-        .map(|s| s.entry_point.as_str())
-        .min_by_key(|n| n.len())
-        .expect("compute pipeline has at least one stage");
+        .first()
+        .map(|stage| stage.owner.as_str())
+        .expect("pipeline has at least one stage");
     assert!(
-        p.stages.iter().all(|s| s.entry_point.starts_with(base)),
-        "descriptor: pipeline stages don't share the base entry {base:?}"
+        p.stages.iter().all(|stage| stage.owner == owner),
+        "descriptor: pipeline stages don't share owner {owner:?}"
     );
-    base
+    owner
+}
+
+/// Rust identifier for a pipeline's generated binding table. Compute owners are
+/// unique descriptor entry identities. Graphics stages all belong to the root
+/// frame entry, so their descriptor pipeline index disambiguates them.
+fn binding_table_id(p: &Pipeline, pipeline_index: usize) -> Ident {
+    if p.kind == "compute" {
+        id(&format!("{}_BINDINGS", pipeline_owner(p).to_uppercase()))
+    } else {
+        id(&format!("PIPELINE_{pipeline_index}_BINDINGS"))
+    }
+}
+
+fn stage_binding_table_id(p: &Pipeline, stage_index: usize) -> Ident {
+    id(&format!(
+        "{}_STAGE_{stage_index}_BINDINGS",
+        pipeline_owner(p).to_uppercase()
+    ))
+}
+
+/// Generate the exact interface used by one physical compute stage. `reads` and
+/// `writes` are descriptor-array indices; duplicate descriptor rows for one
+/// Vulkan slot are folded after their access has been combined.
+fn codegen_stage_bindings(p: &Pipeline, stage: &Stage, stage_index: usize) -> TokenStream {
+    let table = stage_binding_table_id(p, stage_index);
+    let mut used = vec![false; p.bindings.len()];
+    for &binding_index in stage.reads.iter().chain(&stage.writes) {
+        *used.get_mut(binding_index).unwrap_or_else(|| {
+            panic!(
+                "descriptor: stage {} binding index {} is outside {} bindings",
+                stage.entry_point,
+                binding_index,
+                p.bindings.len()
+            )
+        }) = true;
+    }
+
+    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let rows: Vec<TokenStream> = p
+        .bindings
+        .iter()
+        .enumerate()
+        .filter(|(binding_index, b)| used[*binding_index] && seen.insert((b.set, b.binding)))
+        .map(|(_, b)| {
+            let same_slot = |binding_index: usize| {
+                let other = &p.bindings[binding_index];
+                other.set == b.set && other.binding == b.binding
+            };
+            let reads = stage.reads.iter().copied().any(same_slot);
+            let writes = stage.writes.iter().copied().any(same_slot);
+            let (set, binding, name) = (b.set, b.binding, &b.name);
+            let kind = b.stage_kind_tokens(reads, writes);
+            let usage = b.usage_tokens();
+            quote! { (#set, #binding, #kind, #usage, #name) }
+        })
+        .collect();
+    quote! {
+        pub static #table: &[(u32, u32, BindingKind, BindingUsage, &str)] = &[#(#rows),*];
+    }
+}
+
+/// Temporary compatibility bridge for Tinyporto's two runtime `iota` domains.
+/// The compiler currently emits these expression-derived domains as implicit
+/// fixed dispatches. The host already owns the window extent, so use its two
+/// products until the descriptor preserves parameter expressions directly.
+fn temporary_host_count_param(p: &Pipeline, stage_index: usize) -> Option<&'static str> {
+    if pipeline_owner(p) == "tinyporto_frame__compute_2" {
+        match stage_index {
+            0 => Some("window_pixels"),
+            1 => Some("occ_pixels"),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn temporary_output_count_param(p: &Pipeline, output: &Binding) -> Option<&'static str> {
+    let binding_index = p.bindings.iter().position(|binding| {
+        binding.set == output.set
+            && binding.binding == output.binding
+            && binding.name == output.name
+    })?;
+    p.stages
+        .iter()
+        .enumerate()
+        .find(|(_, stage)| stage.writes.contains(&binding_index))
+        .and_then(|(stage_index, _)| temporary_host_count_param(p, stage_index))
 }
 
 /// Fixed byte capacity of `intermediate` binding `b`, if the pipeline has one.
@@ -354,71 +524,95 @@ fn image_pixels_param(p: &Pipeline, set: u32, b: u32) -> Ident {
 /// functions, with the descriptor's rules inlined as arithmetic. Non-compute
 /// pipelines have nothing to compute, so they generate nothing. A compute entry
 /// lowers to several ordered stages (one per output domain); the canonical entry
-/// (see `base_entry`) names the whole pipeline.
+/// (see `pipeline_owner`) names the whole pipeline.
 fn codegen_pipeline(p: &Pipeline) -> TokenStream {
     if p.kind != "compute" {
         return quote! {};
     }
-    let entry0 = base_entry(p);
+    let entry0 = pipeline_owner(p);
     let stages_fn = id(&format!("{entry0}_stages"));
     let count_const = id(&format!("{}_STAGE_COUNT", entry0.to_uppercase()));
     let out_bytes_fn = id(&format!("{entry0}_out_bytes"));
     let n_stages = p.stages.len();
+    let stage_binding_defs: Vec<TokenStream> = p
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(stage_index, stage)| codegen_stage_bindings(p, stage, stage_index))
+        .collect();
 
     // One `ComputeStage { entry, groups }` per descriptor stage. Each stage's
     // dispatch dims are either a constant grid (the entry indexes its whole output
     // directly) or ceil(input_len_elems / workgroup_size). The stages_fn takes the
     // byte size of every input a derived stage sizes from (sorted union), so a
     // fixed-grid stage needs no argument.
-    let mut disp_params: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut disp_params: std::collections::BTreeSet<String> =
+        ["window_pixels".to_string(), "occ_pixels".to_string()]
+            .into_iter()
+            .collect();
     let stage_rows: Vec<TokenStream> = p
         .stages
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(stage_index, s)| {
             let entry = s.entry_point.as_str();
+            let bindings = stage_binding_table_id(p, stage_index);
             let ds = s
                 .dispatch_size
                 .as_ref()
                 .expect("compute stage has dispatch_size");
-            let dims = match ds {
-                DispatchSize::Fixed { x, y, z } => quote! { [#x, #y, #z] },
-                DispatchSize::DerivedFrom {
-                    len,
-                    workgroup_size,
-                } => {
-                    let wg = *workgroup_size;
-                    match len {
-                        // Buffer-sized: a fixed-capacity intermediate is a constant
-                        // grid; an entry input arrives as a `<name>_bytes` arg.
-                        Len::InputBinding {
-                            binding,
-                            elem_bytes,
-                        } => {
-                            if let Some(bytes) = intermediate_fixed_bytes(p, *binding) {
-                                let count = bytes / elem_bytes;
-                                quote! { [(#count as u32).div_ceil(#wg), 1, 1] }
-                            } else {
-                                let param = input_param(p, *binding);
-                                disp_params.insert(param.to_string());
-                                quote! { [((#param / #elem_bytes) as u32).div_ceil(#wg), 1, 1] }
+            let dims = if let Some(param) = temporary_host_count_param(p, stage_index) {
+                assert_eq!(s.workgroup_size[1..], [1, 1]);
+                let count = id(param);
+                let workgroup_size = s.workgroup_size[0];
+                quote! { [(#count as u32).div_ceil(#workgroup_size), 1, 1] }
+            } else {
+                match ds {
+                    DispatchSize::Fixed { x, y, z } => quote! { [#x, #y, #z] },
+                    DispatchSize::DerivedFrom {
+                        len,
+                        workgroup_size,
+                    } => {
+                        let wg = *workgroup_size;
+                        match len {
+                            // Buffer-sized: a fixed-capacity intermediate is a constant
+                            // grid; an entry input arrives as a `<name>_bytes` arg.
+                            Len::InputBinding {
+                                binding,
+                                elem_bytes,
+                            } => {
+                                if let Some(bytes) = intermediate_fixed_bytes(p, *binding) {
+                                    let count = bytes / elem_bytes;
+                                    quote! { [(#count as u32).div_ceil(#wg), 1, 1] }
+                                } else {
+                                    let param = input_param(p, *binding);
+                                    disp_params.insert(param.to_string());
+                                    quote! { [((#param / #elem_bytes) as u32).div_ceil(#wg), 1, 1] }
+                                }
                             }
-                        }
-                        // Storage image: dispatch ceil(width*height / wg). The pixel
-                        // count arrives as a `<name>_pixels` arg (see image_pixels_param).
-                        Len::StorageImage { set, binding } => {
-                            let param = image_pixels_param(p, *set, *binding);
-                            disp_params.insert(param.to_string());
-                            quote! { [(#param as u32).div_ceil(#wg), 1, 1] }
-                        }
-                        // Compile-time count (an iota domain): a constant grid,
-                        // no argument needed.
-                        Len::Fixed { count } => {
-                            quote! { [(#count as u32).div_ceil(#wg), 1, 1] }
+                            // Storage image: dispatch ceil(width*height / wg). The pixel
+                            // count arrives as a `<name>_pixels` arg (see image_pixels_param).
+                            Len::StorageImage { set, binding } => {
+                                let param = image_pixels_param(p, *set, *binding);
+                                disp_params.insert(param.to_string());
+                                quote! { [(#param as u32).div_ceil(#wg), 1, 1] }
+                            }
+                            // Compile-time count (an iota domain): a constant grid,
+                            // no argument needed.
+                            Len::Fixed { count } => {
+                                quote! { [(#count as u32).div_ceil(#wg), 1, 1] }
+                            }
                         }
                     }
                 }
             };
-            quote! { crate::graph::ComputeStage { entry: #entry, groups: #dims } }
+            quote! {
+                crate::graph::ComputeStage {
+                    entry: #entry,
+                    groups: #dims,
+                    bindings: #bindings,
+                }
+            }
         })
         .collect();
     let disp_param_ids: Vec<Ident> = disp_params.iter().map(|s| id(s)).collect();
@@ -431,7 +625,10 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
         .iter()
         .filter(|b| matches!(b.usage.as_deref(), Some("output") | Some("intermediate")))
         .collect();
-    let mut params: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut params: std::collections::BTreeSet<String> =
+        ["window_pixels".to_string(), "occ_pixels".to_string()]
+            .into_iter()
+            .collect();
     let arms: Vec<TokenStream> = outputs
         .iter()
         .map(|o| {
@@ -447,33 +644,40 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
                     params.insert(src.to_string());
                     quote! { (#src / #src_elem_bytes) * #elem_bytes }
                 }
-                Length::SameAsDispatch { elem_bytes } => match output_domain(p, o) {
-                    Some(Len::Fixed { count }) => quote! { #count * #elem_bytes },
-                    Some(Len::InputBinding {
-                        binding,
-                        elem_bytes: src_elem_bytes,
-                    }) => {
-                        if let Some(bytes) = intermediate_fixed_bytes(p, *binding) {
-                            let count = bytes / src_elem_bytes;
-                            quote! { #count * #elem_bytes }
-                        } else {
-                            let src = input_param(p, *binding);
-                            params.insert(src.to_string());
-                            quote! { (#src / #src_elem_bytes) * #elem_bytes }
+                Length::SameAsDispatch { elem_bytes } => {
+                    if let Some(param) = temporary_output_count_param(p, o) {
+                        let count = id(param);
+                        quote! { #count * #elem_bytes }
+                    } else {
+                        match output_domain(p, o) {
+                            Some(Len::Fixed { count }) => quote! { #count * #elem_bytes },
+                            Some(Len::InputBinding {
+                                binding,
+                                elem_bytes: src_elem_bytes,
+                            }) => {
+                                if let Some(bytes) = intermediate_fixed_bytes(p, *binding) {
+                                    let count = bytes / src_elem_bytes;
+                                    quote! { #count * #elem_bytes }
+                                } else {
+                                    let src = input_param(p, *binding);
+                                    params.insert(src.to_string());
+                                    quote! { (#src / #src_elem_bytes) * #elem_bytes }
+                                }
+                            }
+                            Some(Len::StorageImage { set, binding }) => {
+                                let src = image_pixels_param(p, *set, *binding);
+                                params.insert(src.to_string());
+                                quote! { #src * #elem_bytes }
+                            }
+                            None => {
+                                let (binding, src_elem_bytes) = dispatch_input(p);
+                                let src = input_param(p, binding);
+                                params.insert(src.to_string());
+                                quote! { (#src / #src_elem_bytes) * #elem_bytes }
+                            }
                         }
                     }
-                    Some(Len::StorageImage { set, binding }) => {
-                        let src = image_pixels_param(p, *set, *binding);
-                        params.insert(src.to_string());
-                        quote! { #src * #elem_bytes }
-                    }
-                    None => {
-                        let (binding, src_elem_bytes) = dispatch_input(p);
-                        let src = input_param(p, binding);
-                        params.insert(src.to_string());
-                        quote! { (#src / #src_elem_bytes) * #elem_bytes }
-                    }
-                },
+                }
             };
             quote! { #b => #expr }
         })
@@ -481,6 +685,7 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
     let out_params: Vec<Ident> = params.iter().map(|s| id(s)).collect();
 
     quote! {
+        #(#stage_binding_defs)*
         /// Number of ordered compute stages this entry lowers to.
         pub const #count_const: usize = #n_stages;
         /// Ordered compute stages (entry point + workgroup dispatch dims) for this
@@ -500,11 +705,11 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
 
 /// Generate the bind-table static for a pipeline's entry: the descriptor's
 /// pipeline-wide interface shared by its ordered physical stages.
-fn codegen_bindings(p: &Pipeline) -> TokenStream {
+fn codegen_bindings(p: &Pipeline, pipeline_index: usize) -> TokenStream {
     if p.stages.is_empty() {
         return quote! {};
     }
-    let table = id(&format!("{}_BINDINGS", base_entry(p).to_uppercase()));
+    let table = binding_table_id(p, pipeline_index);
     // Dedup by (set, binding): the descriptor lists a storage-image resource once
     // per view kind, so the same slot can appear twice — one layout entry per slot.
     let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
@@ -520,6 +725,75 @@ fn codegen_bindings(p: &Pipeline) -> TokenStream {
         .collect();
     quote! {
         pub static #table: &[(u32, u32, BindingKind, BindingUsage, &str)] = &[#(#rows),*];
+    }
+}
+
+/// Emit one complete graphics item from the unified pipeline descriptor. Stage
+/// entry points, binding interface, draw mode/counts, and depth behavior are all
+/// compiler-owned; the application graph only groups attachments into passes.
+fn codegen_graphics_item(key: &str, p: &Pipeline, pipeline_index: usize) -> TokenStream {
+    if p.kind != "graphics" {
+        return quote! {};
+    }
+    let item = id(&format!("PIPELINE_{pipeline_index}_ITEM"));
+    let bindings = binding_table_id(p, pipeline_index);
+    let vertex = p
+        .stages
+        .iter()
+        .find(|stage| stage.stage.as_deref() == Some("vertex"))
+        .map(|stage| stage.entry_point.as_str())
+        .expect("graphics pipeline has a vertex stage");
+    let fragment = p
+        .stages
+        .iter()
+        .find(|stage| stage.stage.as_deref() == Some("fragment"))
+        .map(|stage| stage.entry_point.as_str())
+        .expect("graphics pipeline has a fragment stage");
+    let invocation = p.invocation.as_ref().expect("graphics invocation");
+    assert_eq!(invocation.topology, "triangle_list");
+    let draw = match &invocation.draw {
+        DrawInvocation::Direct {
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+        } => quote! {
+            crate::graph::Draw::Direct {
+                vertex_count: #vertex_count,
+                instance_count: #instance_count,
+                first_vertex: #first_vertex,
+                first_instance: #first_instance,
+            }
+        },
+        DrawInvocation::Indirect {
+            commands,
+            offset,
+            draw_count,
+        } => {
+            assert_eq!(draw_count.kind, "fixed");
+            assert_eq!(draw_count.count, 1, "multi-draw is not supported yet");
+            let name = &commands.name;
+            quote! { crate::graph::Draw::Indirect { commands: #name, offset: #offset } }
+        }
+    };
+    let depth_write = invocation.fragment_state.depth_write;
+    let depth_test = match invocation.fragment_state.depth_test.as_str() {
+        "disabled" => quote! { crate::graph::DepthTest::Disabled },
+        "less_equal" => quote! { crate::graph::DepthTest::LessEqual },
+        other => panic!("descriptor: unsupported depth test {other:?}"),
+    };
+    let label = format!("{key}:pipeline_{pipeline_index}");
+    quote! {
+        pub static #item: crate::graph::RenderItem = crate::graph::RenderItem {
+            label: #label,
+            module: #key,
+            vs: #vertex,
+            fs: #fragment,
+            bindings: #bindings,
+            draw: #draw,
+            depth_test: #depth_test,
+            depth_write: #depth_write,
+        };
     }
 }
 
@@ -665,8 +939,8 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
         .enumerate()
         .filter(|(_, pipeline)| has_fixed_compute_factory(pipeline))
         .map(|(pipeline_index, pipeline)| {
-            let entry = base_entry(pipeline);
-            let bindings = id(&format!("{}_BINDINGS", entry.to_uppercase()));
+            let entry = pipeline_owner(pipeline);
+            let bindings = binding_table_id(pipeline, pipeline_index);
             let stages = id(&format!("{entry}_stages"));
             let out_bytes = id(&format!("{entry}_out_bytes"));
             quote! {
@@ -674,8 +948,9 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
                     label: #entry,
                     module: #key,
                     bindings: #bindings,
-                    stages: #stages().to_vec(),
+                    stages: #stages(0, 0).to_vec(),
                     out_bytes: #out_bytes,
+                    runtime_counts: [0, 0],
                 })
             }
         });
@@ -683,11 +958,12 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
     let compute_entry_arms = desc
         .pipelines
         .iter()
-        .filter(|pipeline| pipeline.kind == "compute")
-        .filter_map(|pipeline| {
-            let entry = base_entry(pipeline);
+        .enumerate()
+        .filter(|(_, pipeline)| pipeline.kind == "compute")
+        .filter_map(|(pipeline_index, pipeline)| {
+            let entry = pipeline_owner(pipeline);
             let args = compute_stage_args(pipeline)?;
-            let bindings = id(&format!("{}_BINDINGS", entry.to_uppercase()));
+            let bindings = binding_table_id(pipeline, pipeline_index);
             let stages = id(&format!("{entry}_stages"));
             let out_bytes = id(&format!("{entry}_out_bytes"));
             Some(quote! {
@@ -695,8 +971,9 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
                     label: #entry,
                     module: #key,
                     bindings: #bindings,
-                    stages: #stages(#(#args),*).to_vec(),
+                    stages: #stages(window_pixels, occ_pixels, #(#args),*).to_vec(),
                     out_bytes: #out_bytes,
+                    runtime_counts: [window_pixels, occ_pixels],
                 })
             })
         });
@@ -767,6 +1044,7 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
             module: &'static str,
             entry: &'static str,
             window_pixels: u64,
+            occ_pixels: u64,
         ) -> Option<crate::graph::ComputePass> {
             match (module, entry) {
                 #(#compute_entry_arms,)*
@@ -815,26 +1093,31 @@ fn main() {
         let src = repo.join(rel);
         let spv = out_dir.join(format!("{key}.spv"));
         let status = Command::new(&wyn)
-            .args(["compile"])
+            .args(["build", "--graphics"])
             .arg(&src)
             .arg("-o")
             .arg(&spv)
             .status()
-            .unwrap_or_else(|e| panic!("failed to run `wyn compile` ({e}); is `wyn` on PATH?"));
-        assert!(status.success(), "`wyn compile {}` failed", src.display());
+            .unwrap_or_else(|e| panic!("failed to run `wyn build` ({e}); is `wyn` on PATH?"));
+        assert!(
+            status.success(),
+            "`wyn build --graphics {}` failed",
+            src.display()
+        );
 
         let spv_rel = format!("/{key}.spv");
         shader_rows.push(quote! { (#key, include_bytes!(concat!(env!("OUT_DIR"), #spv_rel))) });
 
-        // Translate the descriptor `wyn compile` wrote next to the .spv.
+        // Translate the descriptor `wyn build` wrote next to the .spv.
         let json_path = out_dir.join(format!("{key}.json"));
         let json = std::fs::read_to_string(&json_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", json_path.display()));
         let desc: Descriptor = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("parse {}: {e}", json_path.display()));
-        for p in &desc.pipelines {
+        for (pipeline_index, p) in desc.pipelines.iter().enumerate() {
             codegen.extend(codegen_pipeline(p));
-            codegen.extend(codegen_bindings(p));
+            codegen.extend(codegen_bindings(p, pipeline_index));
+            codegen.extend(codegen_graphics_item(key, p, pipeline_index));
         }
         codegen.extend(codegen_uniform_blocks(&desc.pipelines));
         codegen.extend(codegen_frame_graph(key, &desc));

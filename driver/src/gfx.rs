@@ -44,7 +44,7 @@ impl Gfx {
 
     async fn new_async(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
         let surface = instance
             .create_surface(window.clone())
             .context("create_surface")?;
@@ -82,7 +82,7 @@ impl Gfx {
     /// carries the offscreen format + size; sRGB so readback bytes are display-ready.
     pub fn new_headless(width: u32, height: u32) -> Result<Self> {
         pollster::block_on(async {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,

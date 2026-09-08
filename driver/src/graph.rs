@@ -130,6 +130,7 @@ pub enum Role {
 pub enum TexFormat {
     Rgba8Unorm,
     Rgba16Float,
+    Rgba32Float,
     R32Float,
 }
 
@@ -139,7 +140,7 @@ impl TexFormat {
     /// `texture2d` over them must declare `Float { filterable: false }` (they are
     /// read via `texture_load`, not a filtering sampler).
     pub fn filterable(self) -> bool {
-        !matches!(self, TexFormat::R32Float)
+        !matches!(self, TexFormat::R32Float | TexFormat::Rgba32Float)
     }
 }
 
@@ -208,15 +209,15 @@ pub struct Binding {
     pub role: Role,
 }
 
-/// One ordered stage of a compute pass: an entry point and its workgroup dispatch
-/// dims. A Wyn compute entry lowers to one stage per output domain (e.g. `step` →
-/// six: one fixed-grid kernel per fixed output, one input-sized kernel per `map`),
-/// which the descriptor names in order. The stages of a pass share its binding
-/// interface and run sequentially.
+/// One ordered stage of a compute pass: an entry point, its workgroup dispatch
+/// dims, and its exact physical-stage binding interface. A Wyn compute entry can
+/// lower to several stages that use different subsets/access modes of the logical
+/// pipeline's union interface; they run sequentially.
 #[derive(Clone, Copy, Debug)]
 pub struct ComputeStage {
     pub entry: &'static str,
     pub groups: [u32; 3],
+    pub bindings: BindTable,
 }
 
 /// A compute pass: its generated binding table, the ordered stages it lowers to
@@ -231,7 +232,9 @@ pub struct ComputePass {
     pub module: &'static str,
     pub bindings: BindTable,
     pub stages: Vec<ComputeStage>,
-    pub out_bytes: fn(u32) -> u64,
+    pub out_bytes: fn(u32, u64, u64) -> u64,
+    /// Temporary host-resolved runtime domains: surface pixels and coarse tiles.
+    pub runtime_counts: [u64; 2],
 }
 
 /// One pipeline drawn within a render pass. Vertex and fragment binding tables
@@ -244,13 +247,33 @@ pub struct RenderItem {
     pub module: &'static str,
     pub vs: &'static str,
     pub fs: &'static str,
-    pub vs_bindings: BindTable,
-    pub fs_bindings: BindTable,
-    pub draw_args: &'static str,
+    pub bindings: BindTable,
+    pub draw: Draw,
+    pub depth_test: DepthTest,
     /// Write depth + test LessEqual (true): 3D geometry self-occludes while
     /// coplanar fragments fall back to draw order. Ignore depth + keep painter
     /// order (false) for a pure flat overlay.
     pub depth_write: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Draw {
+    Direct {
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    },
+    Indirect {
+        commands: &'static str,
+        offset: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DepthTest {
+    Disabled,
+    LessEqual,
 }
 
 /// One color attachment of a render pass, in shader `location` order. `target:

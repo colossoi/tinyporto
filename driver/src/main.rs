@@ -71,18 +71,23 @@ struct Args {
 
 // ---- built (concrete GPU) passes ----
 
-// `sets` is indexed by frame parity (len 1 if the pass has no ping-pong
-// binding, else 2). Ordered stages share the descriptor pipeline's union layout.
+// Each physical stage has its own exact descriptor interface. `sets` is indexed
+// by frame parity (len 1 if the stage has no ping-pong binding, else 2).
+struct BuiltComputeStage {
+    pipeline: wgpu::ComputePipeline,
+    groups: [u32; 3],
+    sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
+}
+
 struct BuiltCompute {
     label: &'static str,
-    stages: Vec<(wgpu::ComputePipeline, [u32; 3])>,
-    sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
+    stages: Vec<BuiltComputeStage>,
 }
 
 struct BuiltItem {
     pipeline: wgpu::RenderPipeline,
     sets: Vec<Vec<(u32, wgpu::BindGroup)>>,
-    draw_args: &'static str,
+    draw: Draw,
 }
 
 struct BuiltRender {
@@ -140,14 +145,16 @@ impl Renderer {
         let mut derived: HashMap<&'static str, u64> = HashMap::new();
         for pass in &graph.passes {
             if let Pass::Compute(cp) = pass {
-                for &(_, binding, kind, _, name) in cp.bindings {
-                    if matches!(
-                        kind,
-                        BindingKind::StorageWrite | BindingKind::StorageReadWrite
-                    ) {
+                for &(_, binding, kind, usage, name) in cp.bindings {
+                    if matches!(usage, BindingUsage::Output | BindingUsage::Intermediate)
+                        && matches!(
+                            kind,
+                            BindingKind::StorageWrite | BindingKind::StorageReadWrite
+                        )
+                    {
                         derived.insert(
                             name_to_resource(graph, cp.module, name),
-                            (cp.out_bytes)(binding),
+                            (cp.out_bytes)(binding, cp.runtime_counts[0], cp.runtime_counts[1]),
                         );
                     }
                 }
@@ -358,13 +365,13 @@ impl Renderer {
                         label: Some(c.label),
                         timestamp_writes: None,
                     });
-                    let set_list = &c.sets[parity % c.sets.len()];
-                    for (pipeline, groups) in &c.stages {
-                        cp.set_pipeline(pipeline);
+                    for stage in &c.stages {
+                        cp.set_pipeline(&stage.pipeline);
+                        let set_list = &stage.sets[parity % stage.sets.len()];
                         for (set, bg) in set_list {
                             cp.set_bind_group(*set, bg, &[]);
                         }
-                        cp.dispatch_workgroups(groups[0], groups[1], groups[2]);
+                        cp.dispatch_workgroups(stage.groups[0], stage.groups[1], stage.groups[2]);
                     }
                 }
                 BuiltPass::Render(r) => {
@@ -422,7 +429,20 @@ impl Renderer {
                         for (set, bg) in &it.sets[parity % it.sets.len()] {
                             rp.set_bind_group(*set, bg, &[]);
                         }
-                        rp.draw_indirect(&self.buffers[it.draw_args], 0);
+                        match it.draw {
+                            Draw::Direct {
+                                vertex_count,
+                                instance_count,
+                                first_vertex,
+                                first_instance,
+                            } => rp.draw(
+                                first_vertex..first_vertex + vertex_count,
+                                first_instance..first_instance + instance_count,
+                            ),
+                            Draw::Indirect { commands, offset } => {
+                                rp.draw_indirect(&self.buffers[commands], offset)
+                            }
+                        }
                     }
                 }
             }
@@ -778,6 +798,7 @@ fn wgpu_format(f: TexFormat) -> wgpu::TextureFormat {
     match f {
         TexFormat::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
         TexFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+        TexFormat::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
         TexFormat::R32Float => wgpu::TextureFormat::R32Float,
     }
 }
@@ -806,8 +827,7 @@ fn image_usage(graph: &Graph, name: &str) -> wgpu::TextureUsages {
                     u |= wgpu::TextureUsages::RENDER_ATTACHMENT;
                 }
                 for it in rp.items {
-                    touch(it.module, it.vs_bindings, &mut u);
-                    touch(it.module, it.fs_bindings, &mut u);
+                    touch(it.module, it.bindings, &mut u);
                 }
             }
         }
@@ -899,8 +919,7 @@ fn image_union_access(graph: &Graph, resource: &str) -> ImgAccess {
             Pass::Compute(cp) => scan(cp.module, cp.bindings),
             Pass::Render(rp) => {
                 for it in rp.items {
-                    scan(it.module, it.vs_bindings);
-                    scan(it.module, it.fs_bindings);
+                    scan(it.module, it.bindings);
                 }
             }
         }
@@ -1027,6 +1046,9 @@ fn build_sets(
     res: Res,
     parity: usize,
 ) -> (Vec<wgpu::BindGroupLayout>, Vec<(u32, wgpu::BindGroup)>) {
+    if bindings.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
     let max_set = bindings.iter().map(|b| b.set).max().unwrap_or(0);
     let mut layouts = Vec::new();
     let mut sets = Vec::new();
@@ -1090,25 +1112,25 @@ fn build_compute(
     res: Res,
     graph: &Graph,
 ) -> BuiltCompute {
-    let binds = resolve_table(cp.module, cp.bindings, graph, res.pp);
-    let (layouts, sets0) = build_sets(
-        device,
-        cp.label,
-        &binds,
-        wgpu::ShaderStages::COMPUTE,
-        res,
-        0,
-    );
-    let layout_refs: Vec<&wgpu::BindGroupLayout> = layouts.iter().collect();
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(cp.label),
-        bind_group_layouts: &layout_refs,
-        push_constant_ranges: &[],
-    });
     let stages = cp
         .stages
         .iter()
         .map(|st| {
+            let binds = resolve_table(cp.module, st.bindings, graph, res.pp);
+            let (layouts, sets0) = build_sets(
+                device,
+                st.entry,
+                &binds,
+                wgpu::ShaderStages::COMPUTE,
+                res,
+                0,
+            );
+            let layout_refs: Vec<&wgpu::BindGroupLayout> = layouts.iter().collect();
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(st.entry),
+                bind_group_layouts: &layout_refs,
+                push_constant_ranges: &[],
+            });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(st.entry),
                 layout: Some(&layout),
@@ -1117,27 +1139,30 @@ fn build_compute(
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
-            (pipeline, st.groups)
+            let mut sets = vec![sets0];
+            for parity in 1..variant_count(&binds) {
+                sets.push(
+                    build_sets(
+                        device,
+                        st.entry,
+                        &binds,
+                        wgpu::ShaderStages::COMPUTE,
+                        res,
+                        parity,
+                    )
+                    .1,
+                );
+            }
+            BuiltComputeStage {
+                pipeline,
+                groups: st.groups,
+                sets,
+            }
         })
         .collect();
-    let mut sets = vec![sets0];
-    for parity in 1..variant_count(&binds) {
-        sets.push(
-            build_sets(
-                device,
-                cp.label,
-                &binds,
-                wgpu::ShaderStages::COMPUTE,
-                res,
-                parity,
-            )
-            .1,
-        );
-    }
     BuiltCompute {
         label: cp.label,
         stages,
-        sets,
     }
 }
 
@@ -1151,17 +1176,7 @@ fn build_item(
     res: Res,
     graph: &Graph,
 ) -> BuiltItem {
-    // Vertex + fragment share one pipeline layout: merge their binding tables,
-    // deduping shared (set, binding) slots (e.g. the `frame` block in both stages).
-    let mut binds = resolve_table(it.module, it.vs_bindings, graph, res.pp);
-    for b in resolve_table(it.module, it.fs_bindings, graph, res.pp) {
-        if !binds
-            .iter()
-            .any(|x| x.set == b.set && x.binding == b.binding)
-        {
-            binds.push(b);
-        }
-    }
+    let binds = resolve_table(it.module, it.bindings, graph, res.pp);
     let (layouts, sets0) = build_sets(
         device,
         it.label,
@@ -1176,18 +1191,14 @@ fn build_item(
         bind_group_layouts: &layout_refs,
         push_constant_ranges: &[],
     });
-    let depth_stencil = if has_depth {
+    let depth_stencil = if has_depth && it.depth_test != DepthTest::Disabled {
         // Depth-writers test LessEqual: protruding geometry self-occludes, while
         // coplanar fragments at equal depth let the later draw win, preserving
         // painter order within the geometry stream. Non-writers test Always.
         Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: it.depth_write,
-            depth_compare: if it.depth_write {
-                wgpu::CompareFunction::LessEqual
-            } else {
-                wgpu::CompareFunction::Always
-            },
+            depth_compare: wgpu::CompareFunction::LessEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         })
@@ -1245,7 +1256,13 @@ fn build_item(
     BuiltItem {
         pipeline,
         sets,
-        draw_args: it.draw_args,
+        draw: match it.draw {
+            Draw::Indirect { commands, offset } => Draw::Indirect {
+                commands: name_to_resource(graph, it.module, commands),
+                offset,
+            },
+            direct => direct,
+        },
     }
 }
 
