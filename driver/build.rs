@@ -175,17 +175,11 @@ impl Binding {
         }
     }
 
-    /// Binding kind as used by one physical compute stage. The pipeline-level
-    /// descriptor access is the union across all synthesized stages, while wgpu
-    /// validates each entry point against its own exact storage access.
+    /// Logical access for a physical stage. Storage-buffer layout permissions
+    /// are subsequently taken from the compiled shader's declarations.
     fn stage_kind_tokens(&self, reads: bool, writes: bool) -> TokenStream {
         match self.ty.as_str() {
-            "storage_buffer" => match (reads, writes) {
-                (true, false) => quote! { BindingKind::StorageRead },
-                (false, true) => quote! { BindingKind::StorageWrite },
-                (true, true) => quote! { BindingKind::StorageReadWrite },
-                (false, false) => panic!("descriptor: unused stage storage buffer"),
-            },
+            "storage_buffer" => self.kind_tokens(),
             "storage_texture" => {
                 let format = self.format_tokens();
                 let access = match (reads, writes) {
@@ -420,7 +414,12 @@ fn stage_binding_table_id(p: &Pipeline, stage_index: usize) -> Ident {
 /// Generate the exact interface used by one physical compute stage. `reads` and
 /// `writes` are descriptor-array indices; duplicate descriptor rows for one
 /// Vulkan slot are folded after their access has been combined.
-fn codegen_stage_bindings(p: &Pipeline, stage: &Stage, stage_index: usize) -> TokenStream {
+fn codegen_stage_bindings(
+    p: &Pipeline,
+    stage: &Stage,
+    stage_index: usize,
+    interfaces: &BufferInterfaces,
+) -> TokenStream {
     let table = stage_binding_table_id(p, stage_index);
     let mut used = vec![false; p.bindings.len()];
     for &binding_index in stage.reads.iter().chain(&stage.writes) {
@@ -448,7 +447,19 @@ fn codegen_stage_bindings(p: &Pipeline, stage: &Stage, stage_index: usize) -> To
             let reads = stage.reads.iter().copied().any(same_slot);
             let writes = stage.writes.iter().copied().any(same_slot);
             let (set, binding, name) = (b.set, b.binding, &b.name);
-            let kind = b.stage_kind_tokens(reads, writes);
+            let kind = if let Some(writable) =
+                interfaces.get(&(stage.entry_point.clone(), b.set, b.binding))
+            {
+                if *writable {
+                    quote! { BindingKind::StorageReadWrite }
+                } else {
+                    quote! { BindingKind::StorageRead }
+                }
+            } else {
+                // Unused/optimized-out buffers have no shader requirement;
+                // retain their descriptor declaration and non-buffer handling.
+                b.stage_kind_tokens(reads, writes)
+            };
             let usage = b.usage_tokens();
             quote! { (#set, #binding, #kind, #usage, #name) }
         })
@@ -529,7 +540,7 @@ fn image_pixels_param(p: &Pipeline, set: u32, b: u32) -> Ident {
 /// pipelines have nothing to compute, so they generate nothing. A compute entry
 /// lowers to several ordered stages (one per output domain); the canonical entry
 /// (see `pipeline_owner`) names the whole pipeline.
-fn codegen_pipeline(p: &Pipeline) -> TokenStream {
+fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream {
     if p.kind != "compute" {
         return quote! {};
     }
@@ -542,7 +553,7 @@ fn codegen_pipeline(p: &Pipeline) -> TokenStream {
         .stages
         .iter()
         .enumerate()
-        .map(|(stage_index, stage)| codegen_stage_bindings(p, stage, stage_index))
+        .map(|(stage_index, stage)| codegen_stage_bindings(p, stage, stage_index, interfaces))
         .collect();
 
     // One `ComputeStage { entry, groups }` per descriptor stage. Each stage's
@@ -1068,6 +1079,41 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
     }
 }
 
+type BufferInterfaces = std::collections::HashMap<(String, u32, u32), bool>;
+
+/// Match the same SPIR-V declarations that wgpu validates. Descriptor stage
+/// reads/writes describe operations, while pipeline-wide access unions can be
+/// too broad for a stage-specific readonly global. Neither is a layout contract.
+fn buffer_interfaces(bytes: &[u8]) -> BufferInterfaces {
+    let module = naga::front::spv::parse_u8_slice(bytes, &Default::default())
+        .expect("parse compiled SPIR-V");
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .expect("validate compiled SPIR-V");
+    let mut interfaces = BufferInterfaces::new();
+    for (index, entry) in module.entry_points.iter().enumerate() {
+        let uses = info.get_entry_point(index);
+        for (handle, global) in module.global_variables.iter() {
+            if uses[handle].is_empty() {
+                continue;
+            }
+            if let (Some(binding), naga::AddressSpace::Storage { access }) =
+                (&global.binding, global.space)
+            {
+                let key = (entry.name.clone(), binding.group, binding.binding);
+                let writable = access.contains(naga::StorageAccess::STORE);
+                if let Some(previous) = interfaces.insert(key, writable) {
+                    assert_eq!(previous, writable, "conflicting SPIR-V buffer declarations");
+                }
+            }
+        }
+    }
+    interfaces
+}
+
 fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo = manifest
@@ -1127,8 +1173,9 @@ fn main() {
             .unwrap_or_else(|e| panic!("read {}: {e}", json_path.display()));
         let desc: Descriptor = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("parse {}: {e}", json_path.display()));
+        let interfaces = buffer_interfaces(&std::fs::read(&spv).expect("read compiled SPIR-V"));
         for (pipeline_index, p) in desc.pipelines.iter().enumerate() {
-            codegen.extend(codegen_pipeline(p));
+            codegen.extend(codegen_pipeline(p, &interfaces));
             codegen.extend(codegen_bindings(p, pipeline_index));
             codegen.extend(codegen_graphics_item(key, p, pipeline_index));
         }

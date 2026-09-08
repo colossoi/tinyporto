@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 png = "0.17"
 
 [build-dependencies]
+naga = { version = "27", features = ["spv-in"] }
 # Parse the wyn pipeline descriptor (.json) and codegen Rust from it.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
