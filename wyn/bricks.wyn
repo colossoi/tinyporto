@@ -7,6 +7,10 @@
 -- march so the silhouette rounds too (the Tiny Glade trick).
 
 import "pkg:rng"
+import "math"
+import "camera"
+import "paint"
+import "hiz"
 
 -- Sett palette. Cobble is a mid-tone neutral ranging from warm earthy greige to
 -- architectural grey with a soft blue undertone. Each sett draws an independent hash
@@ -130,3 +134,53 @@ type prop = {
   fwd: vec3f32,
   albedo: vec3f32,
 }
+
+-- Stable world centre shared by the visibility predicate and live-prop builder.
+-- The compacted stream can reorder instance IDs, so all variation remains keyed on
+-- this centre or the original candidate index.
+def sett_center(i: i32) vec2f32 =
+  let base = brick_center(i)
+  -- No along-row (x) jitter: setts sit on the exact cell x so the clamped along-row
+  -- half-extent (sett_hx) can guarantee they never overlap along their length. A
+  -- small cross-row (z) jitter keeps the courses from reading as a rigid grid.
+  let jz = (brick_hash(i + 53) - 0.5) * 0.016 in
+  @[base.x, base.y + jz]
+
+-- Visibility is intentionally a cheapest-first control-flow ladder. In particular,
+-- the water SDF scans the painted stroke data only after distance, frustum, and
+-- coarse-occlusion rejection. The clip projection is shared by the latter two tests.
+def sett_visible(resolution: vec3f32, camera: orbit,
+                 items: []vec4f32, points: []vec2f32, od: []f32, i: i32) bool =
+  let center = sett_center(i) in
+  if dot(center, center) >= 64.0 then false
+  else
+    let c3 = @[center.x, BRICK_H * 0.5, center.y]
+    let clip = world_to_clip(c3, resolution, camera) in
+    -- 0.25 ≈ the sett proxy's bounding radius (footprint + tilt), generous.
+    if !frustum_keep_clip(clip, 0.25, resolution) then false
+    -- Hidden only if the nearest recorded surface wins across the whole tile
+    -- neighbourhood, so a partly-visible sett stays.
+    else if occ_test(od, clip, resolution) then false
+    -- Water converts cobble to canal: reject setts near a painted canal edge.
+    else water_sdf(center, items, points) >= 0.08
+
+-- Build the complete record only after the candidate index survives compaction.
+def sett_prop(i: i32) prop =
+  let center = sett_center(i)
+  let height = BRICK_H * (0.9625 + 0.075 * brick_hash(i))
+  let ss = sett_scale(center.x, center.y)
+  let (right, up, fwd) = sett_basis(center.x, center.y)
+  let half = @[sett_hx(ss), height * 0.5, BRICK_L * 0.5 * ss]
+  -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
+  let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919)
+  let radius = roundfrac * f32.min(half.x, f32.min(half.y, half.z))
+  -- Colour from three independent hashes: hue (warm greige <-> cool blue-grey),
+  -- saturation (mute toward grey <-> enrich the undertone), and lightness. Skewed a
+  -- touch dark (mean < 1) so the brightest setts don't blow out through the tonemap.
+  let seed = sett_seed(center.x, center.y)
+  let hued = mix(COBBLE_WARM, COBBLE_COOL, brick_hash(seed + 17))
+  let g = (hued.x + hued.y + hued.z) * 0.3333
+  let sat = 0.7 + 0.8 * brick_hash(seed + 29)
+  let albedo = mix(v3(g), hued, sat) * v3(0.5 + 0.9 * sett_var(center.x, center.y)) in
+  { center = @[center.x, height * 0.5, center.y], radius = radius, half = half,
+    right = right, up = up, fwd = fwd, albedo = albedo }

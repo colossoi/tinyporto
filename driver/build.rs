@@ -834,6 +834,27 @@ fn codegen_graphics_item(key: &str, p: &Pipeline, pipeline_index: usize) -> Toke
         "less_equal" => quote! { crate::graph::DepthTest::LessEqual },
         other => panic!("descriptor: unsupported depth test {other:?}"),
     };
+    let mut binding_stages = std::collections::BTreeMap::<(u32, u32), (bool, bool)>::new();
+    for stage in &p.stages {
+        for &index in stage.reads.iter().chain(&stage.writes) {
+            let binding = &p.bindings[index];
+            let flags = binding_stages.entry((binding.set, binding.binding)).or_default();
+            match stage.stage.as_deref() {
+                Some("vertex") => flags.0 = true,
+                Some("fragment") => flags.1 = true,
+                _ => {}
+            }
+        }
+    }
+    let visibility = binding_stages.iter().map(|(&(set, binding), &(vertex, fragment))| {
+        let stages = match (vertex, fragment) {
+            (true, true) => quote! { wgpu::ShaderStages::VERTEX_FRAGMENT },
+            (true, false) => quote! { wgpu::ShaderStages::VERTEX },
+            (false, true) => quote! { wgpu::ShaderStages::FRAGMENT },
+            _ => quote! { wgpu::ShaderStages::NONE },
+        };
+        quote! { (#set, #binding, #stages) }
+    });
     let label = format!("{key}:pipeline_{pipeline_index}");
     quote! {
         pub static #item: crate::graph::RenderItem = crate::graph::RenderItem {
@@ -843,6 +864,7 @@ fn codegen_graphics_item(key: &str, p: &Pipeline, pipeline_index: usize) -> Toke
             fs: #fragment,
             bindings: #bindings,
             draw: #draw,
+            binding_stages: &[#(#visibility),*],
             depth_test: #depth_test,
             depth_write: #depth_write,
         };
@@ -918,25 +940,6 @@ fn prerequisite_pipelines(fg: &FrameGraph, target: usize) -> Vec<usize> {
     pipelines
 }
 
-/// Compiler-inserted prerequisites currently have closed, fixed-size domains.
-/// Those can be materialized as an opaque `ComputePass` without any app-provided
-/// dispatch or sizing arguments.
-fn has_fixed_compute_factory(p: &Pipeline) -> bool {
-    p.kind == "compute"
-        && p.stages
-            .iter()
-            .all(|stage| matches!(stage.dispatch_size, Some(DispatchSize::Fixed { .. })))
-        && p.bindings
-            .iter()
-            .filter(|binding| {
-                matches!(
-                    binding.usage.as_deref(),
-                    Some("output") | Some("intermediate")
-                )
-            })
-            .all(|binding| matches!(binding.length, Some(Length::Fixed { .. })))
-}
-
 fn compute_stage_args(p: &Pipeline) -> Option<Vec<TokenStream>> {
     let mut params = std::collections::BTreeSet::new();
     for stage in &p.stages {
@@ -989,22 +992,23 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
         .pipelines
         .iter()
         .enumerate()
-        .filter(|(_, pipeline)| has_fixed_compute_factory(pipeline))
-        .map(|(pipeline_index, pipeline)| {
+        .filter(|(_, pipeline)| pipeline.kind == "compute")
+        .filter_map(|(pipeline_index, pipeline)| {
             let entry = pipeline_owner(pipeline);
+            let args = compute_stage_args(pipeline)?;
             let bindings = binding_table_id(pipeline, pipeline_index);
             let stages = id(&format!("{entry}_stages"));
             let out_bytes = id(&format!("{entry}_out_bytes"));
-            quote! {
+            Some(quote! {
                 (#key, #pipeline_index) => Some(crate::graph::ComputePass {
                     label: #entry,
                     module: #key,
                     bindings: #bindings,
-                    stages: #stages(0, 0).to_vec(),
+                    stages: #stages(window_pixels, occ_pixels, #(#args),*).to_vec(),
                     out_bytes: #out_bytes,
-                    runtime_counts: [0, 0],
+                    runtime_counts: [window_pixels, occ_pixels],
                 })
-            }
+            })
         });
 
     let compute_entry_arms = desc
@@ -1077,6 +1081,8 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
         fn descriptor_compute_pass(
             module: &str,
             pipeline_index: usize,
+            window_pixels: u64,
+            occ_pixels: u64,
         ) -> Option<crate::graph::ComputePass> {
             match (module, pipeline_index) {
                 #(#compute_factory_arms,)*
@@ -1084,11 +1090,11 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
             }
         }
 
-        pub fn insert_descriptor_prerequisites(graph: &mut crate::graph::Graph) {
+        pub fn insert_descriptor_prerequisites(graph: &mut crate::graph::Graph, window_pixels: u64, occ_pixels: u64) {
             graph.insert_compute_prerequisites(
                 descriptor_pipeline_index,
                 descriptor_prerequisite_pipelines,
-                descriptor_compute_pass,
+                |module, index| descriptor_compute_pass(module, index, window_pixels, occ_pixels),
             );
         }
 

@@ -507,7 +507,7 @@ impl Renderer {
                                     device,
                                     stage.entry,
                                     &binds,
-                                    wgpu::ShaderStages::COMPUTE,
+                                    |_, _| wgpu::ShaderStages::COMPUTE,
                                     res,
                                     parity,
                                 )
@@ -525,7 +525,7 @@ impl Renderer {
                                     device,
                                     item.label,
                                     &binds,
-                                    wgpu::ShaderStages::VERTEX_FRAGMENT,
+                                    |set, binding| item.binding_visibility(set, binding),
                                     res,
                                     parity,
                                 )
@@ -1228,7 +1228,7 @@ fn build_sets(
     device: &wgpu::Device,
     label: &str,
     bindings: &[Binding],
-    visibility: wgpu::ShaderStages,
+    visibility: impl Fn(u32, u32) -> wgpu::ShaderStages,
     res: Res,
     parity: usize,
 ) -> (Vec<wgpu::BindGroupLayout>, Vec<(u32, wgpu::BindGroup)>) {
@@ -1245,7 +1245,7 @@ fn build_sets(
             .iter()
             .map(|b| wgpu::BindGroupLayoutEntry {
                 binding: b.binding,
-                visibility,
+                visibility: visibility(b.set, b.binding),
                 // Sampled textures over unfilterable formats (R32Float) must declare
                 // a non-filterable sample type; look up the bound resource's format.
                 ty: layout_type(
@@ -1307,7 +1307,7 @@ fn build_compute(
                 device,
                 st.entry,
                 &binds,
-                wgpu::ShaderStages::COMPUTE,
+                |_, _| wgpu::ShaderStages::COMPUTE,
                 res,
                 0,
             );
@@ -1332,7 +1332,7 @@ fn build_compute(
                         device,
                         st.entry,
                         &binds,
-                        wgpu::ShaderStages::COMPUTE,
+                        |_, _| wgpu::ShaderStages::COMPUTE,
                         res,
                         parity,
                     )
@@ -1367,7 +1367,7 @@ fn build_item(
         device,
         it.label,
         &binds,
-        wgpu::ShaderStages::VERTEX_FRAGMENT,
+        |set, binding| it.binding_visibility(set, binding),
         res,
         0,
     );
@@ -1432,7 +1432,7 @@ fn build_item(
                 device,
                 it.label,
                 &binds,
-                wgpu::ShaderStages::VERTEX_FRAGMENT,
+                |set, binding| it.binding_visibility(set, binding),
                 res,
                 p,
             )

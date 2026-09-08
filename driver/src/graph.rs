@@ -252,11 +252,21 @@ pub struct RenderItem {
     pub fs: &'static str,
     pub bindings: BindTable,
     pub draw: Draw,
+    /// Descriptor-declared shader stages that access each (set, binding).
+    pub binding_stages: &'static [(u32, u32, wgpu::ShaderStages)],
     pub depth_test: DepthTest,
     /// Write depth + test LessEqual (true): 3D geometry self-occludes while
     /// coplanar fragments fall back to draw order. Ignore depth + keep painter
     /// order (false) for a pure flat overlay.
     pub depth_write: bool,
+}
+
+impl RenderItem {
+    pub fn binding_visibility(&self, set: u32, binding: u32) -> wgpu::ShaderStages {
+        self.binding_stages.iter()
+            .find(|&&(s, b, _)| s == set && b == binding)
+            .map_or(wgpu::ShaderStages::NONE, |&(_, _, stages)| stages)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -329,7 +339,7 @@ impl Graph {
         &mut self,
         pipeline_index: fn(&str, &str) -> Option<usize>,
         prerequisite_pipelines: fn(&str, &str) -> &'static [usize],
-        compute_pass: fn(&str, usize) -> Option<ComputePass>,
+        compute_pass: impl Fn(&str, usize) -> Option<ComputePass>,
     ) {
         let mut authored = std::collections::HashSet::new();
         for pass in &self.passes {

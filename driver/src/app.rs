@@ -227,15 +227,13 @@ pub fn graph(w: u32, h: u32) -> Graph {
             ("tinyporto_frame__compute_0_output_1", "points"),
             ("tinyporto_frame__compute_0_output_2", "items"),
             ("tinyporto_frame__compute_0_output_3", "head"),
-            ("tinyporto_frame__compute_0_output_4", "geom_pos"),
-            ("tinyporto_frame__compute_0_output_5", "geom_nrm"),
-            ("tinyporto_frame__compute_0_output_6", "draw_args"),
-            ("tinyporto_frame__compute_0_output_7", "prop_inst"),
-            ("tinyporto_frame__compute_0_output_8", "prop_args"),
-            ("tinyporto_frame__compute_1_output_0", "points"),
-            ("tinyporto_frame__compute_1_output_1", "items"),
-            ("tinyporto_frame__compute_2_output_0", "ao_work"),
-            ("tinyporto_frame__compute_2_output_1", "occ"),
+            ("tinyporto_frame__compute_1_output_0", "geom_pos"),
+            ("tinyporto_frame__compute_1_output_1", "geom_nrm"),
+            ("tinyporto_frame__compute_1_output_2", "draw_args"),
+            ("tinyporto_frame__compute_2_output_0", "prop_inst"),
+            ("tinyporto_frame__compute_2_output_1", "prop_args"),
+            ("tinyporto_frame__compute_3_output_0", "ao_work"),
+            ("tinyporto_frame__compute_3_output_1", "occ"),
             ("geom_pos", "geom_pos"),
             ("geom_nrm", "geom_nrm"),
             // The one instanced prop stream, read by both stages of the prop draw.
@@ -249,8 +247,8 @@ pub fn graph(w: u32, h: u32) -> Graph {
         ],
 
         passes: vec![
-            // Logical frame preparation: advance persistent state, tessellate the
-            // ground ribbon, and build visibility records for cobble/wall instances.
+            // Advance persistent state. Geometry and visibility compute passes are
+            // inserted from descriptor dependencies before their consuming draws.
             Pass::Compute(compute_entry("main", "tinyporto_frame__compute_0", w, h)),
             // Sun shadow map: rasterize the wall bricks through the sun's ortho light
             // camera, storing nearest light-space depth into sun_depth. Reuses the shared
@@ -298,7 +296,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
             // invocation integrates horizon AO into ao_work; the first occ_w*occ_h also min
             // their coarse occ_depth tile, which `cull` reads next frame. Runs before the
             // resolve, which reads ao_work and folds the edge-aware denoise into shading.
-            Pass::Compute(compute_entry("main", "tinyporto_frame__compute_2", w, h)),
+            Pass::Compute(compute_entry("main", "tinyporto_frame__compute_3", w, h)),
             // Deferred resolve: one fullscreen triangle whose fragment reads the G-buffer,
             // folds in the GTAO term (including the edge-aware denoise of ao_work) and
             // writes the final colour (sun + shadows + AO-attenuated sky, tonemapped)
@@ -315,6 +313,33 @@ pub fn graph(w: u32, h: u32) -> Graph {
             }),
         ],
     };
-    crate::generated::insert_descriptor_prerequisites(&mut graph);
+    crate::generated::insert_descriptor_prerequisites(
+        &mut graph, u64::from(w) * u64::from(h),
+        u64::from(occ_w(w)) * u64::from(occ_h(h)),
+    );
     graph
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_prerequisites_accept_live_viewport_sizes() {
+        let (width, height) = (1279, 799);
+        let graph = graph(width, height);
+        let expected = [
+            u64::from(width) * u64::from(height),
+            u64::from(occ_w(width)) * u64::from(occ_h(height)),
+        ];
+        let compute: Vec<_> = graph.passes.iter().filter_map(|pass| match pass {
+            Pass::Compute(pass) => Some(pass),
+            _ => None,
+        }).collect();
+        // More than the two authored passes must be generated successfully,
+        // including prerequisites whose dispatches have nontrivial domains.
+        assert!(compute.len() > 2);
+        assert!(compute.iter().all(|pass| pass.runtime_counts == expected));
+        assert!(compute.iter().any(|pass| pass.stages.iter().any(|stage| stage.groups[0] > 1)));
+    }
 }
