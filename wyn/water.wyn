@@ -13,6 +13,7 @@
 import "math"     -- v2 / v3 / dot / magnitude / mix
 import "clouds"   -- sky reflection off the water surface
 import "shade"    -- sun (specular glint)
+import "pkg:noise" -- shared deterministic 2-D value-noise implementation
 
 -- Water sits this far below the ground plane (y = 0); the shoreline is a quay wall
 -- of this height. Kept shallow — a shallow murky harbour, not a deep lake.
@@ -85,19 +86,11 @@ def SEA_ITER:   i32 = 4
 def WAVE_SCALE: f32 = 1.4       -- world metres -> wave uv
 def NORMAL_STR: f32 = 1.15      -- horizontal slope -> normal tilt
 
-def whash(p: vec2f32) f32 =
-  f32.fract(f32.sin(dot(p, @[127.1, 311.7])) * 43758.5453123)
-
--- 2-D value noise in [-1, 1] (Seascape's `noise`).
+-- 2-D value noise in [-1, 1] (Seascape's `noise` contract), backed by
+-- wyn/noise's graphics-grade PCG value noise.
 def wnoise(p: vec2f32) f32 =
-  let i = vec.floor(p)
-  let f = vec.fract(p)
-  let u = f * f * (v2(3.0) - f * v2(2.0))
-  let a = whash(i)
-  let b = whash(@[i.x + 1.0, i.y])
-  let c = whash(@[i.x, i.y + 1.0])
-  let d = whash(@[i.x + 1.0, i.y + 1.0]) in
-  0.0 - 1.0 + 2.0 * mix(mix(a, b, u.x), mix(c, d, u.x), u.y)
+  let k = fasthash.seed(0xC0FFEE11u32) in
+  0.0 - 1.0 + 2.0 * fhnoise.value2(k, p)
 
 -- One ridged, domain-warped wave octave (Seascape's `sea_octave`).
 def sea_octave(uv: vec2f32, choppy: f32) f32 =

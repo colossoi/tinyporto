@@ -15,6 +15,10 @@ use quote::quote;
 // Wyn entry roots to compile+embed. (key, path-relative-to-repo-root.)
 const ROOTS: &[(&str, &str)] = &[("main", "wyn/main.wyn")];
 
+// Local package dependencies declared in the repository-root wyn.toml. Cargo
+// cannot discover Wyn's import graph itself, so track their sources explicitly.
+const WYN_PACKAGE_PATHS: &[&str] = &["../wyn/pkg/gtao", "../wyn/pkg/noise", "../wyn/pkg/rng"];
+
 // ---- descriptor model (the subset of the wyn `*.json` we consume) ----
 
 #[derive(serde::Deserialize)]
@@ -1073,7 +1077,16 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", repo.join("wyn.toml").display());
     rerun_if_wyn_changed(&repo.join("wyn"));
+    for rel in WYN_PACKAGE_PATHS {
+        let package = repo.join(rel);
+        println!(
+            "cargo:rerun-if-changed={}",
+            package.join("wyn.toml").display()
+        );
+        rerun_if_wyn_changed(&package.join("src"));
+    }
 
     // Recompile when the compiler itself changes (reinstalled from a new HEAD), not
     // only when a `.wyn` source does — otherwise a fresh `wyn` links stale SPIR-V.

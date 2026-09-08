@@ -1,0 +1,12 @@
+manifest-version = 1
+
+[package]
+name = "tinyporto/app"
+version = "v0.1.0"
+wyn = "v0.1.0"
+library = "wyn/main.wyn"
+
+[dependencies]
+gtao = { package = "wyn/gtao", version = "v0.1.0", path = "../wyn/pkg/gtao" }
+noise = { package = "wyn/noise", version = "v0.1.0", path = "../wyn/pkg/noise" }
+rng = { package = "wyn/rng", version = "v0.1.0", path = "../wyn/pkg/rng" }

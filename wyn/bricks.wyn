@@ -6,6 +6,8 @@
 -- (see round_normal); a later pass upgrades to a per-pixel rounded-box ray
 -- march so the silhouette rounds too (the Tiny Glade trick).
 
+import "pkg:rng"
+
 -- Sett palette. Cobble is a mid-tone neutral ranging from warm earthy greige to
 -- architectural grey with a soft blue undertone. Each sett draws an independent hash
 -- for hue (mix of these two), saturation (grey <-> full undertone), and lightness, so
@@ -56,7 +58,7 @@ def sd_round_box(p: vec3f32, b: vec3f32, r: f32) f32 =
 
 -- Per-sett deterministic value in [0,1) for color variation.
 def brick_hash(i: i32) f32 =
-  f32.fract(f32.sin(f32(i) * 91.37) * 47453.31)
+  fasthash.at_f32(fasthash.seed(0xA341316Cu32), u32.i32(i))
 
 -- Stable per-sett seed from its world (x,z) centre. Keyed on position, NOT the
 -- compacted instance index (which reorders as culling changes each frame), so a

@@ -15,7 +15,9 @@ a generic GPU host that knows nothing about the game.**
 
 ## Build & run
 
-Requires the `wyn` compiler on `PATH`.
+Requires the `wyn` compiler on `PATH` and a sibling `../wyn` checkout. The root
+`wyn.toml` uses local path dependencies from `../wyn/pkg` for shared GTAO,
+random-number, and noise code.
 
 ```sh
 cd driver
