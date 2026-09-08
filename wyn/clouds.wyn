@@ -1,12 +1,15 @@
 -- Volumetric sky clouds. A value-noise fbm density field is marched along the
 -- view ray in a fixed horizontal band and composited front-to-back
--- (Beer-Lambert) over a gradient sky. The noise / fbm are ported from the
--- Shadertoy "Clouds" (https://www.shadertoy.com/view/lss3zr); the density field is
+-- (Beer-Lambert) over a gradient sky. The FBM shaping is ported from the
+-- Shadertoy "Clouds" (https://www.shadertoy.com/view/lss3zr), with its 3D value
+-- noise supplied by wyn/noise; the density field is
 -- reshaped from the original's origin-centred blob into a high sky layer so the
 -- clouds sit above the diorama rather than around it.
 --
 -- The clouds are STATIC in world space (they don't drift), so this needs no time
 -- input. Pure: view ray in (see camera.get_ray), colour out; no resources.
+
+import "pkg:noise"
 
 module clouds = {
 
@@ -16,26 +19,17 @@ module clouds = {
       [-0.80,  0.36, -0.48],
       [-0.60, -0.48,  0.64]]
 
-  def hash(n: f32) f32 = f32.fract(f32.sin(n) * 43758.5453)
-
-  -- 3D value noise.
-  def noise(x: vec3f32) f32 =
-    let p  = vec.floor(x)
-    let f0 = vec.fract(x)
-    let f  = f0 * f0 * (3.0 - 2.0 * f0)
-    let n  = p.x + p.y * 57.0 + 113.0 * p.z in
-    mix(mix(mix(hash(n +   0.0), hash(n +   1.0), f.x),
-            mix(hash(n +  57.0), hash(n +  58.0), f.x), f.y),
-        mix(mix(hash(n + 113.0), hash(n + 114.0), f.x),
-            mix(hash(n + 170.0), hash(n + 171.0), f.x), f.y), f.z)
+  -- wyn/noise normalizes value noise to [-1,1]; cloud density expects [0,1].
+  def noise01(x: vec3f32) f32 =
+    0.5f32 + 0.5f32 * fhnoise.value3(fasthash.seed(0xC10D5EEDu32), x)
 
   -- Fractal Brownian motion (3 octaves).
   def fbm(p0: vec3f32) f32 =
-    let f0 = 0.5 * noise(p0)
+    let f0 = 0.5 * noise01(p0)
     let p1 = basis * p0 * 2.02
-    let f1 = f0 + 0.25 * noise(p1)
+    let f1 = f0 + 0.25 * noise01(p1)
     let p2 = basis * p1 * 2.03 in
-    f1 + 0.125 * noise(p2)
+    f1 + 0.125 * noise01(p2)
 
   -- A cloud layer at infinity, addressed by ray DIRECTION. Dividing the horizontal
   -- direction by (rd.y + HORIZ) projects it onto a plane whose apparent horizon sits

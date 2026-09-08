@@ -9,7 +9,7 @@
 
 import "math"     -- distance / v3
 import "camera"   -- get_ray / ground_t / orbit
-import "geom"     -- rw_advance
+import "pkg:curves"
 import "paint"    -- STEP / CORRIDOR / MAXCHORD
 
 -- Input event stream. The host appends one `vec4f32` per raw event since the last
@@ -100,7 +100,8 @@ def fold_strokes(head_in: []f32, events: []vec4f32, res: vec3f32, o: orbit, is_b
     else if kind == EV_MOUSEMOVE && held > 0.5 && (!is_building) then
       if distance(cur, last) > STEP then
         let (emit, pos, na, nd, nl, nhd) =
-          rw_advance(anchor, dir, last, hd > 0.5, cur, CORRIDOR, MAXCHORD)
+          curves.reumann_witkam_advance(
+            anchor, dir, last, hd > 0.5, cur, CORRIDOR, MAXCHORD)
         let hdf = if nhd then 1.0 else 0.0 in
         if emit && ec < EMIT_CAP then (na, nd, nl, hdf, held, press, ec + 1i32, em with [ec] = pos)
         else (na, nd, nl, hdf, held, press, ec, em)

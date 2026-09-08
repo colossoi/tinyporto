@@ -17,7 +17,14 @@ const ROOTS: &[(&str, &str)] = &[("main", "wyn/main.wyn")];
 
 // Local package dependencies declared in the repository-root wyn.toml. Cargo
 // cannot discover Wyn's import graph itself, so track their sources explicitly.
-const WYN_PACKAGE_PATHS: &[&str] = &["../wyn/pkg/gtao", "../wyn/pkg/noise", "../wyn/pkg/rng"];
+const WYN_PACKAGE_PATHS: &[&str] = &[
+    "../wyn/pkg/curves",
+    "../wyn/pkg/gfx",
+    "../wyn/pkg/gtao",
+    "../wyn/pkg/noise",
+    "../wyn/pkg/packing",
+    "../wyn/pkg/rng",
+];
 
 // ---- descriptor model (the subset of the wyn `*.json` we consume) ----
 

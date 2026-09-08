@@ -7,6 +7,9 @@ wyn = "v0.1.0"
 library = "wyn/main.wyn"
 
 [dependencies]
+curves = { package = "wyn/curves", version = "v0.1.0", path = "../wyn/pkg/curves" }
+gfx = { package = "wyn/gfx", version = "v0.1.0", path = "../wyn/pkg/gfx" }
 gtao = { package = "wyn/gtao", version = "v0.1.0", path = "../wyn/pkg/gtao" }
 noise = { package = "wyn/noise", version = "v0.1.0", path = "../wyn/pkg/noise" }
+packing = { package = "wyn/packing", version = "v0.1.0", path = "../wyn/pkg/packing" }
 rng = { package = "wyn/rng", version = "v0.1.0", path = "../wyn/pkg/rng" }

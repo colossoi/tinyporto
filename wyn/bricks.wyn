@@ -3,7 +3,7 @@
 --
 -- Each sett is a real protruding proxy box (instanced, drawn indirect). The
 -- rounded corners come from an analytic rounded-box normal in the fragment
--- (see round_normal); a later pass upgrades to a per-pixel rounded-box ray
+-- (see round_normal); a later pass upgrades to a rounded-box ray
 -- march so the silhouette rounds too (the Tiny Glade trick).
 
 import "pkg:rng"
@@ -38,23 +38,23 @@ def brick_center(i: i32) vec2f32 =
   let z = (f32(row) - f32(BROWS) * 0.5 + 0.5) * CELLZ in
   @[x, z]
 
--- Gradient of the rounded-box SDF at surface point p (box half-extents b,
--- corner radius r): the smoothly-rounded normal at edges/corners.
-def round_normal(p: vec3f32, b: vec3f32, r: f32) vec3f32 =
-  let qx = f32.max(f32.abs(p.x) - (b.x - r), 0.0) in
-  let qy = f32.max(f32.abs(p.y) - (b.y - r), 0.0) in
-  let qz = f32.max(f32.abs(p.z) - (b.z - r), 0.0) in
+-- Smooth local-space normal of a rounded box at a surface point. `half` is the
+-- outer half-size and `radius` must not exceed its smallest component.
+def round_normal(p: vec3f32, half: vec3f32, radius: f32) vec3f32 =
+  let qx = f32.max(f32.abs(p.x) - (half.x - radius), 0.0)
+  let qy = f32.max(f32.abs(p.y) - (half.y - radius), 0.0)
+  let qz = f32.max(f32.abs(p.z) - (half.z - radius), 0.0) in
   normalize(@[f32.sign(p.x) * qx + 1e-6 * p.x,
               f32.sign(p.y) * qy,
               f32.sign(p.z) * qz])
 
--- Exterior signed distance to a rounded box (half-extents b, radius r). The
--- interior term is omitted — we only ever sphere-trace it from outside.
-def sd_round_box(p: vec3f32, b: vec3f32, r: f32) f32 =
-  let qx = f32.max(f32.abs(p.x) - b.x, 0.0) in
-  let qy = f32.max(f32.abs(p.y) - b.y, 0.0) in
-  let qz = f32.max(f32.abs(p.z) - b.z, 0.0) in
-  magnitude(@[qx, qy, qz]) - r
+-- Exterior rounded-box distance for sphere tracing. The full signed-distance
+-- interior term is intentionally omitted because tracing starts outside.
+def sd_round_box(p: vec3f32, half: vec3f32, radius: f32) f32 =
+  let qx = f32.max(f32.abs(p.x) - (half.x - radius), 0.0)
+  let qy = f32.max(f32.abs(p.y) - (half.y - radius), 0.0)
+  let qz = f32.max(f32.abs(p.z) - (half.z - radius), 0.0) in
+  magnitude(@[qx, qy, qz]) - radius
 
 -- Per-sett deterministic value in [0,1) for color variation.
 def brick_hash(i: i32) f32 =
@@ -93,15 +93,27 @@ def sett_basis(cx: f32, cz: f32) (vec3f32, vec3f32, vec3f32) =
   let fwd = cross(right, up) in
   (right, up, fwd)
 
--- Box-local offset -> world (orient) and its inverse (unorient = projection onto
--- the orthonormal basis).
-def sett_orient(p: vec3f32, r: vec3f32, u: vec3f32, f: vec3f32) vec3f32 =
-  @[r.x * p.x + u.x * p.y + f.x * p.z,
-    r.y * p.x + u.y * p.y + f.y * p.z,
-    r.z * p.x + u.z * p.y + f.z * p.z]
-
-def sett_unorient(p: vec3f32, r: vec3f32, u: vec3f32, f: vec3f32) vec3f32 =
-  @[dot(p, r), dot(p, u), dot(p, f)]
+-- Unit proxy box: x,z in [-0.5,0.5], y in [0,1]. Six faces, two triangles
+-- per face, CCW from outside; the draw path scales and orients it per prop.
+def box_pos: [36]vec3f32 =
+  [-- +Y
+   @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.5], @[0.5, 1.0, 0.5],
+   @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.5], @[0.5, 1.0, 0.0 - 0.5],
+   -- -Y
+   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 0.0, 0.0 - 0.5], @[0.5, 0.0, 0.5],
+   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 0.0, 0.5], @[0.0 - 0.5, 0.0, 0.5],
+   -- +X
+   @[0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.5],
+   @[0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.5], @[0.5, 0.0, 0.5],
+   -- -X
+   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 0.0, 0.5], @[0.0 - 0.5, 1.0, 0.5],
+   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.5], @[0.0 - 0.5, 1.0, 0.0 - 0.5],
+   -- +Z
+   @[0.0 - 0.5, 0.0, 0.5], @[0.5, 0.0, 0.5], @[0.5, 1.0, 0.5],
+   @[0.0 - 0.5, 0.0, 0.5], @[0.5, 1.0, 0.5], @[0.0 - 0.5, 1.0, 0.5],
+   -- -Z
+   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5],
+   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5], @[0.5, 0.0, 0.0 - 0.5]]
 
 -- One instanced prop: a rounded box, fully self-describing. Cobble setts and wall
 -- bricks/quoins/grout all reduce to this, so a single vertex/fragment pair places
@@ -118,34 +130,3 @@ type prop = {
   fwd: vec3f32,
   albedo: vec3f32,
 }
-
--- A yaw about +Y as the same orthonormal basis a tilted sett carries, so a wall
--- brick and a cobble share one orient/unorient path.
-def yaw_basis(yaw: f32) (vec3f32, vec3f32, vec3f32) =
-  let cw = f32.cos(yaw)
-  let sw = f32.sin(yaw) in
-  (@[cw, 0.0, sw], @[0.0, 1.0, 0.0], @[0.0 - sw, 0.0, cw])
-
--- Unit proxy box for a sett: x,z in [-0.5,0.5], y in [0,1] (scaled per instance).
--- 6 faces x 2 tris x 3 verts = 36, non-indexed. Every triangle is wound CCW as
--- seen from outside, so the outward face is front-facing (back-face culling is
--- correct). Corners: a..d bottom (y=0), e..h top (y=1), counterclockwise in x,z.
-def box_pos: [36]vec3f32 =
-  [-- +Y top  (e,h,g)(e,g,f)
-   @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.5], @[0.5, 1.0, 0.5],
-   @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.5], @[0.5, 1.0, 0.0 - 0.5],
-   -- -Y bottom  (a,b,c)(a,c,d)
-   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 0.0, 0.0 - 0.5], @[0.5, 0.0, 0.5],
-   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 0.0, 0.5], @[0.0 - 0.5, 0.0, 0.5],
-   -- +X  (b,f,g)(b,g,c)
-   @[0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.5],
-   @[0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.5], @[0.5, 0.0, 0.5],
-   -- -X  (a,d,h)(a,h,e)
-   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 0.0, 0.5], @[0.0 - 0.5, 1.0, 0.5],
-   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.5], @[0.0 - 0.5, 1.0, 0.0 - 0.5],
-   -- +Z  (d,c,g)(d,g,h)
-   @[0.0 - 0.5, 0.0, 0.5], @[0.5, 0.0, 0.5], @[0.5, 1.0, 0.5],
-   @[0.0 - 0.5, 0.0, 0.5], @[0.5, 1.0, 0.5], @[0.0 - 0.5, 1.0, 0.5],
-   -- -Z  (a,e,f)(a,f,b)
-   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5],
-   @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5], @[0.5, 0.0, 0.0 - 0.5]]

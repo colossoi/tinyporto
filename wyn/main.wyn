@@ -19,7 +19,6 @@ open f32
 import "math"
 import "camera"
 import "shade"
-import "geom"
 import "paint"
 import "input"
 import "bricks"
@@ -30,6 +29,7 @@ import "clouds"
 import "hiz"
 import "water"
 import "render_types"
+import "pkg:gfx"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
 -- entry binds at (set=1, binding=0). Continuous state lives here; discrete input
@@ -320,7 +320,7 @@ def wall_visible(frame: frame_globals, i: i32) bool =
 def wall_prop(i: i32) prop =
   let brk = wall_brick(i)
   let center = brk.center
-  let (right, up, fwd) = yaw_basis(brk.yaw)
+  let (right, up, fwd) = gfx.transform.yaw_basis(brk.yaw)
   let kind = f32(brk.kind)
   -- Tone seeds from the stable, baked centre — bricks mix two fired-clay tones by a
   -- position hash; quoins are pale limestone with only a faint lightness wobble.
@@ -443,12 +443,12 @@ def scene_fragment(fragment: fragment_invocation<scene_varying>) gbuffer =
 ------------------------------------------------------------
 
 -- Box-local proxy corner -> world, using the instance's own basis and half-extents.
--- `box_pos` has y in [0,1]; centring it (y - 0.5) makes the box tilt about its middle.
+-- The shared unit box has y in [0,1]; centring it makes the box tilt about its middle.
 def prop_world(p: prop, local: vec3f32) vec3f32 =
   let lc = @[local.x * (p.half.x * 2.0),
              (local.y - 0.5) * (p.half.y * 2.0),
              local.z * (p.half.z * 2.0)] in
-  p.center + sett_orient(lc, p.right, p.up, p.fwd)
+  p.center + gfx.transform.orient(lc, p.right, p.up, p.fwd)
 
 type prop_varying = { world: vec3f32, instance: u32 }
 
@@ -476,7 +476,6 @@ def prop_fragment(frame: frame_globals, prop_inst: []prop,
   let world = fragment.value.world
   let p = prop_inst[i32(fragment.value.instance)]
   let r = p.radius
-  let b = @[p.half.x - r, p.half.y - r, p.half.z - r]
   -- Trace in box-local space: project the world offset onto the instance's basis.
   let rd = normalize(world - cam_eye(cam(frame)))
   let (t, hit) =
@@ -484,15 +483,15 @@ def prop_fragment(frame: frame_globals, prop_inst: []prop,
       if hit then (t, hit)
       else
         let rel = (world + rd * t) - p.center
-        let pl = sett_unorient(rel, p.right, p.up, p.fwd)
-        let d = sd_round_box(pl, b, r) in
+        let pl = gfx.transform.unorient(rel, p.right, p.up, p.fwd)
+        let d = sd_round_box(pl, p.half, r) in
         if d < 0.0004 then (t, true) else (t + d, false)
   let pos = world + rd * t in
   if hit then
     let rel = pos - p.center
-    let pl = sett_unorient(rel, p.right, p.up, p.fwd)
-    let nl = round_normal(pl, b, r)
-    let n = sett_orient(nl, p.right, p.up, p.fwd)
+    let pl = gfx.transform.unorient(rel, p.right, p.up, p.fwd)
+    let nl = round_normal(pl, p.half, r)
+    let n = gfx.transform.orient(nl, p.right, p.up, p.fwd)
     let clip = world_to_clip(pos, frame.resolution, cam(frame))
     let d = clip.z / clip.w in
     -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.

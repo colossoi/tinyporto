@@ -90,7 +90,7 @@ def NORMAL_STR: f32 = 1.15      -- horizontal slope -> normal tilt
 -- wyn/noise's graphics-grade PCG value noise.
 def wnoise(p: vec2f32) f32 =
   let k = fasthash.seed(0xC0FFEE11u32) in
-  0.0 - 1.0 + 2.0 * fhnoise.value2(k, p)
+  fhnoise.value2(k, p)
 
 -- One ridged, domain-warped wave octave (Seascape's `sea_octave`).
 def sea_octave(uv: vec2f32, choppy: f32) f32 =

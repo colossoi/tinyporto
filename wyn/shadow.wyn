@@ -13,7 +13,8 @@
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
-import "camera"   -- world_to_clip / world_from_depth / linear_depth / look_at / LOOKAT
+import "camera"   -- world_to_clip / world_from_depth / linear_depth / LOOKAT
+import "pkg:gfx"
 import "shade"    -- SUN_DIR / sun
 import "render_types"
 
@@ -111,7 +112,8 @@ def sun_ortho: mat4f32 =
     [0.0,     0.0,     0.0 - 1.0 / (f - n), 0.0],
     [0.0,     0.0,     0.0 - n / (f - n),   1.0]]
 
-def sun_view: mat4f32 = look_at(sun_eye, LOOKAT, @[0.0, 1.0, 0.0])
+def sun_view: mat4f32 =
+  gfx.camera.look_at(sun_eye, LOOKAT, @[0.0, 1.0, 0.0])
 
 -- World point -> light clip space (ortho, so w = 1 and xyz are already NDC).
 def world_to_light(p: vec3f32) vec4f32 =

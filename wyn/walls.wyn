@@ -8,7 +8,8 @@
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
 import "bricks"   -- brick_hash for the per-brick jitter
-import "pack"     -- fit(): how many courses/bricks/quoins fit a span
+import "pkg:gfx"
+import "pkg:packing"
 
 -- Brick cell spacing (the running-bond grid) and the drawn half-extents. The brick
 -- is a bit smaller than its cell so neighbours leave a mortar gap, exactly like the
@@ -36,7 +37,7 @@ def MAX_WALL_H:   f32 = 2.4   -- tallest
 def N_BUILD:    i32 = 2
 def N_WALL:     i32 = 8       -- N_BUILD * 4
 def PER_COURSE: i32 = i32(f32.ceil((MAX_WALL_LEN + BRK_LEN * 0.5) / BRK_LEN)) + 1
-def COURSES:    i32 = fit_count(BRK_HY * 2.0, MAX_WALL_H,   BRK_CRS - BRK_HY * 2.0, 0.0)
+def COURSES:    i32 = packing.fit_count(BRK_HY * 2.0, MAX_WALL_H,   BRK_CRS - BRK_HY * 2.0, 0.0)
 def PER_WALL:   i32 = PER_COURSE * COURSES
 def BRICK_SLOTS: i32 = N_WALL * PER_WALL
 
@@ -74,11 +75,12 @@ def GROUT_SLOTS: i32 = 8      -- one per wall (N_WALL)
 def wall_has_grout(w: i32) bool = true   -- flip per wall to make the slab optional
 
 
--- The wall's vertical brick layout, from pack.fit: (course count, pad) where the
+-- The wall's vertical brick layout, from packing.fit: (course count, pad) where the
 -- brick field spans [pad, h - pad], centred. The SINGLE SOURCE OF TRUTH for a wall's
 -- height — bricks fill it, quoins stretch to it, grout spans it, so all three top out
 -- together. (Brick course = BRK_HY*2 tall + the mortar gap that makes up BRK_CRS.)
-def wall_courses(h: f32) (i32, f32) = fit(BRK_HY * 2.0, h, BRK_CRS - BRK_HY * 2.0, 0.0)
+def wall_courses(h: f32) (i32, f32) =
+  packing.fit(BRK_HY * 2.0, h, BRK_CRS - BRK_HY * 2.0, 0.0)
 
 -- Quoin `qi` (0..QUOIN_SLOTS). Corner = qi/COURSES, course = qi%COURSES; an axis-
 -- aligned (yaw 0) box on the building corner, stacked to fill the brick field EXACTLY

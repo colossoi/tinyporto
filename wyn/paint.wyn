@@ -1,6 +1,6 @@
 -- paint: the ground painter — item kinds, tool footprints, buffer capacities, the
 -- tessellation budget, and the tessellation itself (item list -> flat triangle
--- ribbon). The generic spline/ribbon primitives live in geom.wyn; the online
+-- ribbon). The generic spline/ribbon primitives live in wyn/curves; the online
 -- capture fold lives in input.wyn; `step` (main.wyn) just drives them.
 --
 -- The world is an ordered list of parametric items (the source of truth):
@@ -12,7 +12,7 @@
 --
 -- Library module: no `open`; f32.* qualified (see math.wyn for the idiom).
 
-import "geom"   -- rect_vertex / ribbon_vertex for the tessellation
+import "pkg:curves"
 
 -- Buffer capacities. MUST match the driver's buffer sizes (driver/src/app.rs).
 def POINTS_CAP: i32 = 1024     -- total control points across all items
@@ -58,6 +58,18 @@ def TESS_VPI:   i32 = 744      -- verts per item ((TESS_MAXCP - 1) * TESS_VPS)
 def TESS_BASE:  i32 = 6        -- leading verts = the ground base quad (sand)
 def TESS_CAP:   i32 = 95238    -- TESS_BASE + ITEMS_CAP * TESS_VPI
 
+-- Triangle-list vertex of an axis-aligned 2D rectangle (vertex in [0,6)).
+def rect_vertex(center: vec2f32, half_x: f32, half_y: f32,
+                vertex: i32) vec2f32 =
+  let offset =
+    if vertex == 0 then @[0.0 - half_x, 0.0 - half_y]
+    else if vertex == 1 then @[0.0 - half_x, half_y]
+    else if vertex == 2 then @[half_x, half_y]
+    else if vertex == 3 then @[0.0 - half_x, 0.0 - half_y]
+    else if vertex == 4 then @[half_x, half_y]
+    else @[half_x, 0.0 - half_y] in
+  center + offset
+
 -- Ground geometry as two parallel streams: ground_pos = (pos.xyz, kind) and
 -- ground_nrm = (nrm.xyz, attr) for vertex `v`, built from the item list + points.
 -- Two index regions: [0, TESS_BASE) the sand base quad; [TESS_BASE, TESS_CAP) a
@@ -67,7 +79,9 @@ def TESS_CAP:   i32 = 95238    -- TESS_BASE + ITEMS_CAP * TESS_VPI
 -- instanced (see main.wyn's sett pipeline), the Tiny-Glade "tons of tiny instances".
 def ground_pos(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
   if v < TESS_BASE then
-    let c = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in @[c.x, 0.0, c.y, 0.0]
+    let c = rect_vertex(
+      @[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in
+    @[c.x, 0.0, c.y, 0.0]
   else
     let vi = v - TESS_BASE
     let item = vi / TESS_VPI
@@ -80,7 +94,8 @@ def ground_pos(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
     if kind < 0.5 then @[0.0, 0.0, 0.0, 0.0]
     else if kind > 2.5 then
       if local < 6 then
-        let c = rect_vertex(points[pstart], BUILD_HX, BUILD_HZ, local) in
+        let c = rect_vertex(
+          points[pstart], BUILD_HX, BUILD_HZ, local) in
         @[c.x, 0.0, c.y, kind]
       else @[0.0, 0.0, 0.0, 0.0]
     else
@@ -96,7 +111,8 @@ def ground_pos(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
         let p3 = if span + 2 < pcount then points[pstart + span + 2] else p2
         let u0 = f32(sub) / f32(CR_SUB)
         let u1 = f32(sub + 1) / f32(CR_SUB)
-        let (pos, _et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
+        let (pos, _et) = curves.ribbon_vertex(
+          p0, p1, p2, p3, u0, u1, prm, corner) in
         @[pos.x, 0.0, pos.y, kind]
 
 def ground_nrm(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
@@ -125,5 +141,6 @@ def ground_nrm(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
         let p3 = if span + 2 < pcount then points[pstart + span + 2] else p2
         let u0 = f32(sub) / f32(CR_SUB)
         let u1 = f32(sub + 1) / f32(CR_SUB)
-        let (_pos, et) = ribbon_vertex(p0, p1, p2, p3, u0, u1, prm, corner) in
+        let (_pos, et) = curves.ribbon_vertex(
+          p0, p1, p2, p3, u0, u1, prm, corner) in
         @[0.0, 1.0, 0.0, et]

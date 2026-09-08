@@ -16,8 +16,8 @@ a generic GPU host that knows nothing about the game.**
 ## Build & run
 
 Requires the `wyn` compiler on `PATH` and a sibling `../wyn` checkout. The root
-`wyn.toml` uses local path dependencies from `../wyn/pkg` for shared GTAO,
-random-number, and noise code.
+`wyn.toml` uses local path dependencies from `../wyn/pkg` for shared curves,
+graphics math, GTAO, packing, random-number, and noise code.
 
 ```sh
 cd driver
@@ -52,13 +52,11 @@ pass (no CPU readback).
 
 ## Wyn module idiom (current)
 
-Until the compiler supports qualified imports (`module m = import "x"`):
-
-- **Library modules** (`math`/`camera`/`shade`): no `open`; qualify scalar math
-  as `f32.sin`, `f32.clamp`, … (an `open f32` re-exports and currently collides
-  with the importer's `open f32`).
-- **Root** (`main.wyn`): `open f32` + bare `import "math"` / `"camera"` /
-  `"shade"`; call exports unqualified. Export names are globally unique.
+Local source files continue to use bare imports, while shared packages expose
+named modules such as `gfx`, `curves`, and `packing` and are called through
+qualified names. Library modules do not `open f32`; scalar operations stay
+qualified as `f32.sin`, `f32.clamp`, and so on. The root still uses `open f32`
+for its application code.
 - Globals needing no `open`: `normalize`, `dot`, `cross`, `distance`, `reflect`,
   `mix` (scalar+vec), the `**` operator, and the `vec.*` module.
 

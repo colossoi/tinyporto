@@ -2,6 +2,8 @@
 -- Ported/adapted from mountains.wyn, in world meters with ground at y = 0.
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
+import "pkg:gfx"
+
 -- View tuning. The telephoto FOV gives the "tiny diorama" compression; the orbit
 -- target / distance / angles are per-frame state the host drives (see `orbit`).
 def FOV: f32 = 20.0
@@ -13,34 +15,22 @@ def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]   -- sun-shadow map centre (shadow.wyn's 
 -- are independent — the host maps scroll to `dist` and right-drag to `az`/`elev`.
 type orbit = { target: vec3f32, az: f32, elev: f32, dist: f32 }
 
--- Pinhole ray through a pixel, camera-space (-z forward).
-def ray_dir(fov: f32, size: vec2f32, pos: vec2f32) vec3f32 =
-  let xy = pos - size * 0.5
-  let cot_half = f32.tan(f32.radians(90.0 - fov * 0.5))
-  let z = size.y * 0.5 * cot_half in
-  normalize(@[xy.x, xy.y, 0.0 - z])
-
--- Column-major rotation (outer arrays = columns at SPIR-V emission), matching
--- mountains.wyn. angle = (elevation, azimuth).
-def rotation(angle: vec2f32) mat3f32 =
-  let c = @[f32.cos(angle.x), f32.cos(angle.y)]
-  let s = @[f32.sin(angle.x), f32.sin(angle.y)] in
-  @[[c.y,       0.0,       0.0 - s.y],
-    [s.y * s.x, c.x,       c.y * s.x],
-    [s.y * c.x, 0.0 - s.x, c.y * c.x]]
+def shared_orbit(o: orbit) gfx.camera.orbit.state = {
+  target = o.target,
+  azimuth = o.az,
+  elevation = o.elev,
+  distance = o.dist,
+}
 
 -- World-space camera eye for an orbit. The single source for the orbit position;
 -- get_ray and world_to_clip both build their eye from it.
 def cam_eye(o: orbit) vec3f32 =
-  o.target + rotation(@[o.elev, o.az]) * @[0.0, 0.0, o.dist]
+  gfx.camera.orbit.eye(shared_orbit(o))
 
 -- Primary ray for a fragment. Returns (ro, rd) in world space.
 def get_ray(resolution: vec3f32, fragCoord: vec2f32, o: orbit) (vec3f32, vec3f32) =
-  let rot = rotation(@[o.elev, o.az])
-  let rd0 = ray_dir(FOV, resolution.xy, fragCoord)
-  let rd = rot * rd0
-  let ro = o.target + rot * @[0.0, 0.0, o.dist] in
-  (ro, rd)
+  let direction = gfx.camera.ray_direction(FOV, resolution.xy, fragCoord) in
+  gfx.camera.orbit.ray(direction, shared_orbit(o))
 
 -- Intersect a ray with the y = 0 ground plane. Returns t (<0 if pointing away).
 def ground_t(ro: vec3f32, rd: vec3f32) f32 =
@@ -58,59 +48,36 @@ def ground_t(ro: vec3f32, rd: vec3f32) f32 =
 def CLIP_NEAR: f32 = 0.1
 def CLIP_FAR:  f32 = 1000.0
 
-def perspective(fovy_deg: f32, aspect: f32, near: f32, far: f32) mat4f32 =
-  let f = 1.0 / f32.tan(f32.radians(fovy_deg) * 0.5)
-  let nf = 1.0 / (near - far) in
-  @[[f / aspect, 0.0, 0.0,         0.0],
-    [0.0,        f,   0.0,         0.0],
-    [0.0,        0.0, far * nf,    0.0 - 1.0],
-    [0.0,        0.0, far * near * nf, 0.0]]
-
-def look_at(eye: vec3f32, center: vec3f32, up: vec3f32) mat4f32 =
-  let f = normalize(center - eye)
-  let s = normalize(cross(f, up))
-  let u = cross(s, f) in
-  @[[s.x,             u.x,             0.0 - f.x,     0.0],
-    [s.y,             u.y,             0.0 - f.y,     0.0],
-    [s.z,             u.z,             0.0 - f.z,     0.0],
-    [0.0 - dot(s, eye), 0.0 - dot(u, eye), dot(f, eye), 1.0]]
-
 -- World position -> clip space. Applies view then projection (no mat*mat).
 def world_to_clip(p: vec3f32, resolution: vec3f32, o: orbit) vec4f32 =
-  let aspect = resolution.x / resolution.y
-  let eye = cam_eye(o)
-  let vm = look_at(eye, o.target, @[0.0, 1.0, 0.0])
-  let proj = perspective(FOV, aspect, CLIP_NEAR, CLIP_FAR) in
-  proj * (vm * @[p.x, p.y, p.z, 1.0])
+  let aspect = resolution.x / resolution.y in
+  let eye = cam_eye(o) in
+  let view = gfx.camera.look_at(eye, o.target, @[0.0, 1.0, 0.0]) in
+  let projection = gfx.camera.perspective(FOV, aspect, CLIP_NEAR, CLIP_FAR) in
+  gfx.camera.world_to_clip(p, view, projection)
 
 -- Linear view-forward distance (metres, +toward the scene) from a stored NDC depth
 -- d = clip.z / clip.w. The exact inverse of perspective()'s z map for our RH,
 -- z in [0,1] projection, so contact-shadow depth compares in real metres.
 def linear_depth(d: f32) f32 =
-  let nf = 1.0 / (CLIP_NEAR - CLIP_FAR)
-  let a = CLIP_FAR * nf
-  let b = CLIP_FAR * CLIP_NEAR * nf in
-  b / (a + d)
+  gfx.camera.linear_depth(d, CLIP_NEAR, CLIP_FAR)
 
 -- World position of the surface at `fragCoord` (pixel centre, y measured bottom-up
 -- like get_ray) given its stored NDC depth `d`. Reconstructs the eye ray and walks
 -- it out to the linear distance the depth encodes. Inverse of the rasterized
 -- world_to_clip for on-surface points.
 def world_from_depth(resolution: vec3f32, fragCoord: vec2f32, o: orbit, d: f32) vec3f32 =
-  let (ro, rd) = get_ray(resolution, fragCoord, o)
-  let fwd = normalize(o.target - ro)
-  let t = linear_depth(d) / dot(rd, fwd) in
-  ro + rd * t
+  let (ro, rd) = get_ray(resolution, fragCoord, o) in
+  let fwd = normalize(o.target - ro) in
+  gfx.camera.world_position_from_depth(
+    ro, rd, fwd, d, CLIP_NEAR, CLIP_FAR)
 
 -- Does a clip-space centre with bounding SPHERE world-radius `r` touch the view
 -- frustum? Keeping the clip-space form separate lets callers reuse the projection
 -- for later screen-space tests such as coarse occlusion.
 def frustum_keep_clip(c: vec4f32, r: f32, resolution: vec3f32) bool =
-  let fy = 1.0 / f32.tan(f32.radians(FOV) * 0.5)   -- perspective() vertical scale
-  let aspect = resolution.x / resolution.y
-  let ex = c.w + (fy / aspect) * r                 -- clip x half-bound + projected radius
-  let ey = c.w + fy * r in
-  c.w > 0.0 && f32.abs(c.x) < ex && f32.abs(c.y) < ey && c.z > 0.0 - 0.1 - r && c.z < c.w + 0.1
+  gfx.camera.frustum_contains_sphere(
+    c, r, FOV, resolution.x / resolution.y, 0.1)
 
 -- World-space convenience wrapper for callers that do not otherwise need clip.
 def frustum_keep(p: vec3f32, r: f32, resolution: vec3f32, o: orbit) bool =
