@@ -1,13 +1,6 @@
--- Volumetric sky clouds. A value-noise fbm density field is marched along the
--- view ray in a fixed horizontal band and composited front-to-back
--- (Beer-Lambert) over a gradient sky. The FBM shaping is ported from the
--- Shadertoy "Clouds" (https://www.shadertoy.com/view/lss3zr), with its 3D value
--- noise supplied by wyn/noise; the density field is
--- reshaped from the original's origin-centred blob into a high sky layer so the
--- clouds sit above the diorama rather than around it.
---
--- The clouds are STATIC in world space (they don't drift), so this needs no time
--- input. Pure: view ray in (see camera.get_ray), colour out; no resources.
+-- Static sky: a direction-projected cloud sheet over a horizon-to-zenith gradient.
+-- A value-noise field supplies cloud coverage; the sheet has no camera parallax.
+-- Noise supplied by wyn/noise; FBM shaping adapted from Shadertoy "Clouds": https://www.shadertoy.com/view/lss3zr
 
 import "pkg:noise"
 
@@ -58,7 +51,7 @@ module clouds = {
 
   -- Sky colour along a normalized view ray: a pale backdrop below the cloud horizon,
   -- a horizon->zenith gradient above it, with the projected cloud sheet over it.
-  def sky(ro: vec3f32, rd: vec3f32) vec3f32 =
+  def sky(rd: vec3f32) vec3f32 =
     let e = rd.y + HORIZ in
     if e <= 0.0 then VOID
     else

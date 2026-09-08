@@ -1,0 +1,4 @@
+entry reproduce() [1]i32 =
+  let xs = map(|i| i, iota(2))
+  let total = loop total = 0 for i < 2 do total + xs[i] in
+  [total]

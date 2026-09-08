@@ -1,7 +1,7 @@
 -- paint: the ground painter — item kinds, tool footprints, buffer capacities, the
 -- tessellation budget, and the tessellation itself (item list -> flat triangle
 -- ribbon). The generic spline/ribbon primitives live in wyn/curves; the online
--- capture fold lives in input.wyn; `step` (main.wyn) just drives them.
+-- capture fold lives in input.wyn; update_world consumes its emitted points.
 --
 -- The world is an ordered list of parametric items (the source of truth):
 --   * water  (kind 1): a stroke (control-point polyline) swept by a big radius
@@ -14,7 +14,7 @@
 
 import "pkg:curves"
 
--- Buffer capacities. MUST match the driver's buffer sizes (driver/src/app.rs).
+-- Fixed painter capacities; generated output lengths size the driver buffers.
 def POINTS_CAP: i32 = 1024     -- total control points across all items
 def ITEMS_CAP:  i32 = 128      -- max items
 
@@ -30,6 +30,21 @@ def WATER_R:  f32 = 1.6        -- canal half-width (stored per water item as its
 def FENCE_HW: f32 = 0.30       -- fence half-width (stored per item; widenable)
 def BUILD_HX: f32 = 2.0        -- building half-extent x (4 m wide)
 def BUILD_HZ: f32 = 1.5        -- building half-extent z (3 m deep)
+
+def is_water(tool: f32) bool = tool < 0.5
+
+def is_fence(tool: f32) bool = tool >= 0.5 && tool < 1.5
+
+def is_building(tool: f32) bool = tool > 1.5
+
+-- Tool codes are zero-based; item kind zero is reserved for an empty slot.
+def item_kind_for_tool(tool: f32) f32 = tool + 1.0
+
+-- Buildings use fixed rectangle dimensions, so their stroke width is unused.
+def stroke_half_width(tool: f32) f32 =
+  if is_water(tool) then WATER_R
+  else if is_fence(tool) then FENCE_HW
+  else 0.0
 
 type paint_item = { kind: f32, point_start: i32, point_count: i32, param: f32 }
 
@@ -49,14 +64,13 @@ def ground_vertex_from_packed(pos: vec4f32, nrm: vec4f32) ground_vertex =
 def GROUND_HALF: f32 = 20.0    -- half-size of the ground quad (40 m patch)
 def CR_SUB:    i32 = 4         -- Catmull-Rom subsegments per control-point span
 
--- Tessellation budget for the `tessellate` compute pass, which turns the item
--- list into a flat triangle ribbon (a fixed-size vertex buffer; unused slots
--- collapse to degenerate triangles — real compaction is later Nine work).
+-- Tessellation budget: each item reserves space for its control-point spans.
+-- Unused slots collapse to degenerate triangles.
 def TESS_MAXCP: i32 = 32       -- max control points tessellated per item
-def TESS_VPS:   i32 = 24       -- verts per control-point span (CR_SUB quads * 6)
-def TESS_VPI:   i32 = 744      -- verts per item ((TESS_MAXCP - 1) * TESS_VPS)
+def TESS_VPS:   i32 = CR_SUB * 6                      -- vertices per span
+def TESS_VPI:   i32 = (TESS_MAXCP - 1) * TESS_VPS     -- vertices per item
 def TESS_BASE:  i32 = 6        -- leading verts = the ground base quad (sand)
-def TESS_CAP:   i32 = 95238    -- TESS_BASE + ITEMS_CAP * TESS_VPI
+def TESS_CAP:   i32 = TESS_BASE + ITEMS_CAP * TESS_VPI
 
 -- Triangle-list vertex of an axis-aligned 2D rectangle (vertex in [0,6)).
 def rect_vertex(center: vec2f32, half_x: f32, half_y: f32,
@@ -70,77 +84,45 @@ def rect_vertex(center: vec2f32, half_x: f32, half_y: f32,
     else @[half_x, 0.0 - half_y] in
   center + offset
 
--- Ground geometry as two parallel streams: ground_pos = (pos.xyz, kind) and
--- ground_nrm = (nrm.xyz, attr) for vertex `v`, built from the item list + points.
--- Two index regions: [0, TESS_BASE) the sand base quad; [TESS_BASE, TESS_CAP) a
--- fixed budget per item (centripetal-CR ribbon for strokes, one quad for buildings).
--- Unused item slots collapse to a degenerate (zero) triangle. `attr` is the ribbon
--- edge param; ground normals point up. The cobble setts are NOT here — they are
--- instanced (see main.wyn's sett pipeline), the Tiny-Glade "tons of tiny instances".
-def ground_pos(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
-  if v < TESS_BASE then
-    let c = rect_vertex(
-      @[0.0, 0.0], GROUND_HALF, GROUND_HALF, v) in
-    @[c.x, 0.0, c.y, 0.0]
+-- Evaluate one ground vertex: the base quad, a building rectangle, or a stroke
+-- ribbon. Inactive slots have zero positions; normals always point up.
+def ground_vertex_at(vertex_index: i32, items: []vec4f32, points: []vec2f32) ground_vertex =
+  let up = @[0.0, 1.0, 0.0]
+  let empty = { pos = @[0.0, 0.0, 0.0], kind = 0.0, nrm = up, attr = 0.0 } in
+  if vertex_index < TESS_BASE then
+    let p = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, vertex_index) in
+    { pos = @[p.x, 0.0, p.y], kind = 0.0, nrm = up, attr = 0.0 }
   else
-    let vi = v - TESS_BASE
-    let item = vi / TESS_VPI
+    let vi = vertex_index - TESS_BASE
     let local = vi % TESS_VPI
-    let it = paint_item_from_packed(items[item])
-    let kind = it.kind
-    let pstart = it.point_start
-    let pcount = it.point_count
-    let prm = it.param in
-    if kind < 0.5 then @[0.0, 0.0, 0.0, 0.0]
-    else if kind > 2.5 then
+    let item = paint_item_from_packed(items[vi / TESS_VPI]) in
+    if item.kind < 0.5 then empty
+    else if item.kind > 2.5 then
       if local < 6 then
-        let c = rect_vertex(
-          points[pstart], BUILD_HX, BUILD_HZ, local) in
-        @[c.x, 0.0, c.y, kind]
-      else @[0.0, 0.0, 0.0, 0.0]
+        let p = rect_vertex(points[item.point_start], BUILD_HX, BUILD_HZ, local) in
+        { pos = @[p.x, 0.0, p.y], kind = item.kind, nrm = up, attr = 1.0 }
+      else { pos = @[0.0, 0.0, 0.0], kind = 0.0, nrm = up, attr = 1.0 }
     else
       let span = local / TESS_VPS
-      let rem = local % TESS_VPS
-      let sub = rem / 6
-      let corner = rem % 6 in
-      if span >= pcount - 1 then @[0.0, 0.0, 0.0, 0.0]
+      let sub = (local % TESS_VPS) / 6
+      let corner = local % 6 in
+      if span >= item.point_count - 1 then empty
       else
-        let p1 = points[pstart + span]
-        let p2 = points[pstart + span + 1]
-        let p0 = if span > 0 then points[pstart + span - 1] else p1
-        let p3 = if span + 2 < pcount then points[pstart + span + 2] else p2
+        let start = item.point_start
+        let p1 = points[start + span]
+        let p2 = points[start + span + 1]
+        let p0 = if span > 0 then points[start + span - 1] else p1
+        let p3 = if span + 2 < item.point_count then points[start + span + 2] else p2
         let u0 = f32(sub) / f32(CR_SUB)
         let u1 = f32(sub + 1) / f32(CR_SUB)
-        let (pos, _et) = curves.ribbon_vertex(
-          p0, p1, p2, p3, u0, u1, prm, corner) in
-        @[pos.x, 0.0, pos.y, kind]
+        let (position, edge) = curves.ribbon_vertex(p0, p1, p2, p3, u0, u1, item.param, corner) in
+        { pos = @[position.x, 0.0, position.y], kind = item.kind, nrm = up, attr = edge }
 
-def ground_nrm(v: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
-  if v < TESS_BASE then @[0.0, 1.0, 0.0, 0.0]
-  else
-    let vi = v - TESS_BASE
-    let item = vi / TESS_VPI
-    let local = vi % TESS_VPI
-    let it = paint_item_from_packed(items[item])
-    let kind = it.kind
-    let pstart = it.point_start
-    let pcount = it.point_count
-    let prm = it.param in
-    if kind < 0.5 then @[0.0, 1.0, 0.0, 0.0]
-    else if kind > 2.5 then @[0.0, 1.0, 0.0, 1.0]
-    else
-      let span = local / TESS_VPS
-      let rem = local % TESS_VPS
-      let sub = rem / 6
-      let corner = rem % 6 in
-      if span >= pcount - 1 then @[0.0, 1.0, 0.0, 0.0]
-      else
-        let p1 = points[pstart + span]
-        let p2 = points[pstart + span + 1]
-        let p0 = if span > 0 then points[pstart + span - 1] else p1
-        let p3 = if span + 2 < pcount then points[pstart + span + 2] else p2
-        let u0 = f32(sub) / f32(CR_SUB)
-        let u1 = f32(sub + 1) / f32(CR_SUB)
-        let (_pos, et) = curves.ribbon_vertex(
-          p0, p1, p2, p3, u0, u1, prm, corner) in
-        @[0.0, 1.0, 0.0, et]
+-- Pack position/kind and normal/edge into the two render streams.
+def ground_pos(vertex_index: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
+  let vertex = ground_vertex_at(vertex_index, items, points) in
+  @[vertex.pos.x, vertex.pos.y, vertex.pos.z, vertex.kind]
+
+def ground_nrm(vertex_index: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
+  let vertex = ground_vertex_at(vertex_index, items, points) in
+  @[vertex.nrm.x, vertex.nrm.y, vertex.nrm.z, vertex.attr]

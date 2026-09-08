@@ -34,12 +34,12 @@ def shadow_point(p: vec3f32, sundir: vec3f32, k: i32) vec3f32 =
 
 -- Project a clip-space sample to integer pixel coords. `valid` is false off-screen
 -- or behind the eye (w <= 0). Returns (x, y, valid).
-def shadow_pixel(cq: vec4f32, rx: f32, ry: f32, w: i32, h: i32) (i32, i32, bool) =
+def shadow_pixel(cq: vec4f32, resolution: vec3f32) (i32, i32, bool) =
   if cq.w <= 0.0 then (0, 0, false)
   else
-    let sx = i32((cq.x / cq.w * 0.5 + 0.5) * rx)
-    let sy = i32((1.0 - (cq.y / cq.w * 0.5 + 0.5)) * ry)
-    let inb = sx >= 0 && sx < w && sy >= 0 && sy < h in
+    let sx = i32((cq.x / cq.w * 0.5 + 0.5) * resolution.x)
+    let sy = i32((1.0 - (cq.y / cq.w * 0.5 + 0.5)) * resolution.y)
+    let inb = sx >= 0 && sx < i32(resolution.x) && sy >= 0 && sy < i32(resolution.y) in
     (sx, sy, inb)
 
 -- Is the marched sun-ray sample `sp` (clip point `cq`) occluded? Two conditions:
@@ -61,10 +61,7 @@ def shadow_occluded(sp: vec3f32, wp: vec3f32, cq: vec4f32, surfd: f32) bool =
 -- a no-op that only adds noise). Returns occlusion in {0,1} (early-outs once blocked).
 def contact_shadow(sd: render_target<gbuffer>, p: vec3f32, n: vec3f32,
                    resl: vec3f32, o: orbit) f32 =
-  let rx = resl.x
   let ry = resl.y
-  let w = i32(rx)
-  let h = i32(ry)
   let ndl = f32.max(dot(n, sun), 0.0) in
   if ndl <= 0.0 then 0.0
   else
@@ -73,7 +70,7 @@ def contact_shadow(sd: render_target<gbuffer>, p: vec3f32, n: vec3f32,
       else
         let sp = shadow_point(p, sun, k)
         let cq = world_to_clip(sp, resl, o)
-        let (sx, sy, valid) = shadow_pixel(cq, rx, ry, w, h)
+        let (sx, sy, valid) = shadow_pixel(cq, resl)
         let surfd = if valid then target_load(sd, @[sx, sy], 0u32).depth else 1.0
         let wp = world_from_depth(resl, @[f32(sx) + 0.5, ry - (f32(sy) + 0.5)], o, surfd) in
         if shadow_occluded(sp, wp, cq, surfd) then 1.0 else shc

@@ -35,7 +35,7 @@ def BRICK_BASE2: vec3f32 = @[0.60, 0.30, 0.24]   -- browner / darker fired clay
 def MAX_WALL_LEN: f32 = 2.6   -- longest wall across all buildings
 def MAX_WALL_H:   f32 = 2.4   -- tallest
 def N_BUILD:    i32 = 2
-def N_WALL:     i32 = 8       -- N_BUILD * 4
+def N_WALL:     i32 = N_BUILD * 4
 def PER_COURSE: i32 = i32(f32.ceil((MAX_WALL_LEN + BRK_LEN * 0.5) / BRK_LEN)) + 1
 def COURSES:    i32 = packing.fit_count(BRK_HY * 2.0, MAX_WALL_H,   BRK_CRS - BRK_HY * 2.0, 0.0)
 def PER_WALL:   i32 = PER_COURSE * COURSES
@@ -52,11 +52,11 @@ type block = { center: vec3f32, yaw: f32, kind: u32, half: vec3f32 }
 -- limestone blocks at each of the buildings' four vertical corners, laid over the
 -- brick as an add-on course. They ride the SAME instanced pipeline as the bricks
 -- (one cull + one draw), appended after the brick slots and distinguished by `kind`.
-def N_CORNER:      i32 = 8       -- N_BUILD * 4 corners
+def N_CORNER:      i32 = N_BUILD * 4
 def QUOIN_TH:      f32 = 0.17    -- quoin block height (~2 brick courses)
 def QUOIN_GAP_V:   f32 = 0.02    -- mortar between quoin blocks
 def QUOIN_COURSES: i32 = 16      -- budget cap; tallest wall needs ~13
-def QUOIN_SLOTS:   i32 = 128     -- N_CORNER * QUOIN_COURSES
+def QUOIN_SLOTS:   i32 = N_CORNER * QUOIN_COURSES
 def QUOIN_HX: f32 = 0.13         -- chunky, proud of the wall faces
 def QUOIN_HZ: f32 = 0.13
 def QUOIN_COLOR: vec3f32 = @[0.82, 0.80, 0.74]  -- limestone
@@ -71,9 +71,8 @@ def QUOIN_COLOR: vec3f32 = @[0.82, 0.80, 0.74]  -- limestone
 def GROUT_EXTENT: f32 = 0.02
 def GROUT_DEPTH:  f32 = 0.8
 def GROUT_COLOR: vec3f32 = @[0.90, 0.89, 0.87]  -- off-white mortar
-def GROUT_SLOTS: i32 = 8      -- one per wall (N_WALL)
+def GROUT_SLOTS: i32 = N_WALL      -- one per wall
 def wall_has_grout(w: i32) bool = true   -- flip per wall to make the slab optional
-
 
 -- The wall's vertical brick layout, from packing.fit: (course count, pad) where the
 -- brick field spans [pad, h - pad], centred. The SINGLE SOURCE OF TRUTH for a wall's

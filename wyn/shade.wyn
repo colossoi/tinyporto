@@ -19,24 +19,8 @@ def OUTLINE_COLOR: vec3f32 = @[0.12, 0.11, 0.10]
 
 def sun: vec3f32 = normalize(SUN_DIR)
 
--- Lambert + sky ambient for an opaque surface.
-def lit(albedo: vec3f32, n: vec3f32) vec3f32 =
-  let ndl = clamp01(dot(n, sun)) in
-  albedo * (AMBIENT + SUN_COLOR * v3(ndl))
-
--- As `lit`, but ambient occlusion `ao` in [0,1] attenuates the sky-ambient fill —
--- crevices and contact points lose the ambient term and read as soft shadow. The
--- direct sun term is untouched (AO models the sky, not the sun).
-def lit_ao(albedo: vec3f32, n: vec3f32, ao: f32) vec3f32 =
-  let ndl = clamp01(dot(n, sun))
-  let occ = 1.0 - 0.75 * clamp01(ao) in
-  albedo * (AMBIENT * v3(occ) + SUN_COLOR * v3(ndl))
-
--- As `lit_ao`, plus a directional shadow term `sh` in [0,1] (1 = fully occluded
--- toward the sun) that attenuates the DIRECT sun contribution — this is where
--- ray-marched contact shadows land. A little sun is kept even in shadow (0.85 max
--- occlusion) to stand in for sky/bounce fill and avoid crushed blacks. The ambient
--- term (governed by AO) is untouched: shadow blocks the sun, not the sky.
+-- Ambient occlusion attenuates sky fill; directional shadow attenuates sunlight.
+-- Keep a little sunlight even in full shadow to approximate bounced light.
 def lit_ao_sh(albedo: vec3f32, n: vec3f32, ao: f32, sh: f32) vec3f32 =
   let ndl = clamp01(dot(n, sun))
   let occ = 1.0 - 0.75 * clamp01(ao)

@@ -10,7 +10,7 @@
 --
 -- Ground ribbons and rounded-box props fill a shared G-buffer. Deferred lighting
 -- combines that surface data with sunlight, ambient occlusion, water, and sky.
--- Sett placement and materials live in bricks.wyn; curve math lives in geom.wyn.
+-- Sett placement and materials live in bricks.wyn; curve math comes from wyn/curves.
 --
 -- Idiom: root does `open f32`; library modules pulled in via bare `import`.
 
@@ -52,7 +52,7 @@ type frame_globals = {
 
 -- The orbit camera the host drives, unpacked from the frame block. Built locally
 -- wherever the camera is used (kept out of `map` lambdas as an outer capture).
-def cam(frame: frame_globals) orbit =
+def camera_from_frame(frame: frame_globals) orbit =
   { target = frame.cam_target, az = frame.cam_az, elev = frame.cam_elev, dist = frame.cam_dist }
 
 -- Persistent painter state: UI, control points, paint items, and stroke capture.
@@ -92,61 +92,21 @@ type lighting_inputs = {
   ao_work: []vec4f32,
 }
 
-type state_update = {
-  ui: ui_state,
-  head: stroke_head,
-  press: f32,
-  emit_count: i32,
-  kind: f32,
-  param: f32,
-  prev_point_count: i32,
-  prev_item_count: i32,
-}
+def append_captured_points(previous_points: []vec2f32, existing_point_count: i32,
+                           capture: stroke_capture) []vec2f32 =
+  map(|i| if i >= existing_point_count && i - existing_point_count < capture.emitted_count
+          then capture.emitted[i - existing_point_count] else previous_points[i], iota(POINTS_CAP))
 
-def next_state(frame: frame_globals, events: []vec4f32,
-               previous_ui: []f32, previous_head: []f32) (state_update, [16]vec2f32) =
-  let res = frame.resolution
-  let o = cam(frame)
-  let head0 = stroke_head_from_buffer(previous_head)
-  let pc = head0.point_count
-  let ic = head0.item_count
-  -- Stroke kind is fixed at frame start (a Tab this frame applies next frame).
-  let ui0 = ui_state_from_buffer(previous_ui)
-  let tool0 = ui0.tool
-  let ovl0 = ui0.overlay
-  let is_building = tool0 > 1.5
-  let kindv = tool0 + 1.0
-  let param = if tool0 < 0.5 then WATER_R else if tool0 < 1.5 then FENCE_HW else 0.0
-  let (tool1, ovl1) = fold_ui(tool0, ovl0, events)
-  let (anchor, dir, last, hd, held, press, ec, em) =
-    fold_strokes(previous_head, events, res, o, is_building)
-  let new_pc = if pc + ec < POINTS_CAP then pc + ec else POINTS_CAP
-  let new_ic = if press > 0.5 && ic < ITEMS_CAP then ic + 1i32 else ic in
-  ({ ui = { tool = tool1, overlay = ovl1 },
-     head = { point_count = new_pc, item_count = new_ic, held = held,
-              anchor = anchor, dir = dir, last = last, have_dir = hd },
-     press = press, emit_count = ec, kind = kindv, param = param,
-     prev_point_count = pc, prev_item_count = ic },
-   em)
-
-def update_points(previous_points: []vec2f32, update: state_update,
-                  emitted: [16]vec2f32) []vec2f32 =
-  map(|i| let pc = update.prev_point_count in
-          if i >= pc && i - pc < update.emit_count then emitted[i - pc] else previous_points[i]
-      , iota(POINTS_CAP))
-
-def update_items(previous_items: []vec4f32, update: state_update) []vec4f32 =
-  map(|i| let pc = update.prev_point_count
-          let ic = update.prev_item_count
-          let ec = update.emit_count in
-          if update.press > 0.5 && i == ic then
-            pack_paint_item({ kind = update.kind, point_start = pc, point_count = ec, param = update.param })
-          else if update.press < 0.5 && ec > 0i32 && i == ic - 1i32 then
-            let it = paint_item_from_packed(previous_items[i]) in
-            pack_paint_item({ kind = it.kind, point_start = it.point_start,
-                              point_count = it.point_count + ec, param = it.param })
-          else previous_items[i]
-      , iota(ITEMS_CAP))
+def create_or_extend_item(previous_items: []vec4f32, head: stroke_head,
+                          capture: stroke_capture, tool: f32) []vec4f32 =
+  map(|i| if capture.pressed > 0.5 && i == head.item_count then
+            pack_paint_item({ kind = item_kind_for_tool(tool), point_start = head.point_count,
+                              point_count = capture.emitted_count, param = stroke_half_width(tool) })
+          else if capture.pressed < 0.5 && capture.emitted_count > 0i32 && i == head.item_count - 1i32 then
+            let item = paint_item_from_packed(previous_items[i]) in
+            pack_paint_item({ kind = item.kind, point_start = item.point_start,
+                              point_count = item.point_count + capture.emitted_count, param = item.param })
+          else previous_items[i], iota(ITEMS_CAP))
 
 def ground_positions(items: []vec4f32, points: []vec2f32) []vec4f32 =
   map(|s| ground_pos(s, items, points), iota(TESS_CAP))
@@ -158,16 +118,19 @@ def ground_draw: draw_command =
   { vertex_count = u32(TESS_CAP), instance_count = 1u32,
     first_vertex = 0u32, first_instance = 0u32 }
 
--- Advance ALL persistent state one frame: fold events into the UI and capture head,
--- append this frame's committed points, create/extend the current item. Reads the
--- previous `world` and returns the next. The point/item maps run over their own
--- iota domains (POINTS_CAP / ITEMS_CAP), which also size their outputs.
+-- Apply UI shortcuts, capture stroke points, and create or extend the current item.
 def update_world(frame: frame_globals, events: []vec4f32, previous_world: world) world =
-  let (update, emitted) = next_state(frame, events, previous_world.ui, previous_world.head) in
-  { ui = pack_ui_state(update.ui),
-    points = update_points(previous_world.points, update, emitted),
-    items = update_items(previous_world.items, update),
-    head = pack_stroke_head(update.head) }
+  let ui = ui_state_from_buffer(previous_world.ui)
+  let head = stroke_head_from_buffer(previous_world.head)
+  -- Use one tool for the whole batch: UI and stroke events are folded separately,
+  -- so a tool change takes effect on the next frame.
+  let next_ui = apply_ui_shortcuts(ui, events)
+  let capture = capture_stroke_points(
+    head, events, frame.resolution, camera_from_frame(frame), is_building(ui.tool)) in
+  { ui = pack_ui_state(next_ui),
+    points = append_captured_points(previous_world.points, head.point_count, capture),
+    items = create_or_extend_item(previous_world.items, head, capture, ui.tool),
+    head = pack_stroke_head(record_capture_progress(head, capture)) }
 
 -- Ground geometry derived from the (previous) world: two parallel vertex streams
 -- (geom_pos = pos.xyz+kind, geom_nrm = nrm.xyz+attr) over the tessellation domain,
@@ -206,7 +169,7 @@ def wall_visible(frame: frame_globals, wall_brick_index: i32) bool =
   let brk = wall_brick(wall_brick_index)
   let center = brk.center in
   if center.y <= 0.0 then false
-  else frustum_keep(center, magnitude(brk.half), frame.resolution, cam(frame))
+  else frustum_keep(center, magnitude(brk.half), frame.resolution, camera_from_frame(frame))
 
 -- One surviving wall block. Blocks carry their own half-extents and a yaw; a tiny
 -- corner radius keeps the edges crisp. `kind` (0 brick, 1 quoin, 2 grout) selects
@@ -231,7 +194,7 @@ def wall_prop(wall_brick_index: i32) prop =
 def prop_index_visible(frame: frame_globals, painted_scene: painted,
                        occlusion_depth: []f32, candidate_index: i32) bool =
   if candidate_index < PROP_SETTS then
-    sett_visible(frame.resolution, cam(frame), painted_scene.items, painted_scene.points,
+    sett_visible(frame.resolution, camera_from_frame(frame), painted_scene.items, painted_scene.points,
                  occlusion_depth, candidate_index)
   else wall_visible(frame, candidate_index - PROP_SETTS)
 
@@ -288,7 +251,7 @@ def scene_vertex(frame: frame_globals, vertex_positions: []vec4f32,
   let n = vertex_normals[vid]
   let v = ground_vertex_from_packed(p, n) in
   vertex_output(
-    world_to_clip(v.pos, frame.resolution, cam(frame)),
+    world_to_clip(v.pos, frame.resolution, camera_from_frame(frame)),
     { kind = v.kind, attr = v.attr, normal = v.nrm })
 
 def item_color(kind: f32) vec3f32 =
@@ -347,7 +310,7 @@ def prop_vertex(frame: frame_globals, prop_instances: []prop,
   -- instead of carrying its whole record through the rasterizer. The compacted
   -- stream contains no center.y <= 0 tombstones.
   vertex_output(
-    world_to_clip(world, frame.resolution, cam(frame)),
+    world_to_clip(world, frame.resolution, camera_from_frame(frame)),
     { world = world, instance = instance_index })
 
 -- Sphere-trace this instance's rounded box from the proxy's front face. On a hit,
@@ -359,7 +322,7 @@ def prop_fragment(frame: frame_globals, prop_instances: []prop,
   let p = prop_instances[i32(value.instance)]
   let r = p.radius
   -- Trace in box-local space: project the world offset onto the instance's basis.
-  let rd = normalize(world - cam_eye(cam(frame)))
+  let rd = normalize(world - cam_eye(camera_from_frame(frame)))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 24 do
       if hit then (t, hit)
@@ -374,7 +337,7 @@ def prop_fragment(frame: frame_globals, prop_instances: []prop,
     let pl = gfx.transform.unorient(rel, p.right, p.up, p.fwd)
     let nl = round_normal(pl, p.half, r)
     let n = gfx.transform.orient(nl, p.right, p.up, p.fwd)
-    let clip = world_to_clip(pos, frame.resolution, cam(frame))
+    let clip = world_to_clip(pos, frame.resolution, camera_from_frame(frame))
     let d = clip.z / clip.w in
     -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
     #depth(
@@ -523,11 +486,11 @@ def denoise_ao(pixel: vec2i32, occlusion_samples: []vec4f32, constants: gtao.con
 -- contact shadows, and the sun shadow map, then applies tonemapping.
 ------------------------------------------------------------
 
--- Sky shade for a G-buffer miss (alb.w < 0.5): raymarch the static volumetric
--- clouds along this pixel's view ray. `pixel_center` is the pixel centre, bottom-up.
+-- Sky shade for a G-buffer miss (alb.w < 0.5), sampled along the pixel's view ray.
+-- pixel_center uses bottom-up coordinates.
 def shade_sky(resolution: vec3f32, pixel_center: vec2f32, camera: orbit) vec4f32 =
-  let (ro, rd) = get_ray(resolution, pixel_center, camera)
-  let sc = clouds.sky(ro, rd) in
+  let (_ro, rd) = get_ray(resolution, pixel_center, camera)
+  let sc = clouds.sky(rd) in
   @[sc.x, sc.y, sc.z, 1.0]
 
 -- Deferred shade for one pixel: read the thin G-buffer at (x,y) and return its final
@@ -542,7 +505,7 @@ def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
   let rx = frame.resolution.x
   let ry = frame.resolution.y
   let resl = @[rx, ry, 0.0]
-  let o = cam(frame)
+  let o = camera_from_frame(frame)
   let ao_off = (frame.mods & 2u32) != 0u32              -- hold Ctrl to suppress AO
   let g = target_load(scene, @[pixel_x, pixel_y], 0u32)
   let alb = g.albedo
@@ -554,7 +517,7 @@ def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
     let cd = g.depth
     let (_ro, rd) = get_ray(resl, fragc, o)
     let pg = world_from_depth(resl, fragc, o, cd)           -- the flat-ground hit
-    -- Water (approach A): only a ground-level pixel (pixel_y ~ 0) can be canal. `s0` is its
+    -- Water (approach A): only a ground-level pixel (world y ~ 0) can be canal. `s0` is its
     -- signed distance to the water edge: < -QUAY_RIM traces the sunken water/quay per
     -- pixel; the [-QUAY_RIM, 0) lip is lit as a wet-stone quay cap; >= 0 is dry land.
     let s0 = if pg.y < 0.03 then water_sdf(@[pg.x, pg.z], painted_scene.items, painted_scene.points) else 1.0 in
@@ -569,11 +532,6 @@ def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
       let shc = contact_shadow(scene, p, n, resl, o)
       let shm_frac = sun_shadow_pcf(sun_depth, p, rx, ry) in
       shade_surface(base, n, ao, shc, shm_frac)
-
-def frame_lighting_pixel(inputs: lighting_inputs, frame: frame_globals,
-                         painted_scene: painted, pixel: vec2i32) vec4f32 =
-  shade_frame(inputs.scene, inputs.sun_depth, inputs.ao_work,
-              frame, painted_scene, pixel.x, pixel.y)
 
 ------------------------------------------------------------
 -- Deferred resolve. One fullscreen triangle covers every pixel and its fragment
@@ -594,7 +552,8 @@ def resolve_fragment(inputs: lighting_inputs, frame: frame_globals,
                      painted_scene: painted, _value: (), position: vec4f32,
                      _front_facing: bool, _primitive_index: u32, _sample_index: u32) vec4f32 =
   let xy = @[i32(position.x), i32(position.y)] in
-  frame_lighting_pixel(inputs, frame, painted_scene, xy)
+  shade_frame(inputs.scene, inputs.sun_depth, inputs.ao_work,
+              frame, painted_scene, xy.x, xy.y)
 
 -- Shared opaque-depth state for the sun and scene draws. Physical attachments,
 -- barriers, pipeline order, and indirect command dependencies are derived from

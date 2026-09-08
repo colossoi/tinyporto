@@ -5,9 +5,6 @@
 -- ground plane does the surface sit — as a signed distance field so the shoreline
 -- (a quay wall dropping to the water) and the sett culling both read from one source.
 --
--- Until the painter drives it (later), `water_sdf` returns a hardcoded test canal so
--- the geometry + shading can be developed against a fixed scene.
---
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
 import "math"     -- v2 / v3 / dot / magnitude / mix
@@ -55,17 +52,13 @@ def water_sdf(p: vec2f32, items: []vec4f32, points: []vec2f32) f32 =
       let dmin =
         if pcount <= 1 then magnitude(p - points[pstart])
         else
-          -- Live segment count, still capped at MAX_SEG (a longer stroke truncates,
-          -- as before). Iterating the cap and discarding the tail cost every pixel
-          -- MAX_SEG steps no matter how short the stroke.
+          -- Evaluate live segments up to MAX_SEG; longer strokes truncate.
           let nseg = if pcount - 1 < MAX_SEG then pcount - 1 else MAX_SEG in
           loop d = 100.0 for s < nseg do
             f32.min(d, seg_dist(p, points[pstart + s], points[pstart + s + 1]))
         in
       f32.min(best, dmin - hw)
     else best
-
-def WATER_UP: vec3f32 = @[0.0, 1.0, 0.0]
 
 -- Reflect view direction `v` about surface normal `n`.
 def reflect3(v: vec3f32, n: vec3f32) vec3f32 = v - n * v3(2.0 * dot(v, n))
@@ -145,7 +138,7 @@ def shade_water(p0: vec3f32, rd: vec3f32, t: f32, items: []vec4f32, points: []ve
     let m = 1.0 - ndv
     let fres = 0.02 + 0.24 * (m * m * m * m * m)           -- low reflectivity (murky)
     let rr = reflect3(rd, wn)
-    let sky = clouds.sky(pf, rr)
+    let sky = clouds.sky(rr)
     let spec = f32.pow(f32.max(0.0, dot(rr, sun)), 80.0) * 0.9   -- sun sparkle on ripples
     let absorb = 1.0 - f32.exp(0.0 - t_floor * 2.5)       -- silt fades to deep with depth
     let body = mix(WATER_SILT, WATER_DEEP, absorb)

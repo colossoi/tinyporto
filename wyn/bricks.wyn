@@ -1,10 +1,8 @@
 -- bricks: cobblestone setts laid in a running-bond grid over cobble ground.
 -- Library module (no `open`; f32.* / vec.* qualified).
 --
--- Each sett is a real protruding proxy box (instanced, drawn indirect). The
--- rounded corners come from an analytic rounded-box normal in the fragment
--- (see round_normal); a later pass upgrades to a rounded-box ray
--- march so the silhouette rounds too (the Tiny Glade trick).
+-- Each sett is an instanced proxy box. The fragment shader sphere-traces its
+-- rounded-box surface to compute the silhouette, normal, and depth.
 
 import "pkg:rng"
 import "math"
@@ -15,7 +13,7 @@ import "hiz"
 -- Sett palette. Cobble is a mid-tone neutral ranging from warm earthy greige to
 -- architectural grey with a soft blue undertone. Each sett draws an independent hash
 -- for hue (mix of these two), saturation (grey <-> full undertone), and lightness, so
--- the field reads varied rather than washed out and uniform (see sett_fragment).
+-- the field reads varied rather than washed out and uniform (see sett_prop).
 def COBBLE_WARM: vec3f32 = @[0.55, 0.46, 0.36]   -- warm earthy greige
 def COBBLE_COOL: vec3f32 = @[0.38, 0.43, 0.52]   -- architectural grey, soft blue undertone
 
@@ -23,13 +21,12 @@ def COBBLE_COOL: vec3f32 = @[0.38, 0.43, 0.52]   -- architectural grey, soft blu
 def BRICK_W: f32 = 0.24     -- x footprint: the LONG axis, along the row
 def BRICK_L: f32 = 0.15     -- z footprint: the short axis / width (setts read ~1.6:1)
 def BRICK_H: f32 = 0.05     -- protrusion above ground (chunky stone, so the rounding reads)
-def MORTAR:  f32 = 0.004    -- nominal joint (the z pitch adds it to BRICK_L)
 
 def CELLX: f32 = 0.255      -- along-row cell pitch (long axis + a tight joint)
 def CELLZ: f32 = 0.175      -- cross-row pitch (short axis + a tight joint)
 
--- Running-bond grid covering the ~40 m ground (centered on origin). The total sett
--- count (BCOLS*BROWS = 36960) is the driver's `bidx` seed length — kept in sync there.
+-- Running-bond grid covering the ~40 m ground (centered on origin).
+-- BCOLS * BROWS determines the sett candidate count.
 def BCOLS: i32 = 168
 def BROWS: i32 = 220
 
@@ -119,12 +116,9 @@ def box_pos: [36]vec3f32 =
    @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5],
    @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5], @[0.5, 0.0, 0.0 - 0.5]]
 
--- One instanced prop: a rounded box, fully self-describing. Cobble setts and wall
--- bricks/quoins/grout all reduce to this, so a single vertex/fragment pair places
--- and sphere-traces every one of them. The generator (`frame_prepare`) resolves each
--- candidate's placement, orientation, roundness and colour once; the draw does no
--- per-kind work. A dead (culled) slot is marked center.y <= 0 and collapses to a
--- degenerate vertex.
+-- One rounded-box prop, shared by cobbles, wall bricks, quoins, and grout.
+-- Culling constructs these records only for surviving candidates; both vertex
+-- and fragment shaders use the stored placement, basis, and material.
 type prop = {
   center: vec3f32,     -- box centre, world
   radius: f32,         -- corner radius (<= min half extent)
