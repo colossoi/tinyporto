@@ -15,6 +15,7 @@
 
 import "camera"   -- world_to_clip / world_from_depth / linear_depth / look_at / LOOKAT
 import "shade"    -- SUN_DIR / sun
+import "render_types"
 
 -- March tunables (world metres). Short range, so shadows ground bricks / cobbles /
 -- wall bases in contact without leaking long streaks across the scene.
@@ -57,7 +58,8 @@ def shadow_occluded(sp: vec3f32, wp: vec3f32, cq: vec4f32, surfd: f32) bool =
 -- landing behind a nearer occluder ON the ray blocks the sun. Only marches where the
 -- face sees the sun (a back-to-sun face is already unlit by ndl, so a shadow there is
 -- a no-op that only adds noise). Returns occlusion in {0,1} (early-outs once blocked).
-def contact_shadow(sd: storage_image, p: vec3f32, n: vec3f32, resl: vec3f32, o: orbit) f32 =
+def contact_shadow(sd: render_target<gbuffer>, p: vec3f32, n: vec3f32,
+                   resl: vec3f32, o: orbit) f32 =
   let rx = resl.x
   let ry = resl.y
   let w = i32(rx)
@@ -71,7 +73,7 @@ def contact_shadow(sd: storage_image, p: vec3f32, n: vec3f32, resl: vec3f32, o: 
         let sp = shadow_point(p, sun, k)
         let cq = world_to_clip(sp, resl, o)
         let (sx, sy, valid) = shadow_pixel(cq, rx, ry, w, h)
-        let surfd = if valid then image_load(sd, @[sx, sy]).x else 1.0
+        let surfd = if valid then target_load(sd, @[sx, sy], 0u32).depth else 1.0
         let wp = world_from_depth(resl, @[f32(sx) + 0.5, ry - (f32(sy) + 0.5)], o, surfd) in
         if shadow_occluded(sp, wp, cq, surfd) then 1.0 else shc
 
@@ -131,7 +133,7 @@ def sun_lit(refz: f32, stored: f32) bool = refz - SUN_BIAS <= stored
 -- Projects `p` into the light camera and compares its light-space depth to the
 -- nearest recorded caster over a softened 3x3 tap. Returns the occluded fraction in
 -- [0,1] (0 = fully lit, outside the map's covered volume => lit).
-def sun_shadow_pcf(shm: storage_image, p: vec3f32, rx: f32, ry: f32) f32 =
+def sun_shadow_pcf(shm: render_target<f32>, p: vec3f32, rx: f32, ry: f32) f32 =
   let w = i32(rx)
   let h = i32(ry)
   let lc = world_to_light(p)
@@ -145,6 +147,6 @@ def sun_shadow_pcf(shm: storage_image, p: vec3f32, rx: f32, ry: f32) f32 =
         let stx = tx + (kk % 3 - 1)
         let sty = ty + (kk / 3 - 1)
         let inb = stx >= 0 && stx < w && sty >= 0 && sty < h
-        let stored = if inb then image_load(shm, @[stx, sty]).x else 1.0 in
+        let stored = if inb then target_load(shm, @[stx, sty], 0u32) else 1.0 in
         if sun_lit(lc.z, stored) then occ else occ + 1.0
       in occ / 9.0

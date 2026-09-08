@@ -1,0 +1,12 @@
+-- Shared render-target payloads for the unified Tiny Porto frame.
+--
+-- A structured render target gives the scene pass one logical value while the
+-- compiler publishes one color attachment per leaf.  Keeping this type in a
+-- tiny shared module lets the scene, GTAO, and shadow helpers all read the same
+-- target without reintroducing host-visible binding or attachment identities.
+
+type gbuffer = {
+  albedo: vec4f32,
+  normal: vec4f32,
+  depth: f32,
+}
