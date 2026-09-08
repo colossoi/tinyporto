@@ -535,6 +535,19 @@ fn image_pixels_param(p: &Pipeline, set: u32, b: u32) -> Ident {
     id(&format!("{name}_pixels"))
 }
 
+// These two leading arguments form the ComputePass ABI. A BTreeSet sorts
+// occ_pixels before window_pixels, silently reversing both dispatch and capacity.
+fn ordered_runtime_params(params: &std::collections::BTreeSet<String>) -> Vec<Ident> {
+    ["window_pixels", "occ_pixels"]
+        .into_iter()
+        .chain(
+            params.iter().map(String::as_str)
+                .filter(|name| *name != "window_pixels" && *name != "occ_pixels"),
+        )
+        .map(id)
+        .collect()
+}
+
 /// Translate one compute pipeline into `<entry>_stages` + `<entry>_out_bytes`
 /// functions, with the descriptor's rules inlined as arithmetic. Non-compute
 /// pipelines have nothing to compute, so they generate nothing. A compute entry
@@ -630,7 +643,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
             }
         })
         .collect();
-    let disp_param_ids: Vec<Ident> = disp_params.iter().map(|s| id(s)).collect();
+    let disp_param_ids = ordered_runtime_params(&disp_params);
 
     // Sized writes: one match arm per binding the pass writes — entry outputs AND
     // compiler-internal `intermediate` scratch (e.g. a filter's compacted-count
@@ -697,7 +710,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
             quote! { #b => #expr }
         })
         .collect();
-    let out_params: Vec<Ident> = params.iter().map(|s| id(s)).collect();
+    let out_params = ordered_runtime_params(&params);
 
     quote! {
         #(#stage_binding_defs)*
