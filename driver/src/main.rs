@@ -1284,6 +1284,9 @@ struct App {
     mouse: (f32, f32),
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// Wall-clock presentation rate, including event-loop and vsync waits.
+    fps_start: Instant,
+    fps_frames: u32,
 }
 
 impl ApplicationHandler for App {
@@ -1316,6 +1319,8 @@ impl ApplicationHandler for App {
             Ok(r) => {
                 self.window = Some(window);
                 self.renderer = Some(r);
+                self.fps_start = Instant::now();
+                self.fps_frames = 0;
             }
             Err(e) => {
                 eprintln!("gpu init: {e:?}");
@@ -1422,8 +1427,23 @@ impl ApplicationHandler for App {
                 self.cam.ease(); // glide the visible camera toward the input target
                 renderer.upload_events(&self.events);
                 self.events.clear();
+                let previous_frame = renderer.frame;
                 if let Err(e) = renderer.render(&self.cam, self.mods) {
                     eprintln!("render error: {e:?}");
+                }
+                if renderer.frame != previous_frame {
+                    self.fps_frames += 1;
+                }
+                let now = Instant::now();
+                let elapsed = now.duration_since(self.fps_start).as_secs_f64();
+                if elapsed >= 0.5 && self.fps_frames > 0 {
+                    let fps = f64::from(self.fps_frames) / elapsed;
+                    let frame_ms = elapsed * 1000.0 / f64::from(self.fps_frames);
+                    if let Some(window) = &self.window {
+                        window.set_title(&format!("tiny porto — {fps:.0} FPS · {frame_ms:.1} ms"));
+                    }
+                    self.fps_start = now;
+                    self.fps_frames = 0;
                 }
                 if self.args.frames != 0 && renderer.frame >= self.args.frames {
                     println!("rendered {} frames; exiting (--frames)", renderer.frame);
@@ -1470,6 +1490,8 @@ fn main() -> Result<()> {
         mouse: (0.0, 0.0),
         window: None,
         renderer: None,
+        fps_start: Instant::now(),
+        fps_frames: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
