@@ -220,6 +220,9 @@ pub struct ComputeStage {
     pub bindings: BindTable,
 }
 
+/// Lookup of a scalar word in the host uniform snapshot by binding name and byte offset.
+pub type UniformWords<'a> = dyn Fn(&'static str, u32) -> Option<u32> + 'a;
+
 /// A compute pass: its generated binding table, the ordered stages it lowers to
 /// (each with its own dispatch), and the generated size calc for its output
 /// bindings (used to derive the byte sizes of buffers this pass writes).
@@ -232,7 +235,7 @@ pub struct ComputePass {
     pub module: &'static str,
     pub bindings: BindTable,
     pub stages: Vec<ComputeStage>,
-    pub out_bytes: fn(u32, u64, u64) -> u64,
+    pub out_bytes: fn(u32, u64, u64, &UniformWords<'_>) -> u64,
     /// Temporary host-resolved runtime domains: surface pixels and coarse tiles.
     pub runtime_counts: [u64; 2],
 }

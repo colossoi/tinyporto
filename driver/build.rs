@@ -225,6 +225,10 @@ impl Binding {
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Length {
+    HostExpression {
+        count: wyn_pipeline_descriptor::HostExpression,
+        elem_bytes: u32,
+    },
     /// A fixed byte size (e.g. a small fixed-shape output array).
     Fixed { bytes: u64 },
     /// Sized from an input binding: (src_bytes / src_elem_bytes) * elem_bytes.
@@ -243,8 +247,6 @@ enum Length {
 struct Stage {
     entry_point: String,
     owner: String,
-    #[serde(default)]
-    workgroup_size: [u32; 3],
     #[serde(default)]
     stage: Option<String>,
     #[serde(default)]
@@ -476,35 +478,6 @@ fn codegen_stage_bindings(
     }
 }
 
-/// Temporary compatibility bridge for Tinyporto's two runtime `iota` domains.
-/// The compiler currently emits these expression-derived domains as implicit
-/// fixed dispatches. The host already owns the window extent, so use its two
-/// products until the descriptor preserves parameter expressions directly.
-fn temporary_host_count_param(p: &Pipeline, stage_index: usize) -> Option<&'static str> {
-    if pipeline_owner(p) == "tinyporto_frame__compute_2" {
-        match stage_index {
-            0 => Some("window_pixels"),
-            1 => Some("occ_pixels"),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
-fn temporary_output_count_param(p: &Pipeline, output: &Binding) -> Option<&'static str> {
-    let binding_index = p.bindings.iter().position(|binding| {
-        binding.set == output.set
-            && binding.binding == output.binding
-            && binding.name == output.name
-    })?;
-    p.stages
-        .iter()
-        .enumerate()
-        .find(|(_, stage)| stage.writes.contains(&binding_index))
-        .and_then(|(stage_index, _)| temporary_host_count_param(p, stage_index))
-}
-
 /// Fixed byte capacity of `intermediate` binding `b`, if the pipeline has one.
 /// A dispatch (or `same_as_dispatch` output) sized from an intermediate — e.g. a
 /// `filter`'s gather buffer feeding the map over its survivors — covers the full
@@ -548,7 +521,9 @@ fn ordered_runtime_params(params: &std::collections::BTreeSet<String>) -> Vec<Id
     ["window_pixels", "occ_pixels"]
         .into_iter()
         .chain(
-            params.iter().map(String::as_str)
+            params
+                .iter()
+                .map(String::as_str)
                 .filter(|name| *name != "window_pixels" && *name != "occ_pixels"),
         )
         .map(id)
@@ -560,6 +535,40 @@ fn ordered_runtime_params(params: &std::collections::BTreeSet<String>) -> Vec<Id
 /// pipelines have nothing to compute, so they generate nothing. A compute entry
 /// lowers to several ordered stages (one per output domain); the canonical entry
 /// (see `pipeline_owner`) names the whole pipeline.
+fn host_expression_tokens(expr: &wyn_pipeline_descriptor::HostExpression) -> TokenStream {
+    use wyn_pipeline_descriptor::HostExpression as E;
+    let scalar = |ty| {
+        let name = id(&format!("{ty:?}"));
+        quote! { wyn_pipeline_descriptor::HostScalar::#name }
+    };
+    match expr {
+        E::Constant { scalar: ty, bits } => {
+            let ty = scalar(ty);
+            quote! { wyn_pipeline_descriptor::HostExpression::Constant { scalar: #ty, bits: #bits } }
+        }
+        E::Uniform {
+            set,
+            binding,
+            offset,
+            scalar: ty,
+        } => {
+            let ty = scalar(ty);
+            quote! { wyn_pipeline_descriptor::HostExpression::Uniform { set: #set, binding: #binding, offset: #offset, scalar: #ty } }
+        }
+        E::Convert { to, value } => {
+            let to = scalar(to);
+            let value = host_expression_tokens(value);
+            quote! { wyn_pipeline_descriptor::HostExpression::Convert { to: #to, value: Box::new(#value) } }
+        }
+        E::Binary { op, left, right } => {
+            let op = id(&format!("{op:?}"));
+            let left = host_expression_tokens(left);
+            let right = host_expression_tokens(right);
+            quote! { wyn_pipeline_descriptor::HostExpression::Binary { op: wyn_pipeline_descriptor::HostBinary::#op, left: Box::new(#left), right: Box::new(#right) } }
+        }
+    }
+}
+
 fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream {
     if p.kind != "compute" {
         return quote! {};
@@ -596,12 +605,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
                 .dispatch_size
                 .as_ref()
                 .expect("compute stage has dispatch_size");
-            let dims = if let Some(param) = temporary_host_count_param(p, stage_index) {
-                assert_eq!(s.workgroup_size[1..], [1, 1]);
-                let count = id(param);
-                let workgroup_size = s.workgroup_size[0];
-                quote! { [(#count as u32).div_ceil(#workgroup_size), 1, 1] }
-            } else {
+            let dims = {
                 match ds {
                     DispatchSize::Fixed { x, y, z } => quote! { [#x, #y, #z] },
                     DispatchSize::DerivedFrom {
@@ -669,6 +673,22 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
         .map(|o| {
             let b = o.binding;
             let expr = match o.length.as_ref().expect("output binding has length") {
+                Length::HostExpression { count, elem_bytes } => {
+                    let expr = host_expression_tokens(count);
+                    let uniform_arms: Vec<_> = p.bindings.iter().filter(|b| b.ty == "uniform").map(|b| {
+                        let (set, binding, name) = (b.set,b.binding,&b.name);
+                        quote! { (#set, #binding) => _uniforms(#name, offset) }
+                    }).collect();
+                    quote! {
+                        {
+                            static LENGTH: std::sync::LazyLock<wyn_pipeline_descriptor::BufferLen> = std::sync::LazyLock::new(||
+                                wyn_pipeline_descriptor::BufferLen::HostExpression { count: #expr, elem_bytes: #elem_bytes });
+                            LENGTH.resolve_host_bytes(&|set, binding, offset| match (set,binding) {
+                                #(#uniform_arms,)* _ => None,
+                            }).expect("invalid host allocation expression")
+                        }
+                    }
+                }
                 Length::Fixed { bytes } => quote! { #bytes },
                 Length::LikeInput {
                     binding,
@@ -680,10 +700,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
                     quote! { (#src / #src_elem_bytes) * #elem_bytes }
                 }
                 Length::SameAsDispatch { elem_bytes } => {
-                    if let Some(param) = temporary_output_count_param(p, o) {
-                        let count = id(param);
-                        quote! { #count * #elem_bytes }
-                    } else {
+                    {
                         match output_domain(p, o) {
                             Some(Len::Fixed { count }) => quote! { #count * #elem_bytes },
                             Some(Len::InputBinding {
@@ -729,7 +746,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
             [#(#stage_rows),*]
         }
         /// Byte size of output binding `binding` (descriptor `length` rules).
-        pub const fn #out_bytes_fn(binding: u32, #(#out_params: u64),*) -> u64 {
+        pub fn #out_bytes_fn(binding: u32, #(#out_params: u64),*, _uniforms: &crate::graph::UniformWords<'_>) -> u64 {
             match binding {
                 #(#arms,)*
                 _ => panic!("binding is not an output of this pipeline"),
@@ -1199,6 +1216,18 @@ fn main() {
             codegen.extend(codegen_bindings(p, pipeline_index));
             codegen.extend(codegen_graphics_item(key, p, pipeline_index));
         }
+        // Graphics ordinals stay stable when compute materializations are inserted.
+        for (ordinal, (pipeline_index, _)) in desc
+            .pipelines
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.kind == "graphics")
+            .enumerate()
+        {
+            let item = id(&format!("PIPELINE_{pipeline_index}_ITEM"));
+            let alias = id(&format!("GRAPHICS_{ordinal}_ITEM"));
+            codegen.extend(quote! { pub use #item as #alias; });
+        }
         codegen.extend(codegen_uniform_blocks(&desc.pipelines));
         codegen.extend(codegen_frame_graph(key, &desc));
     }
@@ -1211,4 +1240,49 @@ fn main() {
     let file = syn::parse2::<syn::File>(generated).expect("generated code parses");
     let pretty = prettyplease::unparse(&file);
     std::fs::write(out_dir.join("generated.rs"), pretty).expect("write generated.rs");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn uniform_length_codegen_does_not_need_a_dispatch_domain() {
+        let desc: Descriptor =
+            serde_json::from_str(include_str!("tests/fixtures/uniform_output_size.json")).unwrap();
+        let pipeline = desc.pipelines.iter().find(|p| p.kind == "compute").unwrap();
+        assert!(pipeline.stages.iter().all(|s| matches!(
+            s.dispatch_size,
+            Some(DispatchSize::Fixed { x: 1, y: 1, z: 1 })
+        )));
+        let code = codegen_pipeline(pipeline, &BufferInterfaces::new());
+        syn::parse2::<syn::File>(code.clone()).expect("generated Rust parses");
+        let code = code.to_string();
+        assert!(code.contains("resolve_host_bytes"));
+        assert!(code
+            .split_whitespace()
+            .collect::<String>()
+            .contains("_uniforms(\"frame\",offset)"));
+        let output = pipeline
+            .bindings
+            .iter()
+            .find(|b| b.usage.as_deref() == Some("output"))
+            .unwrap();
+        assert!(output_domain(pipeline, output).is_none());
+        let Length::HostExpression { count, elem_bytes } = output.length.as_ref().unwrap() else {
+            panic!("logical expression")
+        };
+        for (w, h) in [(64.0f32, 32.0f32), (31.9, 7.8), (128.0, 65.0)] {
+            let bytes = wyn_pipeline_descriptor::BufferLen::HostExpression {
+                count: count.clone(),
+                elem_bytes: *elem_bytes,
+            }
+            .resolve_host_bytes(&|set, binding, offset| match (set, binding, offset) {
+                (0, 0, 0) => Some(w.to_bits()),
+                (0, 0, 4) => Some(h.to_bits()),
+                _ => None,
+            })
+            .unwrap();
+            assert_eq!(bytes, 4 * (w as i32 as u64) * (h as i32 as u64));
+        }
+    }
 }

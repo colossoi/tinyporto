@@ -1,0 +1,328 @@
+{
+  "pipelines": [
+    {
+      "kind": "graphics",
+      "stages": [
+        {
+          "entry_point": "_w_stage_reproduce__vertex",
+          "owner": "reproduce",
+          "stage": "vertex",
+          "reads": [
+            0
+          ]
+        },
+        {
+          "entry_point": "_w_stage_reproduce__fragment",
+          "owner": "reproduce",
+          "stage": "fragment",
+          "reads": [
+            0
+          ]
+        }
+      ],
+      "invocation": {
+        "topology": "triangle_list",
+        "draw": {
+          "kind": "direct",
+          "vertex_count": 3,
+          "instance_count": 1,
+          "first_vertex": 0,
+          "first_instance": 0
+        },
+        "raster_state": {
+          "viewport": {
+            "kind": "target"
+          },
+          "scissor": {
+            "kind": "target"
+          },
+          "front_face": "counter_clockwise",
+          "cull": "none",
+          "fill": "fill"
+        },
+        "fragment_state": {
+          "depth_test": "disabled",
+          "depth_write": false,
+          "blend": "replace",
+          "color_write": true
+        }
+      },
+      "bindings": [
+        {
+          "type": "uniform",
+          "set": 0,
+          "binding": 0,
+          "name": "frame",
+          "size": 16,
+          "members": [
+            {
+              "name": "resolution",
+              "offset": 0,
+              "size": 12
+            }
+          ]
+        }
+      ],
+      "vertex_inputs": [],
+      "fragment_outputs": [
+        {
+          "location": 0,
+          "name": "scene"
+        }
+      ]
+    },
+    {
+      "kind": "compute",
+      "bindings": [
+        {
+          "type": "uniform",
+          "set": 0,
+          "binding": 0,
+          "name": "frame",
+          "size": 16,
+          "members": [
+            {
+              "name": "resolution",
+              "offset": 0,
+              "size": 12
+            }
+          ]
+        },
+        {
+          "type": "texture",
+          "set": 0,
+          "binding": 3,
+          "name": "scene",
+          "sample_type": {
+            "float": {
+              "filterable": true
+            }
+          },
+          "view_dimension": "d2",
+          "multisampled": false,
+          "resource": "scene"
+        },
+        {
+          "type": "storage_buffer",
+          "set": 0,
+          "binding": 2,
+          "access": "write_only",
+          "usage": "output",
+          "name": "reproduce_output",
+          "length": {
+            "kind": "host_expression",
+            "count": {
+              "kind": "binary",
+              "op": "multiply",
+              "left": {
+                "kind": "convert",
+                "to": "i32",
+                "value": {
+                  "kind": "uniform",
+                  "set": 0,
+                  "binding": 0,
+                  "offset": 0,
+                  "scalar": "f32"
+                }
+              },
+              "right": {
+                "kind": "convert",
+                "to": "i32",
+                "value": {
+                  "kind": "uniform",
+                  "set": 0,
+                  "binding": 0,
+                  "offset": 4,
+                  "scalar": "f32"
+                }
+              }
+            },
+            "elem_bytes": 4
+          }
+        }
+      ],
+      "stages": [
+        {
+          "entry_point": "reproduce",
+          "owner": "reproduce",
+          "workgroup_size": [
+            64,
+            1,
+            1
+          ],
+          "dispatch_size": {
+            "kind": "fixed",
+            "x": 1,
+            "y": 1,
+            "z": 1,
+            "explicit": false
+          },
+          "reads": [
+            0,
+            1
+          ],
+          "writes": [
+            2
+          ]
+        }
+      ]
+    }
+  ],
+  "source_results": [
+    {
+      "entry": "reproduce",
+      "result": 0,
+      "pipeline_index": 1,
+      "set": 0,
+      "binding": 2
+    }
+  ],
+  "frame_graph": {
+    "passes": [
+      {
+        "name": "_w_stage_reproduce__vertex",
+        "kind": "vertex",
+        "pipeline_index": 0,
+        "stage_index": 0,
+        "reads": [
+          {
+            "resource": 0
+          }
+        ]
+      },
+      {
+        "name": "_w_stage_reproduce__fragment",
+        "kind": "fragment",
+        "pipeline_index": 0,
+        "stage_index": 1,
+        "reads": [
+          {
+            "resource": 0
+          }
+        ],
+        "writes": [
+          {
+            "resource": 1
+          }
+        ]
+      },
+      {
+        "name": "reproduce",
+        "kind": "compute",
+        "pipeline_index": 1,
+        "stage_index": 0,
+        "reads": [
+          {
+            "resource": 0
+          },
+          {
+            "resource": 1
+          }
+        ],
+        "writes": [
+          {
+            "resource": 2
+          }
+        ],
+        "depends_on": [
+          1
+        ]
+      }
+    ],
+    "resources": [
+      {
+        "name": "frame",
+        "kind": "uniform",
+        "bindings": [
+          {
+            "pipeline_index": 0,
+            "binding_index": 0,
+            "name": "frame",
+            "kind": "uniform",
+            "set": 0,
+            "binding": 0
+          },
+          {
+            "pipeline_index": 1,
+            "binding_index": 0,
+            "name": "frame",
+            "kind": "uniform",
+            "set": 0,
+            "binding": 0
+          }
+        ],
+        "extent": {
+          "kind": "uniform",
+          "bytes": 16
+        },
+        "first_pass": 0,
+        "last_pass": 2
+      },
+      {
+        "name": "scene",
+        "kind": "texture",
+        "bindings": [
+          {
+            "pipeline_index": 1,
+            "binding_index": 1,
+            "name": "scene",
+            "kind": "texture",
+            "set": 0,
+            "binding": 3
+          }
+        ],
+        "first_pass": 1,
+        "last_pass": 2
+      },
+      {
+        "name": "reproduce_output",
+        "kind": "storage_buffer",
+        "bindings": [
+          {
+            "pipeline_index": 1,
+            "binding_index": 2,
+            "name": "reproduce_output",
+            "kind": "storage_buffer",
+            "set": 0,
+            "binding": 2
+          }
+        ],
+        "extent": {
+          "kind": "storage_buffer",
+          "length": {
+            "kind": "host_expression",
+            "count": {
+              "kind": "binary",
+              "op": "multiply",
+              "left": {
+                "kind": "convert",
+                "to": "i32",
+                "value": {
+                  "kind": "uniform",
+                  "set": 0,
+                  "binding": 0,
+                  "offset": 0,
+                  "scalar": "f32"
+                }
+              },
+              "right": {
+                "kind": "convert",
+                "to": "i32",
+                "value": {
+                  "kind": "uniform",
+                  "set": 0,
+                  "binding": 0,
+                  "offset": 4,
+                  "scalar": "f32"
+                }
+              }
+            },
+            "elem_bytes": 4
+          }
+        },
+        "first_pass": 2,
+        "last_pass": 2
+      }
+    ]
+  }
+}

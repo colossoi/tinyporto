@@ -6,7 +6,7 @@
 //! resources exist, the binding-name -> resource mapping, and the per-frame
 //! schedule.
 
-use crate::generated::{PIPELINE_2_ITEM, PIPELINE_3_ITEM, PIPELINE_4_ITEM, PIPELINE_6_ITEM};
+use crate::generated::{GRAPHICS_0_ITEM, GRAPHICS_1_ITEM, GRAPHICS_2_ITEM, GRAPHICS_3_ITEM};
 use crate::graph::*;
 
 // Coarse occlusion grid (Hi-Z simple): one texel per OCC_TILE^2 window block,
@@ -43,14 +43,14 @@ fn compute_entry(module: &'static str, entry: &'static str, w: u32, h: u32) -> C
 
 // Draw lists, hoisted out of `graph` because a RenderItem reads the generated
 // binding-table statics and so cannot be const-promoted inside a function body.
-static SUN_SHADOW_ITEMS: [RenderItem; 1] = [RenderItem { ..PIPELINE_2_ITEM }];
+static SUN_SHADOW_ITEMS: [RenderItem; 1] = [RenderItem { ..GRAPHICS_0_ITEM }];
 
 static SCENE_ITEMS: [RenderItem; 2] = [
-    RenderItem { ..PIPELINE_3_ITEM },
-    RenderItem { ..PIPELINE_4_ITEM },
+    RenderItem { ..GRAPHICS_1_ITEM },
+    RenderItem { ..GRAPHICS_2_ITEM },
 ];
 
-static RESOLVE_ITEMS: [RenderItem; 1] = [RenderItem { ..PIPELINE_6_ITEM }];
+static RESOLVE_ITEMS: [RenderItem; 1] = [RenderItem { ..GRAPHICS_3_ITEM }];
 
 /// The frame graph for a `w` x `h` surface. Image extents and image-sized compute
 /// dispatches derive from it; no resolution is hardcoded here or in the shaders.

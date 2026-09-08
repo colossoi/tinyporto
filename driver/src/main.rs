@@ -113,6 +113,10 @@ struct Renderer {
     )>,
     depth_view: Option<wgpu::TextureView>,
     passes: Vec<BuiltPass>,
+    graph: Graph,
+    pingpong: HashMap<&'static str, [wgpu::Buffer; 2]>,
+    img_formats: HashMap<&'static str, TexFormat>,
+    output_sizes: Vec<(ComputePass, u32, &'static str)>,
     frame: u32,
     start: Instant,
 }
@@ -129,8 +133,54 @@ struct Res<'a> {
     img_formats: &'a HashMap<&'static str, TexFormat>,
 }
 
+fn uniform_word(blocks: &HashMap<&str, Vec<u8>>, name: &str, offset: u32) -> Option<u32> {
+    let bytes = blocks.get(name)?;
+    let start = offset as usize;
+    Some(u32::from_le_bytes(
+        bytes.get(start..start.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn pack_uniform_block(
+    members: &[BlockMember],
+    layout: &UniformBlockLayout,
+    width: u32,
+    height: u32,
+    cam: &Camera,
+    mods: u32,
+    time: f32,
+) -> Vec<u8> {
+    let (w, h) = (width as f32, height as f32);
+    let name = layout.name;
+    let mut bytes = vec![0u8; layout.size as usize];
+    for m in members.iter() {
+        let (_, offset, _) = layout
+            .members
+            .iter()
+            .find(|(f, _, _)| *f == m.field)
+            .unwrap_or_else(|| panic!("block '{name}' has no member '{}'", m.field));
+        let off = *offset as usize;
+        match m.source {
+            FrameSource::Resolution => {
+                put(
+                    &mut bytes,
+                    off,
+                    bytemuck::cast_slice(&[w, h, if h > 0.0 { w / h } else { 1.0 }]),
+                );
+            }
+            FrameSource::Mods => put(&mut bytes, off, bytemuck::cast_slice(&[mods])),
+            FrameSource::CamTarget => put(&mut bytes, off, bytemuck::cast_slice(&cam.target)),
+            FrameSource::CamAz => put(&mut bytes, off, bytemuck::cast_slice(&[cam.az])),
+            FrameSource::CamElev => put(&mut bytes, off, bytemuck::cast_slice(&[cam.elev])),
+            FrameSource::CamDist => put(&mut bytes, off, bytemuck::cast_slice(&[cam.dist])),
+            FrameSource::Time => put(&mut bytes, off, bytemuck::cast_slice(&[time])),
+        }
+    }
+    bytes
+}
+
 impl Renderer {
-    fn new(gfx: Gfx, graph: &Graph) -> Result<Self> {
+    fn new(gfx: Gfx, graph: &Graph, camera: &Camera, mods: u32, time: f32) -> Result<Self> {
         validate_descriptor_graph(graph)?;
         let device = &gfx.device;
 
@@ -142,6 +192,32 @@ impl Renderer {
         // Byte size of each buffer that is a compute output (resource name ->
         // bytes), from each compute pass's generated size calc applied to its
         // StorageWrite bindings. Buffers with no declared size are sized from here.
+        let initial_uniforms: HashMap<_, _> = graph
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                let Resource::UniformBlock { name, members } = resource else {
+                    return None;
+                };
+                let layout = generated::UNIFORM_BLOCKS
+                    .iter()
+                    .find(|l| l.name == *name)
+                    .expect("uniform layout");
+                Some((
+                    *name,
+                    pack_uniform_block(
+                        members,
+                        layout,
+                        gfx.config.width,
+                        gfx.config.height,
+                        camera,
+                        mods,
+                        time,
+                    ),
+                ))
+            })
+            .collect();
+        let mut output_sizes = Vec::new();
         let mut derived: HashMap<&'static str, u64> = HashMap::new();
         for pass in &graph.passes {
             if let Pass::Compute(cp) = pass {
@@ -152,10 +228,24 @@ impl Renderer {
                             BindingKind::StorageWrite | BindingKind::StorageReadWrite
                         )
                     {
-                        derived.insert(
-                            name_to_resource(graph, cp.module, name),
-                            (cp.out_bytes)(binding, cp.runtime_counts[0], cp.runtime_counts[1]),
+                        let resource = name_to_resource(graph, cp.module, name);
+                        let bytes = (cp.out_bytes)(
+                            binding,
+                            cp.runtime_counts[0],
+                            cp.runtime_counts[1],
+                            &|uniform, offset| {
+                                uniform_word(
+                                    &initial_uniforms,
+                                    name_to_resource(graph, cp.module, uniform),
+                                    offset,
+                                )
+                            },
                         );
+                        derived
+                            .entry(resource)
+                            .and_modify(|n| *n = (*n).max(bytes))
+                            .or_insert(bytes);
+                        output_sizes.push((cp.clone(), binding, resource));
                     }
                 }
             }
@@ -290,6 +380,10 @@ impl Renderer {
             blocks,
             depth_view,
             passes,
+            graph: graph.clone(),
+            pingpong,
+            img_formats,
+            output_sizes,
             frame: 0,
             start: Instant::now(),
         })
@@ -317,40 +411,131 @@ impl Renderer {
             .write_buffer(&self.buffers["events"], 0, bytemuck::cast_slice(&buf));
     }
 
-    fn update_uniforms(&self, cam: &Camera, mods: u32, time: f32) {
-        let q = &self.gfx.queue;
-        let w = self.gfx.config.width as f32;
-        let h = self.gfx.config.height as f32;
-        // Pack each uniform block once and upload it. Every member's bytes go at
-        // the std140 offset the descriptor published for its field name.
-        for (name, members, layout) in &self.blocks {
-            let mut bytes = vec![0u8; layout.size as usize];
-            for m in members.iter() {
-                let (_, offset, _) = layout
-                    .members
-                    .iter()
-                    .find(|(f, _, _)| *f == m.field)
-                    .unwrap_or_else(|| panic!("block '{name}' has no member '{}'", m.field));
-                let off = *offset as usize;
-                match m.source {
-                    FrameSource::Resolution => {
-                        put(
-                            &mut bytes,
-                            off,
-                            bytemuck::cast_slice(&[w, h, if h > 0.0 { w / h } else { 1.0 }]),
-                        );
-                    }
-                    FrameSource::Mods => put(&mut bytes, off, bytemuck::cast_slice(&[mods])),
-                    FrameSource::CamTarget => {
-                        put(&mut bytes, off, bytemuck::cast_slice(&cam.target))
-                    }
-                    FrameSource::CamAz => put(&mut bytes, off, bytemuck::cast_slice(&[cam.az])),
-                    FrameSource::CamElev => put(&mut bytes, off, bytemuck::cast_slice(&[cam.elev])),
-                    FrameSource::CamDist => put(&mut bytes, off, bytemuck::cast_slice(&[cam.dist])),
-                    FrameSource::Time => put(&mut bytes, off, bytemuck::cast_slice(&[time])),
+    fn update_uniforms(&mut self, cam: &Camera, mods: u32, time: f32) {
+        let snapshot: HashMap<_, _> = self
+            .blocks
+            .iter()
+            .map(|(name, members, layout)| {
+                (
+                    *name,
+                    pack_uniform_block(
+                        members,
+                        layout,
+                        self.gfx.config.width,
+                        self.gfx.config.height,
+                        cam,
+                        mods,
+                        time,
+                    ),
+                )
+            })
+            .collect();
+        self.grow_outputs(&snapshot);
+        for (name, bytes) in snapshot {
+            self.gfx.queue.write_buffer(&self.buffers[name], 0, &bytes);
+        }
+    }
+
+    /// Grow logical capacities before submitting work using the same uniform snapshot.
+    /// Preserve existing contents, including both sides of persistent ping-pong resources.
+    fn grow_outputs(&mut self, snapshot: &HashMap<&str, Vec<u8>>) {
+        let mut required = HashMap::<&str, u64>::new();
+        for (cp, binding, resource) in &self.output_sizes {
+            let bytes = (cp.out_bytes)(
+                *binding,
+                cp.runtime_counts[0],
+                cp.runtime_counts[1],
+                &|name, offset| {
+                    uniform_word(
+                        snapshot,
+                        name_to_resource(&self.graph, cp.module, name),
+                        offset,
+                    )
+                },
+            );
+            required
+                .entry(resource)
+                .and_modify(|n| *n = (*n).max(bytes))
+                .or_insert(bytes);
+        }
+        let device = &self.gfx.device;
+        let mut copies = None;
+        let mut grow = |name: &str, buffer: &mut wgpu::Buffer, bytes: u64| {
+            if bytes <= buffer.size() {
+                return;
+            }
+            let next = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(name),
+                size: bytes.max(4),
+                usage: buffer.usage(),
+                mapped_at_creation: false,
+            });
+            let encoder = copies.get_or_insert_with(|| {
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("grow logical outputs"),
+                })
+            });
+            encoder.copy_buffer_to_buffer(buffer, 0, &next, 0, buffer.size());
+            *buffer = next;
+        };
+        for (name, bytes) in required {
+            if let Some(buffer) = self.buffers.get_mut(name) {
+                grow(name, buffer, bytes);
+            }
+            if let Some(pair) = self.pingpong.get_mut(name) {
+                for buffer in pair {
+                    grow(name, buffer, bytes);
                 }
             }
-            q.write_buffer(&self.buffers[name], 0, &bytes);
+        }
+        let Some(copies) = copies else { return };
+        self.gfx.queue.submit([copies.finish()]);
+        let res = Res {
+            buffers: &self.buffers,
+            pp: &self.pingpong,
+            views: &self.image_views,
+            img_formats: &self.img_formats,
+        };
+        for (built, definition) in self.passes.iter_mut().zip(&self.graph.passes) {
+            match (built, definition) {
+                (BuiltPass::Compute(built), Pass::Compute(cp)) => {
+                    for (built, stage) in built.stages.iter_mut().zip(&cp.stages) {
+                        let binds = resolve_table(cp.module, stage.bindings, &self.graph, res.pp);
+                        built.sets = (0..variant_count(&binds))
+                            .map(|parity| {
+                                build_sets(
+                                    device,
+                                    stage.entry,
+                                    &binds,
+                                    wgpu::ShaderStages::COMPUTE,
+                                    res,
+                                    parity,
+                                )
+                                .1
+                            })
+                            .collect();
+                    }
+                }
+                (BuiltPass::Render(built), Pass::Render(rp)) => {
+                    for (built, item) in built.items.iter_mut().zip(rp.items) {
+                        let binds = resolve_table(item.module, item.bindings, &self.graph, res.pp);
+                        built.sets = (0..variant_count(&binds))
+                            .map(|parity| {
+                                build_sets(
+                                    device,
+                                    item.label,
+                                    &binds,
+                                    wgpu::ShaderStages::VERTEX_FRAGMENT,
+                                    res,
+                                    parity,
+                                )
+                                .1
+                            })
+                            .collect();
+                    }
+                }
+                _ => unreachable!("built graph preserves pass order"),
+            }
         }
     }
 
@@ -754,7 +939,8 @@ fn make_storage_raw(device: &wgpu::Device, label: &str, size: u64, indirect: boo
     }
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        size,
+        // A zero logical length still needs a legal, nonempty storage binding.
+        size: size.max(4),
         usage,
         mapped_at_creation: false,
     })
@@ -1313,7 +1499,7 @@ impl ApplicationHandler for App {
         };
         let renderer = Gfx::new(window.clone()).and_then(|gfx| {
             let (w, h) = (gfx.config.width, gfx.config.height);
-            Renderer::new(gfx, &app::graph(w, h))
+            Renderer::new(gfx, &app::graph(w, h), &self.cam, self.mods, 0.0)
         });
         match renderer {
             Ok(r) => {
@@ -1468,9 +1654,9 @@ fn main() -> Result<()> {
     if let Some(path) = args.screenshot.clone() {
         let gfx = Gfx::new_headless(args.width, args.height)?;
         let (gw, gh) = (gfx.config.width, gfx.config.height);
-        let mut renderer = Renderer::new(gfx, &app::graph(gw, gh))?;
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
+        let mut renderer = Renderer::new(gfx, &app::graph(gw, gh), &cam, args.mods, args.time)?;
         renderer.screenshot(&path, &cam, args.mods, args.time)?;
         for name in &args.dump {
             renderer.dump_buffer(name)?;
@@ -1495,4 +1681,178 @@ fn main() -> Result<()> {
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    fn uniform_output_bytes(_: u32, _: u64, _: u64, words: &UniformWords<'_>) -> u64 {
+        static LENGTH: std::sync::LazyLock<wyn_pipeline_descriptor::BufferLen> =
+            std::sync::LazyLock::new(|| {
+                let descriptor: serde_json::Value = serde_json::from_str(include_str!(
+                    "../tests/fixtures/uniform_output_size.json"
+                ))
+                .unwrap();
+                let output = descriptor["pipelines"][1]["bindings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|b| b["usage"] == "output")
+                    .unwrap();
+                serde_json::from_value(output["length"].clone()).unwrap()
+            });
+        LENGTH
+            .resolve_host_bytes(&|set, binding, offset| {
+                if (set, binding) == (0, 0) {
+                    words("frame", offset)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn uniform_capacity_growth_preserves_storage_and_pingpong_contents() {
+        let gfx = Gfx::new_headless(64, 32).expect("headless GPU");
+        let buffer = |name, value| {
+            make_storage(
+                &gfx.device,
+                &gfx.queue,
+                name,
+                4,
+                BufInit::U32s(value),
+                false,
+            )
+        };
+        let buffers = HashMap::from([("pixels", buffer("pixels", &[42]))]);
+        let pingpong = HashMap::from([(
+            "history",
+            [buffer("history0", &[17]), buffer("history1", &[29])],
+        )]);
+        const BINDS: BindTable = &[(
+            0,
+            0,
+            BindingKind::StorageReadWrite,
+            BindingUsage::Output,
+            "pixels",
+        )];
+        let cp = ComputePass {
+            label: "test",
+            module: "test",
+            bindings: BINDS,
+            stages: vec![ComputeStage {
+                entry: "update",
+                groups: [1, 1, 1],
+                bindings: BINDS,
+            }],
+            out_bytes: uniform_output_bytes,
+            runtime_counts: [0, 0],
+        };
+        let graph = Graph {
+            resources: vec![],
+            passes: vec![Pass::Compute(cp.clone())],
+            names: &[],
+        };
+        let image_views = HashMap::new();
+        let img_formats = HashMap::new();
+        let module = gfx.device.create_shader_module(wgpu::ShaderModuleDescriptor { label:Some("binding growth test"),source:wgpu::ShaderSource::Wgsl(
+            "@group(0) @binding(0) var<storage,read_write> data: array<u32>; @compute @workgroup_size(1) fn update() { data[0] = data[0] + 1u; }".into()) });
+        let built = build_compute(
+            &gfx.device,
+            &module,
+            &cp,
+            Res {
+                buffers: &buffers,
+                pp: &pingpong,
+                views: &image_views,
+                img_formats: &img_formats,
+            },
+            &graph,
+        );
+        let mut renderer = Renderer {
+            gfx,
+            buffers,
+            pingpong,
+            image_views,
+            img_formats,
+            blocks: vec![],
+            depth_view: None,
+            passes: vec![BuiltPass::Compute(built)],
+            graph,
+            output_sizes: vec![(cp.clone(), 2, "pixels"), (cp, 2, "history")],
+            frame: 0,
+            start: Instant::now(),
+        };
+        let snapshot = |w: f32, h: f32| {
+            HashMap::from([("frame", [w.to_le_bytes(), h.to_le_bytes()].concat())])
+        };
+        renderer.grow_outputs(&snapshot(64.0, 32.0));
+        assert_eq!(renderer.buffers["pixels"].size(), 8192);
+        assert!(renderer.pingpong["history"]
+            .iter()
+            .all(|b| b.size() == 8192));
+        renderer.grow_outputs(&snapshot(128.0, 65.0));
+        assert_eq!(renderer.buffers["pixels"].size(), 4 * 128 * 65);
+        renderer.grow_outputs(&snapshot(0.0, 32.0));
+        assert_eq!(
+            renderer.buffers["pixels"].size(),
+            4 * 128 * 65,
+            "zero logical size need not shrink capacity"
+        );
+
+        let readback = renderer.gfx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("growth check"),
+            size: 12,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = renderer
+            .gfx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // Execute through the refreshed bind group. A stale binding would write
+        // the old buffer and leave the newly allocated output unchanged.
+        {
+            let BuiltPass::Compute(built) = &renderer.passes[0] else {
+                unreachable!()
+            };
+            let stage = &built.stages[0];
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&stage.pipeline);
+            for (set, group) in &stage.sets[0] {
+                pass.set_bind_group(*set, group, &[]);
+            }
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        for (i, buffer) in [
+            &renderer.buffers["pixels"],
+            &renderer.pingpong["history"][0],
+            &renderer.pingpong["history"][1],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            encoder.copy_buffer_to_buffer(buffer, 0, &readback, i as u64 * 4, 4);
+        }
+        renderer.gfx.queue.submit([encoder.finish()]);
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |result| result.unwrap());
+        renderer
+            .gfx
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .unwrap();
+        let bytes = readback.slice(..).get_mapped_range();
+        let values: Vec<_> = bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, [43, 17, 29]);
+    }
 }
