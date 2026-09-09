@@ -52,13 +52,13 @@ module clouds = {
   -- Sky colour along a normalized view ray: a pale backdrop below the cloud horizon,
   -- a horizon->zenith gradient above it, with the projected cloud sheet over it.
   def sky(rd: vec3f32) vec3f32 =
-    let e = rd.y + HORIZ in
-    if e <= 0.0 then VOID
+    let horizon_height = rd.y + HORIZ in
+    if horizon_height <= 0.0 then VOID
     else
-      let grad = mix(HORIZON, ZENITH, sat(rd.y * 2.0 + 0.2))
-      let uv   = @[rd.x, rd.z] * (1.0 / e)     -- planar projection; blows up at the horizon
-      let cov  = coverage(uv)
-      let fade = sat(e * 10.0)                  -- ease clouds in above the horizon
-      let shade = mix(DARK, LIT, sat(cov * 1.3)) in
-      mix(grad, shade, cov * fade)
+      let sky_gradient = mix(HORIZON, ZENITH, sat(rd.y * 2.0 + 0.2))
+      let uv   = rd.xz * (1.0 / horizon_height)     -- planar projection; blows up at the horizon
+      let cloud_coverage  = coverage(uv)
+      let fade = sat(horizon_height * 10.0)                  -- ease clouds in above the horizon
+      let cloud_color = mix(DARK, LIT, sat(cloud_coverage * 1.3)) in
+      mix(sky_gradient, cloud_color, cloud_coverage * fade)
 }

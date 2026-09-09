@@ -57,8 +57,8 @@ def pack_paint_item(it: paint_item) vec4f32 =
 type ground_vertex = { pos: vec3f32, kind: f32, nrm: vec3f32, attr: f32 }
 
 def ground_vertex_from_packed(pos: vec4f32, nrm: vec4f32) ground_vertex =
-  { pos = @[pos.x, pos.y, pos.z], kind = pos.w,
-    nrm = @[nrm.x, nrm.y, nrm.z], attr = nrm.w }
+  { pos = pos.xyz, kind = pos.w,
+    nrm = nrm.xyz, attr = nrm.w }
 
 -- Rendering.
 def GROUND_HALF: f32 = 20.0    -- half-size of the ground quad (40 m patch)
@@ -93,19 +93,19 @@ def ground_vertex_at(vertex_index: i32, items: []vec4f32, points: []vec2f32) gro
     let p = rect_vertex(@[0.0, 0.0], GROUND_HALF, GROUND_HALF, vertex_index) in
     { pos = @[p.x, 0.0, p.y], kind = 0.0, nrm = up, attr = 0.0 }
   else
-    let vi = vertex_index - TESS_BASE
-    let local = vi % TESS_VPI
-    let item = paint_item_from_packed(items[vi / TESS_VPI]) in
+    let item_vertex_index = vertex_index - TESS_BASE
+    let vertex_in_item = item_vertex_index % TESS_VPI
+    let item = paint_item_from_packed(items[item_vertex_index / TESS_VPI]) in
     if item.kind < 0.5 then empty
     else if item.kind > 2.5 then
-      if local < 6 then
-        let p = rect_vertex(points[item.point_start], BUILD_HX, BUILD_HZ, local) in
+      if vertex_in_item < 6 then
+        let p = rect_vertex(points[item.point_start], BUILD_HX, BUILD_HZ, vertex_in_item) in
         { pos = @[p.x, 0.0, p.y], kind = item.kind, nrm = up, attr = 1.0 }
       else { pos = @[0.0, 0.0, 0.0], kind = 0.0, nrm = up, attr = 1.0 }
     else
-      let span = local / TESS_VPS
-      let sub = (local % TESS_VPS) / 6
-      let corner = local % 6 in
+      let span = vertex_in_item / TESS_VPS
+      let subsegment = (vertex_in_item % TESS_VPS) / 6
+      let corner = vertex_in_item % 6 in
       if span >= item.point_count - 1 then empty
       else
         let start = item.point_start
@@ -113,16 +113,16 @@ def ground_vertex_at(vertex_index: i32, items: []vec4f32, points: []vec2f32) gro
         let p2 = points[start + span + 1]
         let p0 = if span > 0 then points[start + span - 1] else p1
         let p3 = if span + 2 < item.point_count then points[start + span + 2] else p2
-        let u0 = f32(sub) / f32(CR_SUB)
-        let u1 = f32(sub + 1) / f32(CR_SUB)
+        let u0 = f32(subsegment) / f32(CR_SUB)
+        let u1 = f32(subsegment + 1) / f32(CR_SUB)
         let (position, edge) = curves.ribbon_vertex(p0, p1, p2, p3, u0, u1, item.param, corner) in
         { pos = @[position.x, 0.0, position.y], kind = item.kind, nrm = up, attr = edge }
 
 -- Pack position/kind and normal/edge into the two render streams.
 def ground_pos(vertex_index: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
   let vertex = ground_vertex_at(vertex_index, items, points) in
-  @[vertex.pos.x, vertex.pos.y, vertex.pos.z, vertex.kind]
+  @[vertex.pos..., vertex.kind]
 
 def ground_nrm(vertex_index: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
   let vertex = ground_vertex_at(vertex_index, items, points) in
-  @[vertex.nrm.x, vertex.nrm.y, vertex.nrm.z, vertex.attr]
+  @[vertex.nrm..., vertex.attr]

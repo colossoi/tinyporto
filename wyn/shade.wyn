@@ -23,9 +23,9 @@ def sun: vec3f32 = normalize(SUN_DIR)
 -- Keep a little sunlight even in full shadow to approximate bounced light.
 def lit_ao_sh(albedo: vec3f32, n: vec3f32, ao: f32, sh: f32) vec3f32 =
   let ndl = clamp01(dot(n, sun))
-  let occ = 1.0 - 0.75 * clamp01(ao)
-  let sunvis = 1.0 - 0.85 * clamp01(sh) in
-  albedo * (AMBIENT * v3(occ) + SUN_COLOR * v3(ndl * sunvis))
+  let ambient_visibility = 1.0 - 0.75 * clamp01(ao)
+  let sun_visibility = 1.0 - 0.85 * clamp01(sh) in
+  albedo * (AMBIENT * v3(ambient_visibility) + SUN_COLOR * v3(ndl * sun_visibility))
 
 def tonemap_aces(x: vec3f32) vec3f32 =
   let a = 2.51
@@ -40,7 +40,7 @@ def tonemap_aces(x: vec3f32) vec3f32 =
 -- (1 = fully occluded); `shc`/`shm_frac` are the contact-march and sun-shadow-map
 -- occlusion, combined by `max` (either one blocks the sun).
 def shade_surface(albedo: vec3f32, n: vec3f32, ao: f32, shc: f32, shm_frac: f32) vec4f32 =
-  let sh = f32.max(shc, shm_frac)
-  let col = lit_ao_sh(albedo, n, ao, sh)
-  let m = tonemap_aces(col) in
-  @[m.x, m.y, m.z, 1.0]
+  let occlusion = f32.max(shc, shm_frac)
+  let lit_color = lit_ao_sh(albedo, n, ao, occlusion)
+  let tonemapped_color = tonemap_aces(lit_color) in
+  @[tonemapped_color..., 1.0]

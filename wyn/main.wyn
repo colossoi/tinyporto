@@ -166,29 +166,28 @@ def PROP_SLOTS: i32 = PROP_SETTS + PROP_WALLS
 
 -- Wall visibility tests each live block against the camera frustum.
 def wall_visible(frame: frame_globals, wall_brick_index: i32) bool =
-  let brk = wall_brick(wall_brick_index)
-  let center = brk.center in
-  if center.y <= 0.0 then false
-  else frustum_keep(center, magnitude(brk.half), frame.resolution, camera_from_frame(frame))
+  let brick = wall_brick(wall_brick_index) in
+  if brick.center.y <= 0.0 then false
+  else frustum_keep(brick.center, magnitude(brick.half), frame.resolution, camera_from_frame(frame))
 
 -- One surviving wall block. Blocks carry their own half-extents and a yaw; a tiny
 -- corner radius keeps the edges crisp. `kind` (0 brick, 1 quoin, 2 grout) selects
 -- colour here and is not carried into the draw stream.
 def wall_prop(wall_brick_index: i32) prop =
-  let brk = wall_brick(wall_brick_index)
-  let center = brk.center
-  let (right, up, fwd) = gfx.transform.yaw_basis(brk.yaw)
-  let kind = f32(brk.kind)
+  let brick = wall_brick(wall_brick_index)
+  let center = brick.center
+  let (right, up, forward) = gfx.transform.yaw_basis(brick.yaw)
+  let kind = f32(brick.kind)
   -- Tone seeds from the stable, baked centre — bricks mix two fired-clay tones by a
   -- position hash; quoins are pale limestone with only a faint lightness wobble.
-  let cv = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0))
+  let brightness = brick_hash(i32(center.x * 53.0 + center.z * 131.0 + center.y * 311.0 + 10000.0))
   let hue = brick_hash(i32(center.x * 97.0 + center.z * 57.0 + center.y * 181.0 + 10000.0))
   let albedo = if kind > 1.5 then GROUT_COLOR
-               else if kind > 0.5 then QUOIN_COLOR * v3(0.90 + 0.16 * cv)
-               else mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * cv)
+               else if kind > 0.5 then QUOIN_COLOR * v3(0.90 + 0.16 * brightness)
+               else mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * brightness)
   in
-  { center = center, radius = 0.004, half = brk.half,
-    right = right, up = up, fwd = fwd, albedo = albedo }
+  { center = center, radius = 0.004, half = brick.half,
+    right = right, up = up, fwd = forward, albedo = albedo }
 
 -- Filter original candidate indices before constructing their full prop records.
 def prop_index_visible(frame: frame_globals, painted_scene: painted,
@@ -210,24 +209,20 @@ def cull_props(painted_scene: painted, frame: frame_globals,
                occlusion_depth: []f32) visibility =
   let live_indices =
     filter(|i| prop_index_visible(frame, painted_scene, occlusion_depth, i), iota(PROP_SLOTS))
-  let live = map(prop_from_index, live_indices) in
-  { prop_inst = live, draw = prop_draw(length(live_indices)) }
+  let visible_props = map(prop_from_index, live_indices) in
+  { prop_inst = visible_props, draw = prop_draw(length(live_indices)) }
 
 -- Minimum depth per coarse tile, saved for next frame's visibility tests.
 -- Clamp reads at partial edge tiles so out-of-bounds depth cannot fake an occluder.
 def occ_reduce_tile(scene: render_target<gbuffer>, resolution: vec3f32,
                     tile: vec2i32) f32 =
-  let mx = i32(resolution.x) - 1
-  let my = i32(resolution.y) - 1
-  let tx = tile.x
-  let ty = tile.y
-  let m =
-    loop m = 1.0 for k < 64 do
-      let sx = clampi(tx * OCC_TILE + (k % OCC_TILE), 0, mx)
-      let sy = clampi(ty * OCC_TILE + (k / OCC_TILE), 0, my)
-      let v = target_load(scene, @[sx, sy], 0u32).depth in
-      f32.min(m, v) in
-  m
+  let max_x = i32(resolution.x) - 1
+  let max_y = i32(resolution.y) - 1 in
+  loop nearest_depth = 1.0 for k < 64 do
+    let sx = clampi(tile.x * OCC_TILE + (k % OCC_TILE), 0, max_x)
+    let sy = clampi(tile.y * OCC_TILE + (k / OCC_TILE), 0, max_y)
+    let sample_depth = target_load(scene, @[sx, sy], 0u32).depth in
+    f32.min(nearest_depth, sample_depth)
 
 ------------------------------------------------------------
 -- Deferred G-buffer. The scene fragments
@@ -246,13 +241,11 @@ def scene_vertex(frame: frame_globals, vertex_positions: []vec4f32,
                  vertex_normals: []vec4f32, vertex_index: u32,
                  _instance_index: u32, _draw_index: u32)
   vertex<scene_varying> =
-  let vid = i32(vertex_index)
-  let p = vertex_positions[vid]
-  let n = vertex_normals[vid]
-  let v = ground_vertex_from_packed(p, n) in
+  let index = i32(vertex_index)
+  let vertex = ground_vertex_from_packed(vertex_positions[index], vertex_normals[index]) in
   vertex_output(
-    world_to_clip(v.pos, frame.resolution, camera_from_frame(frame)),
-    { kind = v.kind, attr = v.attr, normal = v.nrm })
+    world_to_clip(vertex.pos, frame.resolution, camera_from_frame(frame)),
+    { kind = vertex.kind, attr = vertex.attr, normal = vertex.nrm })
 
 def item_color(kind: f32) vec3f32 =
   if kind < 0.5 then SAND_COLOR
@@ -266,15 +259,12 @@ def item_color(kind: f32) vec3f32 =
 -- @0, world normal @1, window depth @2 (also feeds the Hi-Z pyramid). No lighting.
 def scene_fragment(value: scene_varying, position: vec4f32,
                    _front_facing: bool, _primitive_index: u32, _sample_index: u32) gbuffer =
-  let kind = value.kind
-  let attr = value.attr
-  let normal = value.normal
-  let nrm = normalize(normal)
-  let base = item_color(kind)
-  let edge = smoothstep(0.78, 1.0, f32.abs(attr))
-  let surf = mix(base, OUTLINE_COLOR, edge * 0.5) in
-  { albedo = @[surf.x, surf.y, surf.z, 1.0],
-    normal = @[nrm.x, nrm.y, nrm.z, 1.0],
+  let normal = normalize(value.normal)
+  let base = item_color(value.kind)
+  let edge = smoothstep(0.78, 1.0, f32.abs(value.attr))
+  let surface_color = mix(base, OUTLINE_COLOR, edge * 0.5) in
+  { albedo = @[surface_color..., 1.0],
+    normal = @[normal..., 1.0],
     depth = position.z }
 
 ------------------------------------------------------------
@@ -291,21 +281,19 @@ def scene_fragment(value: scene_varying, position: vec4f32,
 -- Box-local proxy corner -> world, using the instance's own basis and half-extents.
 -- `box_pos` has y in [0,1]; centring it (y - 0.5) makes the box tilt about its middle.
 def prop_world(prop_instance: prop, local_position: vec3f32) vec3f32 =
-  let lc = @[local_position.x * (prop_instance.half.x * 2.0),
+  let centered_position = @[local_position.x * (prop_instance.half.x * 2.0),
              (local_position.y - 0.5) * (prop_instance.half.y * 2.0),
              local_position.z * (prop_instance.half.z * 2.0)] in
-  prop_instance.center + gfx.transform.orient(lc, prop_instance.right, prop_instance.up, prop_instance.fwd)
+  prop_instance.center + gfx.transform.orient(centered_position, prop_instance.right, prop_instance.up, prop_instance.fwd)
 
 type prop_varying = { world: vec3f32, instance: u32 }
 
 def prop_vertex(frame: frame_globals, prop_instances: []prop,
                 vertex_index: u32, instance_index: u32,
                 _draw_index: u32) vertex<prop_varying> =
-  let vid = i32(vertex_index)
-  let iid = i32(instance_index)
-  let p = prop_instances[iid]
-  let world = prop_world(p, box_pos[vid]) in
-  -- `iid` rides through as a varying: it is constant across the primitive, so any
+  let instance = prop_instances[i32(instance_index)]
+  let world = prop_world(instance, box_pos[i32(vertex_index)]) in
+  -- `instance_index` rides through as a varying: it is constant across the primitive, so any
   -- interpolation returns it unchanged, and the fragment re-reads the instance
   -- instead of carrying its whole record through the rasterizer. The compacted
   -- stream contains no center.y <= 0 tombstones.
@@ -318,33 +306,33 @@ def prop_vertex(frame: frame_globals, prop_instances: []prop,
 -- grazes a rounded-off corner) discard the fragment to carve the silhouette.
 def prop_fragment(frame: frame_globals, prop_instances: []prop,
                   value: prop_varying) fragment_output<gbuffer> =
-  let world = value.world
-  let p = prop_instances[i32(value.instance)]
-  let r = p.radius
+  let ray_start = value.world
+  let instance = prop_instances[i32(value.instance)]
+  let radius = instance.radius
   -- Trace in box-local space: project the world offset onto the instance's basis.
-  let rd = normalize(world - cam_eye(camera_from_frame(frame)))
+  let ray_direction = normalize(ray_start - cam_eye(camera_from_frame(frame)))
   let (t, hit) =
     loop (t, hit) = (0.0, false) for _i < 24 do
       if hit then (t, hit)
       else
-        let rel = (world + rd * t) - p.center
-        let pl = gfx.transform.unorient(rel, p.right, p.up, p.fwd)
-        let d = sd_round_box(pl, p.half, r) in
-        if d < 0.0004 then (t, true) else (t + d, false)
-  let pos = world + rd * t in
+        let center_offset = (ray_start + ray_direction * t) - instance.center
+        let local_position = gfx.transform.unorient(center_offset, instance.right, instance.up, instance.fwd)
+        let surface_distance = sd_round_box(local_position, instance.half, radius) in
+        if surface_distance < 0.0004 then (t, true) else (t + surface_distance, false)
+  let hit_position = ray_start + ray_direction * t in
   if hit then
-    let rel = pos - p.center
-    let pl = gfx.transform.unorient(rel, p.right, p.up, p.fwd)
-    let nl = round_normal(pl, p.half, r)
-    let n = gfx.transform.orient(nl, p.right, p.up, p.fwd)
-    let clip = world_to_clip(pos, frame.resolution, camera_from_frame(frame))
-    let d = clip.z / clip.w in
+    let center_offset = hit_position - instance.center
+    let local_position = gfx.transform.unorient(center_offset, instance.right, instance.up, instance.fwd)
+    let local_normal = round_normal(local_position, instance.half, radius)
+    let world_normal = gfx.transform.orient(local_normal, instance.right, instance.up, instance.fwd)
+    let clip = world_to_clip(hit_position, frame.resolution, camera_from_frame(frame))
+    let hit_depth = clip.z / clip.w in
     -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
     #depth(
-      { albedo = @[p.albedo.x, p.albedo.y, p.albedo.z, 1.0],
-        normal = @[n.x, n.y, n.z, 1.0],
-        depth = d },
-      d)
+      { albedo = @[instance.albedo..., 1.0],
+        normal = @[world_normal..., 1.0],
+        depth = hit_depth },
+      hit_depth)
   else
     #discard
 
@@ -361,21 +349,19 @@ def prop_fragment(frame: frame_globals, prop_instances: []prop,
 
 def brick_shadow_vertex(vertex_index: u32, instance_index: u32,
                         _draw_index: u32) vertex<()> =
-  let vid = i32(vertex_index)
-  let iid = i32(instance_index)
-  let inst = wall_brick(iid) in
+  let brick = wall_brick(i32(instance_index)) in
   let position =
-    if inst.center.y <= 0.0 then @[2.0, 2.0, 2.0, 1.0]
+    if brick.center.y <= 0.0 then @[2.0, 2.0, 2.0, 1.0]
   else
-    let center = inst.center
-    let cw = f32.cos(inst.yaw)
-    let sw = f32.sin(inst.yaw)
-    let hf = inst.half
-    let local = box_pos[vid]
-    let lx = local.x * (hf.x * 2.0)
-    let ly = (local.y - 0.5) * (hf.y * 2.0)
-    let lz = local.z * (hf.z * 2.0)
-    let world = @[center.x + cw * lx - sw * lz, center.y + ly, center.z + sw * lx + cw * lz] in
+    let center = brick.center
+    let cos_yaw = f32.cos(brick.yaw)
+    let sin_yaw = f32.sin(brick.yaw)
+    let half_extents = brick.half
+    let local = box_pos[i32(vertex_index)]
+    let lx = local.x * (half_extents.x * 2.0)
+    let ly = (local.y - 0.5) * (half_extents.y * 2.0)
+    let lz = local.z * (half_extents.z * 2.0)
+    let world = @[center.x + cos_yaw * lx - sin_yaw * lz, center.y + ly, center.z + sin_yaw * lx + cos_yaw * lz] in
     world_to_light(world) in
   vertex_output(position, ())
 
@@ -389,7 +375,7 @@ def shadow_fragment(_value: (), position: vec4f32,
 -- 20°) and clip planes. Frame 0: no temporal accumulation (we have no TAA), so the
 -- per-pixel noise is static and the denoise pass cleans it up spatially.
 def gtao_consts(resolution: vec3f32) gtao.consts =
-  gtao.make_constants(@[resolution.x, resolution.y], f32.tan(f32.radians(10.0)),
+  gtao.make_constants(resolution.xy, f32.tan(f32.radians(10.0)),
                       CLIP_NEAR, CLIP_FAR, 0u32, gtao.default_settings)
 
 -- Linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
@@ -423,22 +409,22 @@ def gtao_main_pixel(scene: render_target<gbuffer>, constants: gtao.consts,
   let bz = gtao_load_scene_vdepth(scene, constants, pixel.x, pixel.y + 1i32)
   let nrm = gtao.viewspace_normal_from_depths(pixel, cz, lz, rz, tz, bz, constants)
   let packed_edges = gtao.pack_edges(gtao.calculate_edges(cz, lz, rz, tz, bz))
-  let p = gtao.setup_pixel(pixel, cz, constants)
+  let pixel_setup = gtao.setup_pixel(pixel, cz, constants)
   let noise = gtao.spatiotemporal_noise(@[u32(pixel.x), u32(pixel.y)], 0u32)
   let visibility =
-    loop vis = p.visibility_base for slice < 3 do
-      let s = gtao.setup_slice(p, slice, 3, noise.x, nrm) in
+    loop vis = pixel_setup.visibility_base for slice < 3 do
+      let slice_setup = gtao.setup_slice(pixel_setup, slice, 3, noise.x, nrm) in
       let (hc0, hc1) =
-        loop (hc0, hc1) = (s.low_horizon_cos0, s.low_horizon_cos1)
+        loop (hc0, hc1) = (slice_setup.low_horizon_cos0, slice_setup.low_horizon_cos1)
         for step < 3 do
-          let (off, _) = gtao.step_sample(p, s, slice, step, 3, noise.y, constants)
-          let uv0 = p.nsp + off
-          let uv1 = p.nsp - off
-          let sz0 = gtao_load_scene_vdepth_uv(scene, constants, uv0)
-          let sz1 = gtao_load_scene_vdepth_uv(scene, constants, uv1) in
-          gtao.horizon_fold(p, s, uv0, sz0, uv1, sz1, hc0, hc1, constants)
+          let (sample_offset, _) = gtao.step_sample(pixel_setup, slice_setup, slice, step, 3, noise.y, constants)
+          let uv0 = pixel_setup.nsp + sample_offset
+          let uv1 = pixel_setup.nsp - sample_offset
+          let sample_depth0 = gtao_load_scene_vdepth_uv(scene, constants, uv0)
+          let sample_depth1 = gtao_load_scene_vdepth_uv(scene, constants, uv1) in
+          gtao.horizon_fold(pixel_setup, slice_setup, uv0, sample_depth0, uv1, sample_depth1, hc0, hc1, constants)
       in
-      vis + gtao.slice_visibility(s, hc0, hc1)
+      vis + gtao.slice_visibility(slice_setup, hc0, hc1)
   let vis = gtao.finalize_visibility(visibility, 3, constants) in
   @[vis, packed_edges, 0.0, 1.0]
 
@@ -447,17 +433,17 @@ def gtao_main_pixel(scene: render_target<gbuffer>, constants: gtao.consts,
 -- their values feed later work (or the next frame).
 def build_postprocess(scene: render_target<gbuffer>, resolution: vec3f32)
   ([]vec4f32, []f32) =
-  let w = i32(resolution.x)
-  let h = i32(resolution.y)
-  let c = gtao_consts(resolution)
+  let width = i32(resolution.x)
+  let height = i32(resolution.y)
+  let constants = gtao_consts(resolution)
   let ao_work =
-    map(|i| gtao_main_pixel(scene, c, @[i % w, i / w]), iota(w * h))
-  let ow = occ_w(resolution)
-  let oh = occ_h(resolution)
-  let occ_next =
-    map(|i| occ_reduce_tile(scene, resolution, @[i % ow, i / ow]),
-        iota(ow * oh)) in
-  (ao_work, occ_next)
+    map(|i| gtao_main_pixel(scene, constants, @[i % width, i / width]), iota(width * height))
+  let tile_columns = occ_w(resolution)
+  let tile_rows = occ_h(resolution)
+  let next_occlusion =
+    map(|i| occ_reduce_tile(scene, resolution, @[i % tile_columns, i / tile_columns]),
+        iota(tile_columns * tile_rows)) in
+  (ao_work, next_occlusion)
 
 def load_ao_edges(occlusion_samples: []vec4f32, pixel_x: i32, pixel_y: i32,
                   constants: gtao.consts) vec2f32 =
@@ -486,12 +472,12 @@ def denoise_ao(pixel: vec2i32, occlusion_samples: []vec4f32, constants: gtao.con
 -- contact shadows, and the sun shadow map, then applies tonemapping.
 ------------------------------------------------------------
 
--- Sky shade for a G-buffer miss (alb.w < 0.5), sampled along the pixel's view ray.
+-- Sky shade for a G-buffer miss, sampled along the pixel's view ray.
 -- pixel_center uses bottom-up coordinates.
 def shade_sky(resolution: vec3f32, pixel_center: vec2f32, camera: orbit) vec4f32 =
-  let (_ro, rd) = get_ray(resolution, pixel_center, camera)
-  let sc = clouds.sky(rd) in
-  @[sc.x, sc.y, sc.z, 1.0]
+  let (_, ray_direction) = get_ray(resolution, pixel_center, camera)
+  let sky_color = clouds.sky(ray_direction) in
+  @[sky_color..., 1.0]
 
 -- Deferred shade for one pixel: read the thin G-buffer at (x,y) and return its final
 -- colour. Sky pixels get the cloud sky; lit pixels get GTAO (the edge-aware denoise
@@ -502,36 +488,36 @@ def shade_sky(resolution: vec3f32, pixel_center: vec2f32, camera: orbit) vec4f32
 def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
                 occlusion_samples: []vec4f32, frame: frame_globals,
                 painted_scene: painted, pixel_x: i32, pixel_y: i32) vec4f32 =
-  let rx = frame.resolution.x
-  let ry = frame.resolution.y
-  let resl = @[rx, ry, 0.0]
-  let o = camera_from_frame(frame)
+  let width = frame.resolution.x
+  let height = frame.resolution.y
+  let resolution = @[width, height, 0.0]
+  let camera = camera_from_frame(frame)
   let ao_off = (frame.mods & 2u32) != 0u32              -- hold Ctrl to suppress AO
-  let g = target_load(scene, @[pixel_x, pixel_y], 0u32)
-  let alb = g.albedo
-  let fragc = @[f32(pixel_x) + 0.5, ry - (f32(pixel_y) + 0.5)] in    -- pixel centre, bottom-up
-  if alb.w < 0.5 then shade_sky(resl, fragc, o)
+  let surface = target_load(scene, @[pixel_x, pixel_y], 0u32)
+  let pixel_center = @[f32(pixel_x) + 0.5, height - (f32(pixel_y) + 0.5)] in    -- pixel centre, bottom-up
+  if surface.albedo.w < 0.5 then shade_sky(resolution, pixel_center, camera)
   else
-    let gnv = g.normal
-    let n = normalize(@[gnv.x, gnv.y, gnv.z])
-    let cd = g.depth
-    let (_ro, rd) = get_ray(resl, fragc, o)
-    let pg = world_from_depth(resl, fragc, o, cd)           -- the flat-ground hit
-    -- Water (approach A): only a ground-level pixel (world y ~ 0) can be canal. `s0` is its
+    let normal = normalize(surface.normal.xyz)
+    let (_, ray_direction) = get_ray(resolution, pixel_center, camera)
+    let surface_position = world_from_depth(resolution, pixel_center, camera, surface.depth)
+    -- Water (approach A): only a ground-level pixel (world y ~ 0) can be canal. `canal_distance` is its
     -- signed distance to the water edge: < -QUAY_RIM traces the sunken water/quay per
     -- pixel; the [-QUAY_RIM, 0) lip is lit as a wet-stone quay cap; >= 0 is dry land.
-    let s0 = if pg.y < 0.03 then water_sdf(@[pg.x, pg.z], painted_scene.items, painted_scene.points) else 1.0 in
-    if s0 < 0.0 - QUAY_RIM then
-      let wc = shade_water(pg, rd, frame.time, painted_scene.items, painted_scene.points) in
-      @[wc.x, wc.y, wc.z, 1.0]
+    let canal_distance =
+      if surface_position.y < 0.03 then
+        water_sdf(surface_position.xz, painted_scene.items, painted_scene.points)
+      else 1.0 in
+    if canal_distance < 0.0 - QUAY_RIM then
+      let water_color = shade_water(surface_position, ray_direction, frame.time, painted_scene.items, painted_scene.points) in
+      @[water_color..., 1.0]
     else
-      let base = if s0 < 0.0 then QUAY_COLOR else @[alb.x, alb.y, alb.z]
+      let base = if canal_distance < 0.0 then QUAY_COLOR else surface.albedo.xyz
       let ao = if ao_off then 0.0
-               else let (aov, _e) = denoise_ao(@[pixel_x, pixel_y], occlusion_samples, gtao_consts(resl)) in 1.0 - aov
-      let p = pg + n * SH_LIFT
-      let shc = contact_shadow(scene, p, n, resl, o)
-      let shm_frac = sun_shadow_pcf(sun_depth, p, rx, ry) in
-      shade_surface(base, n, ao, shc, shm_frac)
+               else let (visibility, _) = denoise_ao(@[pixel_x, pixel_y], occlusion_samples, gtao_consts(resolution)) in 1.0 - visibility
+      let shadow_origin = surface_position + normal * SH_LIFT
+      let contact_occlusion = contact_shadow(scene, shadow_origin, normal, resolution, camera)
+      let sun_occlusion = sun_shadow_pcf(sun_depth, shadow_origin, width, height) in
+      shade_surface(base, normal, ao, contact_occlusion, sun_occlusion)
 
 ------------------------------------------------------------
 -- Deferred resolve. One fullscreen triangle covers every pixel and its fragment
@@ -551,9 +537,8 @@ def blit_vertex(vertex_index: u32, _instance_index: u32,
 def resolve_fragment(inputs: lighting_inputs, frame: frame_globals,
                      painted_scene: painted, _value: (), position: vec4f32,
                      _front_facing: bool, _primitive_index: u32, _sample_index: u32) vec4f32 =
-  let xy = @[i32(position.x), i32(position.y)] in
   shade_frame(inputs.scene, inputs.sun_depth, inputs.ao_work,
-              frame, painted_scene, xy.x, xy.y)
+              frame, painted_scene, i32(position.x), i32(position.y))
 
 -- Shared opaque-depth state for the sun and scene draws. Physical attachments,
 -- barriers, pipeline order, and indirect command dependencies are derived from
@@ -591,14 +576,14 @@ entry tinyporto_frame(
   let sun_depth = shade_with(opaque_depth, sun, shadow_fragments, shadow_fragment)
 
   -- Fill the scene G-buffer with the ground, then the visible props.
-  let ground_triangles = rasterize_triangles(
+  let ground_fragments = rasterize_triangles(
     indirect_draw(ground.draw),
     scene_vertex(frame, ground.geom_pos, ground.geom_nrm, _, _, _))
-  let ground_image = shade_with(opaque_depth, scene, ground_triangles, scene_fragment)
-  let prop_triangles = rasterize_triangles(
+  let ground_image = shade_with(opaque_depth, scene, ground_fragments, scene_fragment)
+  let prop_fragments = rasterize_triangles(
     indirect_draw(visible.draw), prop_vertex(frame, visible.prop_inst, _, _, _))
   let scene_image = shade_with(
-    opaque_depth, ground_image, prop_triangles,
+    opaque_depth, ground_image, prop_fragments,
     |value, _, _, _, _| prop_fragment(frame, visible.prop_inst, value))
 
   -- Estimate ambient occlusion and save coarse depth for the next frame.

@@ -84,11 +84,11 @@ def sett_hx(sc: f32) f32 = f32.min(BRICK_W * 0.5 * sc, CELLX * 0.5 - SETT_JOINT)
 -- that normal, orienting the rectangular footprint. Vertex (place the proxy) and
 -- fragment (trace) both build this from the stable centre so they agree.
 def sett_basis(cx: f32, cz: f32) (vec3f32, vec3f32, vec3f32) =
-  let s = sett_seed(cx, cz)
-  let tx = (brick_hash(s + 51) - 0.5) * 0.18
-  let tz = (brick_hash(s + 61) - 0.5) * 0.18
+  let seed = sett_seed(cx, cz)
+  let tilt_x = (brick_hash(seed + 51) - 0.5) * 0.18
+  let tilt_z = (brick_hash(seed + 61) - 0.5) * 0.18
   let yaw = sett_yaw(cx, cz)
-  let up = normalize(@[tx, 1.0, tz])
+  let up = normalize(@[tilt_x, 1.0, tilt_z])
   let fwd0 = @[f32.sin(yaw), 0.0, f32.cos(yaw)]
   let right = normalize(cross(up, fwd0))
   let fwd = cross(right, up) in
@@ -148,8 +148,8 @@ def sett_visible(resolution: vec3f32, camera: orbit,
   let center = sett_center(i) in
   if dot(center, center) >= 64.0 then false
   else
-    let c3 = @[center.x, BRICK_H * 0.5, center.y]
-    let clip = world_to_clip(c3, resolution, camera) in
+    let world_center = @[center.x, BRICK_H * 0.5, center.y]
+    let clip = world_to_clip(world_center, resolution, camera) in
     -- 0.25 ≈ the sett proxy's bounding radius (footprint + tilt), generous.
     if !frustum_keep_clip(clip, 0.25, resolution) then false
     -- Hidden only if the nearest recorded surface wins across the whole tile
@@ -162,19 +162,19 @@ def sett_visible(resolution: vec3f32, camera: orbit,
 def sett_prop(i: i32) prop =
   let center = sett_center(i)
   let height = BRICK_H * (0.9625 + 0.075 * brick_hash(i))
-  let ss = sett_scale(center.x, center.y)
+  let scale = sett_scale(center.x, center.y)
   let (right, up, fwd) = sett_basis(center.x, center.y)
-  let half = @[sett_hx(ss), height * 0.5, BRICK_L * 0.5 * ss]
+  let half = @[sett_hx(scale), height * 0.5, BRICK_L * 0.5 * scale]
   -- Roundness spread: some cobbles crisp, some well-rounded (wide variance).
-  let roundfrac = 0.13 + 0.80 * brick_hash(i + 7919)
-  let radius = roundfrac * f32.min(half.x, f32.min(half.y, half.z))
+  let rounding_fraction = 0.13 + 0.80 * brick_hash(i + 7919)
+  let radius = rounding_fraction * f32.min(half.x, f32.min(half.y, half.z))
   -- Colour from three independent hashes: hue (warm greige <-> cool blue-grey),
   -- saturation (mute toward grey <-> enrich the undertone), and lightness. Skewed a
   -- touch dark (mean < 1) so the brightest setts don't blow out through the tonemap.
   let seed = sett_seed(center.x, center.y)
-  let hued = mix(COBBLE_WARM, COBBLE_COOL, brick_hash(seed + 17))
-  let g = (hued.x + hued.y + hued.z) * 0.3333
-  let sat = 0.7 + 0.8 * brick_hash(seed + 29)
-  let albedo = mix(v3(g), hued, sat) * v3(0.5 + 0.9 * sett_var(center.x, center.y)) in
+  let hue_color = mix(COBBLE_WARM, COBBLE_COOL, brick_hash(seed + 17))
+  let gray = (hue_color.x + hue_color.y + hue_color.z) * 0.3333
+  let saturation = 0.7 + 0.8 * brick_hash(seed + 29)
+  let albedo = mix(v3(gray), hue_color, saturation) * v3(0.5 + 0.9 * sett_var(center.x, center.y)) in
   { center = @[center.x, height * 0.5, center.y], radius = radius, half = half,
     right = right, up = up, fwd = fwd, albedo = albedo }

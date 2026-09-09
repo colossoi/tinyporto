@@ -87,16 +87,16 @@ def wall_courses(h: f32) (i32, f32) =
 def quoin(qi: i32) block =
   let corner = qi / QUOIN_COURSES
   let course = qi % QUOIN_COURSES
-  let b = corner / 4
-  let csel = corner % 4
-  let (cx, cz, hw, hd, h) = building_rect(b)
-  let qx = if csel == 1 || csel == 2 then cx + hw else cx - hw
-  let qz = if csel == 2 || csel == 3 then cz + hd else cz - hd
+  let building_index = corner / 4
+  let corner_in_building = corner % 4
+  let (cx, cz, hw, hd, h) = building_rect(building_index)
+  let qx = if corner_in_building == 1 || corner_in_building == 2 then cx + hw else cx - hw
+  let qz = if corner_in_building == 2 || corner_in_building == 3 then cz + hd else cz - hd
   let (_, pad) = wall_courses(h)
-  let fh = h - 2.0 * pad                                    -- brick-field height
-  let n = i32(f32.max(1.0, f32.floor(fh / (QUOIN_TH + QUOIN_GAP_V) + 0.5)))  -- courses to fill it
-  let pitch = fh / f32(n)                                   -- stretched to reach the top exactly
-  let qy = if course >= n then 0.0 - 1.0 else pad + f32(course) * pitch + pitch * 0.5 in
+  let brick_field_height = h - 2.0 * pad
+  let course_count = i32(f32.max(1.0, f32.floor(brick_field_height / (QUOIN_TH + QUOIN_GAP_V) + 0.5)))  -- courses to fill it
+  let pitch = brick_field_height / f32(course_count)  -- stretch to reach the top exactly
+  let qy = if course >= course_count then 0.0 - 1.0 else pad + f32(course) * pitch + pitch * 0.5 in
   { center = @[qx, qy, qz], yaw = 0.0, kind = 1u32,
     half = @[QUOIN_HX, (pitch - QUOIN_GAP_V) * 0.5, QUOIN_HZ] }
 
@@ -104,14 +104,14 @@ def quoin(qi: i32) block =
 -- wall's local frame (x along, z thickness) so `yaw` orients it like the bricks.
 -- GROUT_EXTENT insets its face, GROUT_DEPTH recesses its thickness.
 def grout(gi: i32) block =
-  let (a, bb, h, yaw) = wall(gi)
-  let len = distance(a, bb)
+  let (start, end, h, yaw) = wall(gi)
+  let wall_length = distance(start, end)
   let (_, pad) = wall_courses(h)
-  let mx = (a.x + bb.x) * 0.5
-  let mz = (a.y + bb.y) * 0.5
+  let mx = (start.x + end.x) * 0.5
+  let mz = (start.y + end.y) * 0.5
   let my = if wall_has_grout(gi) then h * 0.5 else 0.0 - 1.0 in
   { center = @[mx, my, mz], yaw = yaw, kind = 2u32,
-    half = @[f32.max(len * 0.5 - GROUT_EXTENT, 0.0),
+    half = @[f32.max(wall_length * 0.5 - GROUT_EXTENT, 0.0),
              f32.max(h * 0.5 - pad - GROUT_EXTENT, 0.0),
              BRK_HZ * GROUT_DEPTH] }
 
@@ -124,9 +124,9 @@ def building_rect(b: i32) (f32, f32, f32, f32, f32) =
 -- is 0 for x-aligned sides and pi/2 for z-aligned, so a brick's long (x) axis runs
 -- along the wall. Sides wind around the rectangle so bricks lay A -> B.
 def wall(w: i32) (vec2f32, vec2f32, f32, f32) =
-  let b = w / 4
+  let building_index = w / 4
   let side = w % 4
-  let (cx, cz, hw, hd, h) = building_rect(b)
+  let (cx, cz, hw, hd, h) = building_rect(building_index)
   let x0 = cx - hw
   let x1 = cx + hw
   let z0 = cz - hd
@@ -145,38 +145,38 @@ def wall_brick(i: i32) block =
   if i >= BRICK_SLOTS + QUOIN_SLOTS then grout(i - BRICK_SLOTS - QUOIN_SLOTS)
   else if i >= BRICK_SLOTS then quoin(i - BRICK_SLOTS)
   else
-  let w = i / PER_WALL
-  let local = i % PER_WALL
-  let course = local / PER_COURSE
-  let col = local % PER_COURSE
-  let (a, bb, h, yaw) = wall(w)
-  let len = distance(a, bb)
-  let dir = @[(bb.x - a.x) / len, (bb.y - a.y) / len]
-  let (n_crs, pad_y) = wall_courses(h)                    -- courses (shared with quoins/grout)
-  let off = if (course % 2) == 1 then BRK_LEN * 0.5 else 0.0
+  let wall_index = i / PER_WALL
+  let slot_in_wall = i % PER_WALL
+  let course = slot_in_wall / PER_COURSE
+  let col = slot_in_wall % PER_COURSE
+  let (start, end, h, yaw) = wall(wall_index)
+  let wall_length = distance(start, end)
+  let dir = @[(end.x - start.x) / wall_length, (end.y - start.y) / wall_length]
+  let (course_count, pad_y) = wall_courses(h)                    -- courses (shared with quoins/grout)
+  let course_offset = if (course % 2) == 1 then BRK_LEN * 0.5 else 0.0
   -- Per-brick jitter, keyed on the STABLE index i (so a brick's look survives
   -- compaction). Wall bricks are neatly laid — only a faint hand-laid wobble.
   -- `perp` is the horizontal out-of-wall axis.
-  let ja = (brick_hash(i * 4 + 1) - 0.5) * 0.012
-  let jp = (brick_hash(i * 4 + 2) - 0.5) * 0.010
-  let jv = (brick_hash(i * 4 + 3) - 0.5) * 0.007
-  let jyaw = (brick_hash(i * 4 + 5) - 0.5) * 0.05
-  let js = (brick_hash(i * 4 + 6) - 0.5) * BRK_SIZE_VAR  -- per-brick size wobble
+  let along_jitter = (brick_hash(i * 4 + 1) - 0.5) * 0.012
+  let outward_jitter = (brick_hash(i * 4 + 2) - 0.5) * 0.010
+  let height_jitter = (brick_hash(i * 4 + 3) - 0.5) * 0.007
+  let yaw_jitter = (brick_hash(i * 4 + 5) - 0.5) * 0.05
+  let size_jitter = (brick_hash(i * 4 + 6) - 0.5) * BRK_SIZE_VAR  -- per-brick size wobble
   -- Flush running bond: the brick's cell sits on a fixed pitch from the wall start
-  -- (offset shifts odd courses left half a cell), then is CLIPPED to [0, len]. The
+  -- (offset shifts odd courses left half a cell), then is CLIPPED to [0, wall_length]. The
   -- clip turns the poking end cells into the part-bricks that close each course, so
   -- every course fills the wall edge to edge under the quoins.
-  let s0 = f32(col) * BRK_LEN - off + ja                 -- nominal near edge along the wall
-  let s1 = s0 + BRK_HX * 2.0                              -- nominal far edge (full brick length)
-  let cs = f32.max(s0, 0.0)
-  let ce = f32.min(s1, len)
-  let bw = ce - cs                                        -- clipped length (a part-brick at the ends)
-  let along = (cs + ce) * 0.5                             -- centre of the clipped cell
-  let dead = course >= n_crs || bw < 0.03                -- past the top, or a sliver
+  let cell_start = f32(col) * BRK_LEN - course_offset + along_jitter                 -- nominal near edge along the wall
+  let cell_end = cell_start + BRK_HX * 2.0                              -- nominal far edge (full brick length)
+  let clipped_start = f32.max(cell_start, 0.0)
+  let clipped_end = f32.min(cell_end, wall_length)
+  let brick_length = clipped_end - clipped_start                                        -- clipped length (a part-brick at the ends)
+  let along = (clipped_start + clipped_end) * 0.5                             -- centre of the clipped cell
+  let dead = course >= course_count || brick_length < 0.03                -- past the top, or a sliver
   let px = 0.0 - dir.y
   let pz = dir.x
-  let cx = a.x + dir.x * along + px * jp
-  let cz = a.y + dir.y * along + pz * jp
-  let cy = if dead then 0.0 - 1.0 else pad_y + f32(course) * BRK_CRS + BRK_HY + jv in
-  { center = @[cx, cy, cz], yaw = yaw + jyaw, kind = 0u32,
-    half = @[f32.max(bw * 0.5 + js, 0.008), BRK_HY + js * 0.4, BRK_HZ] }
+  let cx = start.x + dir.x * along + px * outward_jitter
+  let cz = start.y + dir.y * along + pz * outward_jitter
+  let cy = if dead then 0.0 - 1.0 else pad_y + f32(course) * BRK_CRS + BRK_HY + height_jitter in
+  { center = @[cx, cy, cz], yaw = yaw + yaw_jitter, kind = 0u32,
+    half = @[f32.max(brick_length * 0.5 + size_jitter, 0.008), BRK_HY + size_jitter * 0.4, BRK_HZ] }

@@ -1,5 +1,10 @@
 # Uniform-sized output has no allocation domain
 
+**Allocation issue fixed.** The installed compiler now emits a host-expression
+output length. Its dispatch still covers only one workgroup; see
+[the dispatch follow-up](uniform_dispatch.md). The original allocation failure
+is recorded below.
+
 `wyn build --graphics` succeeds, but Tiny Porto's driver build panics at
 `driver/build.rs:342`: `same_as_dispatch needs a buffer-derived dispatch`.
 

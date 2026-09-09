@@ -49,23 +49,23 @@ def stroke_head_from_buffer(xs: []f32) stroke_head =
     have_dir = xs[9] }
 
 def pack_stroke_head(h: stroke_head) [12]f32 =
-  [f32(h.point_count), f32(h.item_count), h.held, h.anchor.x, h.anchor.y,
-   h.dir.x, h.dir.y, h.last.x, h.last.y, h.have_dir, 0.0, 0.0]
+  [f32(h.point_count), f32(h.item_count), h.held, h.anchor...,
+   h.dir..., h.last..., h.have_dir, 0.0, 0.0]
 
 -- Screen pixel -> ground-plane point (same ray as the rendered cursor). `py` is
 -- top-left pixel Y (as events carry it); flip to the bottom-left ray convention.
 def screen_to_ground(resolution: vec3f32, o: orbit, px: f32, py: f32) vec2f32 =
-  let mc = @[px, resolution.y - py]
-  let (ro, rd) = get_ray(resolution, mc, o) in
-  (ro + rd * v3(ground_t(ro, rd))).xz
+  let pixel = @[px, resolution.y - py]
+  let (ray_origin, ray_direction) = get_ray(resolution, pixel, o) in
+  (ray_origin + ray_direction * v3(ground_t(ray_origin, ray_direction))).xz
 
 -- Tab cycles the active tool; L toggles the overlay.
 def apply_ui_shortcuts(previous_ui: ui_state, events: []vec4f32) ui_state =
   let (tool, overlay) =
     loop (tool, overlay) = (previous_ui.tool, previous_ui.overlay) for k < EV_CAP do
-      let e = events[k]
-      let kind = i32(e.x) / 256i32
-      let code = i32(e.y) in
+      let event = events[k]
+      let kind = i32(event.x) / 256i32
+      let code = i32(event.y) in
       if kind == EV_KEYDOWN && code == KEY_TAB then (f32((i32(tool) + 1) % 3), overlay)
       else if kind == EV_KEYDOWN && code == KEY_L then (tool, 1.0 - overlay)
       else (tool, overlay) in
@@ -73,7 +73,7 @@ def apply_ui_shortcuts(previous_ui: ui_state, events: []vec4f32) ui_state =
 
 -- Stroke fold: thread the Reumann-Witkam strip (anchor/dir/last/have_dir) + held
 -- through the frame's mouse events IN ORDER, committing control points into a
--- fixed emit array `em` at a running count `ec`. MouseDown starts a stroke and
+-- fixed emit array `emitted_points` at a running count `emitted_count`. MouseDown starts a stroke and
 -- plants its first point (a building plants only this one); MouseMove advances the
 -- RW strip; MouseUp snaps a final point. Every emit is guarded by the EMIT_CAP
 -- array bound (a very fast drag past the cap loses its tail — a soft limit).
@@ -87,37 +87,41 @@ type stroke_capture = {
 def capture_stroke_points(previous_head: stroke_head, events: []vec4f32,
                           resolution: vec3f32, camera: orbit, is_building: bool) stroke_capture =
   let z2 = @[0.0, 0.0]
-  let (anchor, dir, last, hd, held, press, ec, em) =
-    loop (anchor, dir, last, hd, held, press, ec, em) =
+  let (anchor, dir, last, direction_flag, held, press, emitted_count, emitted_points) =
+    loop (anchor, dir, last, direction_flag, held, press, emitted_count, emitted_points) =
        (previous_head.anchor, previous_head.dir, previous_head.last,
         previous_head.have_dir, previous_head.held, 0.0, 0i32,
         [z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2, z2])
     for k < EV_CAP do
-      let e = events[k]
-      let kind = i32(e.x) / 256i32
-      let code = i32(e.y)
-      let cur = screen_to_ground(resolution, camera, e.z, e.w) in
+      let event = events[k]
+      let kind = i32(event.x) / 256i32
+      let code = i32(event.y)
+      let ground_sample = screen_to_ground(resolution, camera, event.z, event.w) in
       if kind == EV_MOUSEDOWN && code == BTN_LEFT then
         -- Press: start the strip, plant the first point.
-        if ec < EMIT_CAP then (cur, z2, cur, 0.0, 1.0, 1.0, ec + 1i32, em with [ec] = cur)
-        else (cur, z2, cur, 0.0, 1.0, 1.0, ec, em)
+        if emitted_count < EMIT_CAP then
+          (ground_sample, z2, ground_sample, 0.0, 1.0, 1.0,
+           emitted_count + 1i32, emitted_points with [emitted_count] = ground_sample)
+        else (ground_sample, z2, ground_sample, 0.0, 1.0, 1.0, emitted_count, emitted_points)
       else if kind == EV_MOUSEMOVE && held > 0.5 && (!is_building) then
-        if distance(cur, last) > STEP then
-          let (emit, pos, na, nd, nl, nhd) =
-            curves.reumann_witkam_advance(anchor, dir, last, hd > 0.5, cur, CORRIDOR, MAXCHORD)
-          let hdf = if nhd then 1.0 else 0.0 in
-          if emit && ec < EMIT_CAP then (na, nd, nl, hdf, held, press, ec + 1i32, em with [ec] = pos)
-          else (na, nd, nl, hdf, held, press, ec, em)
-        else (anchor, dir, last, hd, held, press, ec, em)
+        if distance(ground_sample, last) > STEP then
+          let (emit, emitted_point, next_anchor, next_direction, next_sample, has_direction) =
+            curves.reumann_witkam_advance(anchor, dir, last, direction_flag > 0.5, ground_sample, CORRIDOR, MAXCHORD)
+          let next_direction_flag = if has_direction then 1.0 else 0.0 in
+          if emit && emitted_count < EMIT_CAP then
+            (next_anchor, next_direction, next_sample, next_direction_flag, held, press,
+             emitted_count + 1i32, emitted_points with [emitted_count] = emitted_point)
+          else (next_anchor, next_direction, next_sample, next_direction_flag, held, press, emitted_count, emitted_points)
+        else (anchor, dir, last, direction_flag, held, press, emitted_count, emitted_points)
       else if kind == EV_MOUSEUP && code == BTN_LEFT then
         -- Release: snap a final point for a non-building stroke, then clear held.
-        if held > 0.5 && (!is_building) && distance(last, anchor) > 0.05 && ec < EMIT_CAP then
-          (anchor, dir, last, hd, 0.0, press, ec + 1i32, em with [ec] = last)
-        else (anchor, dir, last, hd, 0.0, press, ec, em)
-      else (anchor, dir, last, hd, held, press, ec, em) in
+        if held > 0.5 && (!is_building) && distance(last, anchor) > 0.05 && emitted_count < EMIT_CAP then
+          (anchor, dir, last, direction_flag, 0.0, press, emitted_count + 1i32, emitted_points with [emitted_count] = last)
+        else (anchor, dir, last, direction_flag, 0.0, press, emitted_count, emitted_points)
+      else (anchor, dir, last, direction_flag, held, press, emitted_count, emitted_points) in
   { head = { point_count = previous_head.point_count, item_count = previous_head.item_count,
-             anchor = anchor, dir = dir, last = last, have_dir = hd, held = held },
-    pressed = press, emitted_count = ec, emitted = em }
+             anchor = anchor, dir = dir, last = last, have_dir = direction_flag, held = held },
+    pressed = press, emitted_count = emitted_count, emitted = emitted_points }
 
 -- Counts stop at the fixed buffer capacities, even if capture emits more points.
 def record_capture_progress(previous_head: stroke_head, capture: stroke_capture) stroke_head =

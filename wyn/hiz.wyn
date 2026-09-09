@@ -40,16 +40,16 @@ def occ_hidden(ndcz: f32, max_occ: f32) bool = max_occ < 0.9999 && ndcz > max_oc
 -- The latest unified pipeline model represents this temporal result as an ordinary
 -- array value returned by one frame and supplied to the next.
 def occ_test(od: []f32, clip: vec4f32, resolution: vec3f32) bool =
-  let (ndcz, tx, ty, infront) = occ_tile(clip, resolution, OCC_TILE) in
-  if !infront then false
+  let (ndcz, tx, ty, in_front_of_eye) = occ_tile(clip, resolution, OCC_TILE) in
+  if !in_front_of_eye then false
   else
     let ow = occ_w(resolution)
     let oh = occ_h(resolution)
-    let mo =
-      loop mo = 0.0 for k < 9 do
+    let farthest_tile_depth =
+      loop farthest_tile_depth = 0.0 for k < 9 do
         let cx = clampi(tx + (k % 3 - 1), 0, ow - 1)
         let cy = clampi(ty + (k / 3 - 1), 0, oh - 1)
-        let v = od[cy * ow + cx] in
-        f32.max(mo, v)
+        let tile_depth = od[cy * ow + cx] in
+        f32.max(farthest_tile_depth, tile_depth)
       in
-    occ_hidden(ndcz, mo)
+    occ_hidden(ndcz, farthest_tile_depth)

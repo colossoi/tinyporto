@@ -44,20 +44,20 @@ def seg_dist(p: vec2f32, a: vec2f32, b: vec2f32) f32 =
 -- over all water strokes.
 def water_sdf(p: vec2f32, items: []vec4f32, points: []vec2f32) f32 =
   loop best = 100.0 for ii < MAX_WATER_ITEMS do
-    let it = items[ii] in
-    if it.x > 0.5 && it.x < 1.5 then           -- a water stroke (kind 1)
-      let pstart = i32(it.y)
-      let pcount = i32(it.z)
-      let hw = it.w
-      let dmin =
-        if pcount <= 1 then magnitude(p - points[pstart])
+    let item = items[ii] in
+    if item.x > 0.5 && item.x < 1.5 then           -- a water stroke (kind 1)
+      let point_start = i32(item.y)
+      let point_count = i32(item.z)
+      let half_width = item.w
+      let centerline_distance =
+        if point_count <= 1 then magnitude(p - points[point_start])
         else
           -- Evaluate live segments up to MAX_SEG; longer strokes truncate.
-          let nseg = if pcount - 1 < MAX_SEG then pcount - 1 else MAX_SEG in
-          loop d = 100.0 for s < nseg do
-            f32.min(d, seg_dist(p, points[pstart + s], points[pstart + s + 1]))
+          let segment_count = if point_count - 1 < MAX_SEG then point_count - 1 else MAX_SEG in
+          loop d = 100.0 for s < segment_count do
+            f32.min(d, seg_dist(p, points[point_start + s], points[point_start + s + 1]))
         in
-      f32.min(best, dmin - hw)
+      f32.min(best, centerline_distance - half_width)
     else best
 
 -- Reflect view direction `v` about surface normal `n`.
@@ -82,8 +82,8 @@ def NORMAL_STR: f32 = 1.15      -- horizontal slope -> normal tilt
 -- 2-D value noise in [-1, 1] (Seascape's `noise` contract), backed by
 -- wyn/noise's graphics-grade PCG value noise.
 def wnoise(p: vec2f32) f32 =
-  let k = fasthash.seed(0xC0FFEE11u32) in
-  fhnoise.value2(k, p)
+  let seed = fasthash.seed(0xC0FFEE11u32) in
+  fhnoise.value2(seed, p)
 
 -- One ridged, domain-warped wave octave (Seascape's `sea_octave`).
 def sea_octave(uv: vec2f32, choppy: f32) f32 =
@@ -95,32 +95,32 @@ def sea_octave(uv: vec2f32, choppy: f32) f32 =
 
 -- Summed wave height at wave-space (x,z) and time `t`.
 def sea_height(px: vec2f32, t: f32) f32 =
-  let seat = 1.0 + t * SEA_SPEED
+  let wave_time = 1.0 + t * SEA_SPEED
   let uv0 = @[px.x * 0.75, px.y]
-  let r = loop (i, uv, h, freq, amp, choppy) = (0, uv0, 0.0, SEA_FREQ, SEA_HEIGHT, SEA_CHOPPY) while i < SEA_ITER do
-    let d1 = sea_octave((uv + v2(seat)) * v2(freq), choppy)
-    let d2 = sea_octave((uv - v2(seat)) * v2(freq), choppy)
-    let h2 = h + (d1 + d2) * amp
-    let uvr = @[1.6 * uv.x + 1.2 * uv.y, 0.0 - 1.2 * uv.x + 1.6 * uv.y] in   -- octave_m rotate
-    (i + 1, uvr, h2, freq * 1.9, amp * 0.22, mix(choppy, 1.0, 0.2))
-  in r.2
+  let wave_state = loop (i, uv, h, freq, amp, choppy) = (0, uv0, 0.0, SEA_FREQ, SEA_HEIGHT, SEA_CHOPPY) while i < SEA_ITER do
+    let forward_wave = sea_octave((uv + v2(wave_time)) * v2(freq), choppy)
+    let backward_wave = sea_octave((uv - v2(wave_time)) * v2(freq), choppy)
+    let next_height = h + (forward_wave + backward_wave) * amp
+    let rotated_uv = @[1.6 * uv.x + 1.2 * uv.y, 0.0 - 1.2 * uv.x + 1.6 * uv.y] in   -- octave_m rotate
+    (i + 1, rotated_uv, next_height, freq * 1.9, amp * 0.22, mix(choppy, 1.0, 0.2))
+  in wave_state.2
 
 -- Ripple normal from the height-field gradient (finite difference), tilted off `up`.
 def water_normal(p: vec2f32, t: f32) vec3f32 =
-  let e = 0.06
-  let q  = @[p.x * WAVE_SCALE, p.y * WAVE_SCALE]
-  let h0 = sea_height(q, t)
-  let hx = sea_height(@[q.x + e, q.y], t)
-  let hz = sea_height(@[q.x, q.y + e], t) in
-  normalize(@[(h0 - hx) * NORMAL_STR, e, (h0 - hz) * NORMAL_STR])
+  let sample_spacing = 0.06
+  let wave_position  = @[p.x * WAVE_SCALE, p.y * WAVE_SCALE]
+  let h0 = sea_height(wave_position, t)
+  let hx = sea_height(@[wave_position.x + sample_spacing, wave_position.y], t)
+  let hz = sea_height(@[wave_position.x, wave_position.y + sample_spacing], t) in
+  normalize(@[(h0 - hx) * NORMAL_STR, sample_spacing, (h0 - hz) * NORMAL_STR])
 
 -- Horizontal gradient of the water field (points OUT of the canal); used to face the
 -- far quay wall the camera looks across at grazing angles.
 def water_grad(p: vec2f32, items: []vec4f32, points: []vec2f32) vec2f32 =
-  let e = 0.05
-  let s0 = water_sdf(p, items, points) in
-  @[(water_sdf(@[p.x + e, p.y], items, points) - s0) / e,
-    (water_sdf(@[p.x, p.y + e], items, points) - s0) / e]
+  let sample_spacing = 0.05
+  let center_distance = water_sdf(p, items, points) in
+  @[(water_sdf(@[p.x + sample_spacing, p.y], items, points) - center_distance) / sample_spacing,
+    (water_sdf(@[p.x, p.y + sample_spacing], items, points) - center_distance) / sample_spacing]
 
 -- Per-pixel canal shade (approach A): from the flat-ground hit `p0` (inside the water
 -- region) trace down the view ray `rd` into the sunken basin. On the water plane at
@@ -129,37 +129,37 @@ def water_grad(p: vec2f32, items: []vec4f32, points: []vec2f32) vec2f32 =
 -- little except at grazing) and a sharp sun glint on the wavelets. Overshooting the far
 -- edge gives the quay wall. Returns a display-range colour (sky/reflection are in range).
 def shade_water(p0: vec3f32, rd: vec3f32, t: f32, items: []vec4f32, points: []vec2f32) vec3f32 =
-  let t_floor = (0.0 - WATER_DEPTH - p0.y) / rd.y
-  let pf = p0 + rd * v3(t_floor)
-  let sf = water_sdf(@[pf.x, pf.z], items, points) in     -- floor point vs the canal edge
-  if sf < 0.0 then
-    let wn = water_normal(@[pf.x, pf.z], t)
-    let ndv = f32.max(0.03, 0.0 - dot(rd, wn))           -- 1 top-down .. 0 grazing
+  let distance_to_water = (0.0 - WATER_DEPTH - p0.y) / rd.y
+  let water_position = p0 + rd * v3(distance_to_water)
+  let canal_distance = water_sdf(water_position.xz, items, points) in     -- floor point vs the canal edge
+  if canal_distance < 0.0 then
+    let ripple_normal = water_normal(water_position.xz, t)
+    let ndv = f32.max(0.03, 0.0 - dot(rd, ripple_normal))           -- 1 top-down .. 0 grazing
     let m = 1.0 - ndv
-    let fres = 0.02 + 0.24 * (m * m * m * m * m)           -- low reflectivity (murky)
-    let rr = reflect3(rd, wn)
-    let sky = clouds.sky(rr)
-    let spec = f32.pow(f32.max(0.0, dot(rr, sun)), 80.0) * 0.9   -- sun sparkle on ripples
-    let absorb = 1.0 - f32.exp(0.0 - t_floor * 2.5)       -- silt fades to deep with depth
+    let reflectivity = 0.02 + 0.24 * (m * m * m * m * m)           -- low reflectivity (murky)
+    let reflected_ray = reflect3(rd, ripple_normal)
+    let sky = clouds.sky(reflected_ray)
+    let sun_glint = f32.pow(f32.max(0.0, dot(reflected_ray, sun)), 80.0) * 0.9   -- sun sparkle on ripples
+    let absorb = 1.0 - f32.exp(0.0 - distance_to_water * 2.5)       -- silt fades to deep with depth
     let body = mix(WATER_SILT, WATER_DEEP, absorb)
-    let surf = mix(body, sky, fres) + v3(spec)
+    let surface_color = mix(body, sky, reflectivity) + v3(sun_glint)
     -- Scummy foam collar along the quay (hides the grazing-reflection seam too).
-    let foam = smoothstep(0.0 - 0.30, 0.0 - 0.05, sf) in
-    mix(surf, FOAM_COLOR, foam * 0.4)
+    let foam = smoothstep(0.0 - 0.30, 0.0 - 0.05, canal_distance) in
+    mix(surface_color, FOAM_COLOR, foam * 0.4)
   else
     -- Quay wall: the ray left the canal footprint before reaching the floor, so it
-    -- crosses the vertical embankment. Bisect along [0, t_floor] for the water_sdf = 0
+    -- crosses the vertical embankment. Bisect along [0, distance_to_water] for the water_sdf = 0
     -- crossing (the wall face) — evaluating the field AT the boundary, where its
     -- gradient is well defined, avoids the facet/pyramid artifacts of sampling the
     -- overshot point. Shade lit wet stone, darker at the waterline, lighter up top.
     let (lo, hi) =
-      loop (lo, hi) = (0.0, t_floor) for k < 12 do
+      loop (lo, hi) = (0.0, distance_to_water) for k < 12 do
         let mid = (lo + hi) * 0.5
-        let pm = p0 + rd * v3(mid) in
-        if water_sdf(@[pm.x, pm.z], items, points) < 0.0 then (mid, hi) else (lo, mid)
-    let pw = p0 + rd * v3((lo + hi) * 0.5)
-    let g = water_grad(@[pw.x, pw.z], items, points)
-    let nrm = normalize(@[0.0 - g.x, 0.22, 0.0 - g.y])       -- inward-facing, near-vertical
-    let ndl = f32.max(0.0, dot(nrm, sun))
-    let wet = clamp01((pw.y + WATER_DEPTH) / WATER_DEPTH) in  -- 0 at waterline .. 1 at top
+        let sample_position = p0 + rd * v3(mid) in
+        if water_sdf(sample_position.xz, items, points) < 0.0 then (mid, hi) else (lo, mid)
+    let quay_position = p0 + rd * v3((lo + hi) * 0.5)
+    let canal_gradient = water_grad(quay_position.xz, items, points)
+    let quay_normal = normalize(@[0.0 - canal_gradient.x, 0.22, 0.0 - canal_gradient.y])       -- inward-facing, near-vertical
+    let ndl = f32.max(0.0, dot(quay_normal, sun))
+    let wet = clamp01((quay_position.y + WATER_DEPTH) / WATER_DEPTH) in  -- 0 at waterline .. 1 at top
     QUAY_COLOR * v3((0.35 + 0.55 * ndl) * mix(0.55, 1.0, wet))
