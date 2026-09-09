@@ -16,8 +16,9 @@ mod generated {
 }
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -33,6 +34,32 @@ use graph::*;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameRate(Option<u32>);
+
+impl FrameRate {
+    fn interval(self) -> Option<Duration> {
+        self.0
+            .map(|fps| Duration::from_secs_f64(1.0 / f64::from(fps)))
+    }
+}
+
+impl FromStr for FrameRate {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "-" {
+            return Ok(Self(None));
+        }
+
+        match value.parse::<u32>() {
+            Ok(0) => Err("frame rate must be a positive integer or '-' for uncapped".into()),
+            Ok(fps) => Ok(Self(Some(fps))),
+            Err(_) => Err("frame rate must be a positive integer or '-' for uncapped".into()),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Generic wgpu host for Wyn SPIR-V pipelines (tiny porto).")]
 struct Args {
@@ -43,6 +70,9 @@ struct Args {
     /// Render N frames then exit (headless smoke test). 0 = run forever.
     #[arg(long, default_value_t = 0)]
     frames: u32,
+    /// Maximum interactive frame rate in Hz. Use `-` for uncapped.
+    #[arg(long, default_value = "60", allow_hyphen_values = true)]
+    fps: FrameRate,
     /// Render a scripted scenario offscreen to this PNG and exit (no window).
     #[arg(long)]
     screenshot: Option<std::path::PathBuf>,
@@ -1540,6 +1570,9 @@ struct App {
     /// Wall-clock presentation rate, including event-loop and vsync waits.
     fps_start: Instant,
     fps_frames: u32,
+    /// Explicit redraw pacing. `None` preserves the uncapped polling mode.
+    frame_interval: Option<Duration>,
+    next_frame: Instant,
 }
 
 impl ApplicationHandler for App {
@@ -1572,8 +1605,10 @@ impl ApplicationHandler for App {
             Ok(r) => {
                 self.window = Some(window);
                 self.renderer = Some(r);
-                self.fps_start = Instant::now();
+                let now = Instant::now();
+                self.fps_start = now;
                 self.fps_frames = 0;
+                self.next_frame = now;
             }
             Err(e) => {
                 eprintln!("gpu init: {e:?}");
@@ -1707,9 +1742,26 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        match self.frame_interval {
+            Some(interval) => {
+                let now = Instant::now();
+                if now >= self.next_frame {
+                    window.request_redraw();
+                    // Schedule from `now` instead of the previous deadline so a slow
+                    // frame never causes a burst of catch-up redraws.
+                    self.next_frame = now + interval;
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+            }
+            None => {
+                window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
         }
     }
 }
@@ -1731,8 +1783,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let frame_interval = args.fps.interval();
+    let next_frame = Instant::now();
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(match frame_interval {
+        Some(_) => ControlFlow::WaitUntil(next_frame),
+        None => ControlFlow::Poll,
+    });
     let mut app = App {
         args,
         cam: Camera::default(),
@@ -1745,6 +1802,8 @@ fn main() -> Result<()> {
         renderer: None,
         fps_start: Instant::now(),
         fps_frames: 0,
+        frame_interval,
+        next_frame,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1753,6 +1812,23 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    #[test]
+    fn frame_rate_defaults_to_60_hz() {
+        let args = Args::try_parse_from(["tinyporto"]).unwrap();
+        assert_eq!(args.fps, FrameRate(Some(60)));
+    }
+
+    #[test]
+    fn dash_frame_rate_means_uncapped() {
+        let args = Args::try_parse_from(["tinyporto", "--fps", "-"]).unwrap();
+        assert_eq!(args.fps, FrameRate(None));
+    }
+
+    #[test]
+    fn zero_frame_rate_is_rejected() {
+        assert!(Args::try_parse_from(["tinyporto", "--fps", "0"]).is_err());
+    }
 
     static TEST_SIZE_INPUTS: &[HostSizeInput] = &[
         HostSizeInput {

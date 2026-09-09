@@ -23,6 +23,8 @@ graphics math, GTAO, packing, random-number, and noise code.
 cd driver
 cargo run                 # build.rs compiles+embeds the Wyn shaders, then opens a window
 cargo run -- --frames 5   # render N frames then exit (headless smoke test)
+cargo run -- --fps 144    # override the default 60 Hz cap
+cargo run -- --fps -      # run uncapped
 ```
 
 Shaders are compiled at **build time** (`build.rs` → `wyn compile`) and embedded
