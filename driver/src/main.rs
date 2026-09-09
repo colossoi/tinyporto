@@ -141,6 +141,73 @@ fn uniform_word(blocks: &HashMap<&str, Vec<u8>>, name: &str, offset: u32) -> Opt
     ))
 }
 
+fn resolve_output_bytes(
+    graph: &Graph,
+    pass: &ComputePass,
+    binding: u32,
+    resource: &'static str,
+    uniforms: &HashMap<&str, Vec<u8>>,
+) -> u64 {
+    match (pass.out_size)(binding, pass.runtime_counts[0], pass.runtime_counts[1]) {
+        OutputSize::Bytes(bytes) => bytes,
+        OutputSize::HostProvided { inputs, elem_bytes } => {
+            let words = |binding_name, offset| {
+                uniform_word(
+                    uniforms,
+                    name_to_resource(graph, pass.module, binding_name),
+                    offset,
+                )
+            };
+            (graph.host_buffer_bytes)(resource, elem_bytes, inputs, &words).unwrap_or_else(|| {
+                panic!(
+                    "no host capacity for {resource:?} ({}:{}, binding {binding})",
+                    pass.module, pass.label
+                )
+            })
+        }
+    }
+}
+
+fn resolve_compute_stage_groups(
+    graph: &Graph,
+    pass: &ComputePass,
+    stage: &ComputeStage,
+    uniforms: &HashMap<&str, Vec<u8>>,
+) -> [u32; 3] {
+    let Some(dispatch) = stage.host_dispatch else {
+        return stage.groups;
+    };
+    let &(_, _, _, usage, binding_name) = stage
+        .bindings
+        .iter()
+        .find(|&&(_, binding, _, _, _)| binding == dispatch.output_binding)
+        .expect("host dispatch output binding");
+    assert_eq!(usage, BindingUsage::Output);
+    let resource = name_to_resource(graph, pass.module, binding_name);
+    let OutputSize::HostProvided { inputs, .. } = (pass.out_size)(
+        dispatch.output_binding,
+        pass.runtime_counts[0],
+        pass.runtime_counts[1],
+    ) else {
+        panic!("host dispatch output does not have a host-provided size")
+    };
+    let words = |uniform_name, offset| {
+        uniform_word(
+            uniforms,
+            name_to_resource(graph, pass.module, uniform_name),
+            offset,
+        )
+    };
+    (graph.host_dispatch_groups)(resource, inputs, &words, dispatch.workgroup_size).unwrap_or_else(
+        || {
+            panic!(
+                "no host dispatch for {resource:?} ({}:{})",
+                pass.module, pass.label
+            )
+        },
+    )
+}
+
 fn pack_uniform_block(
     members: &[BlockMember],
     layout: &UniformBlockLayout,
@@ -229,18 +296,8 @@ impl Renderer {
                         )
                     {
                         let resource = name_to_resource(graph, cp.module, name);
-                        let bytes = (cp.out_bytes)(
-                            binding,
-                            cp.runtime_counts[0],
-                            cp.runtime_counts[1],
-                            &|uniform, offset| {
-                                uniform_word(
-                                    &initial_uniforms,
-                                    name_to_resource(graph, cp.module, uniform),
-                                    offset,
-                                )
-                            },
-                        );
+                        let bytes =
+                            resolve_output_bytes(graph, cp, binding, resource, &initial_uniforms);
                         derived
                             .entry(resource)
                             .and_modify(|n| *n = (*n).max(bytes))
@@ -346,7 +403,12 @@ impl Renderer {
                 Pass::Compute(cp) => {
                     let module = modules.get(cp.module).expect("module");
                     passes.push(BuiltPass::Compute(build_compute(
-                        device, module, cp, res, graph,
+                        device,
+                        module,
+                        cp,
+                        res,
+                        graph,
+                        &initial_uniforms,
                     )));
                 }
                 Pass::Render(rp) => {
@@ -430,9 +492,24 @@ impl Renderer {
                 )
             })
             .collect();
+        self.update_host_dispatches(&snapshot);
         self.grow_outputs(&snapshot);
         for (name, bytes) in snapshot {
             self.gfx.queue.write_buffer(&self.buffers[name], 0, &bytes);
+        }
+    }
+
+    fn update_host_dispatches(&mut self, snapshot: &HashMap<&str, Vec<u8>>) {
+        let graph = &self.graph;
+        for (built, declared) in self.passes.iter_mut().zip(&graph.passes) {
+            let (BuiltPass::Compute(built), Pass::Compute(declared)) = (built, declared) else {
+                continue;
+            };
+            assert_eq!(built.stages.len(), declared.stages.len());
+            for (built_stage, declared_stage) in built.stages.iter_mut().zip(&declared.stages) {
+                built_stage.groups =
+                    resolve_compute_stage_groups(graph, declared, declared_stage, snapshot);
+            }
         }
     }
 
@@ -441,18 +518,7 @@ impl Renderer {
     fn grow_outputs(&mut self, snapshot: &HashMap<&str, Vec<u8>>) {
         let mut required = HashMap::<&str, u64>::new();
         for (cp, binding, resource) in &self.output_sizes {
-            let bytes = (cp.out_bytes)(
-                *binding,
-                cp.runtime_counts[0],
-                cp.runtime_counts[1],
-                &|name, offset| {
-                    uniform_word(
-                        snapshot,
-                        name_to_resource(&self.graph, cp.module, name),
-                        offset,
-                    )
-                },
-            );
+            let bytes = resolve_output_bytes(&self.graph, cp, *binding, resource, snapshot);
             required
                 .entry(resource)
                 .and_modify(|n| *n = (*n).max(bytes))
@@ -1297,6 +1363,7 @@ fn build_compute(
     cp: &ComputePass,
     res: Res,
     graph: &Graph,
+    uniforms: &HashMap<&str, Vec<u8>>,
 ) -> BuiltCompute {
     let stages = cp
         .stages
@@ -1341,7 +1408,7 @@ fn build_compute(
             }
             BuiltComputeStage {
                 pipeline,
-                groups: st.groups,
+                groups: resolve_compute_stage_groups(graph, cp, st, uniforms),
                 sets,
             }
         })
@@ -1687,30 +1754,77 @@ fn main() -> Result<()> {
 mod allocation_tests {
     use super::*;
 
-    fn uniform_output_bytes(_: u32, _: u64, _: u64, words: &UniformWords<'_>) -> u64 {
-        static LENGTH: std::sync::LazyLock<wyn_pipeline_descriptor::BufferLen> =
-            std::sync::LazyLock::new(|| {
-                let descriptor: serde_json::Value = serde_json::from_str(include_str!(
-                    "../tests/fixtures/uniform_output_size.json"
-                ))
-                .unwrap();
-                let output = descriptor["pipelines"][1]["bindings"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|b| b["usage"] == "output")
-                    .unwrap();
-                serde_json::from_value(output["length"].clone()).unwrap()
-            });
-        LENGTH
-            .resolve_host_bytes(&|set, binding, offset| {
-                if (set, binding) == (0, 0) {
-                    words("frame", offset)
-                } else {
-                    None
-                }
+    static TEST_SIZE_INPUTS: &[HostSizeInput] = &[
+        HostSizeInput {
+            name: "frame_resolution_x",
+            binding_name: "frame",
+            set: 0,
+            binding: 0,
+            offset: 0,
+            scalar: HostSizeScalar::F32,
+        },
+        HostSizeInput {
+            name: "frame_resolution_y",
+            binding_name: "frame",
+            set: 0,
+            binding: 0,
+            offset: 4,
+            scalar: HostSizeScalar::F32,
+        },
+    ];
+
+    fn host_output_size(_: u32, _: u64, _: u64) -> OutputSize {
+        OutputSize::HostProvided {
+            inputs: TEST_SIZE_INPUTS,
+            elem_bytes: 4,
+        }
+    }
+
+    fn test_host_buffer_bytes(
+        resource: &'static str,
+        elem_bytes: u32,
+        inputs: &'static [HostSizeInput],
+        words: &UniformWords<'_>,
+    ) -> Option<u64> {
+        if !matches!(resource, "pixels" | "history") {
+            return None;
+        }
+        let dimension = |name| {
+            let input = inputs.iter().find(|input| input.name == name)?;
+            words(input.binding_name, input.offset).map(f32::from_bits)
+        };
+        let width = dimension("frame_resolution_x")? as u64;
+        let height = dimension("frame_resolution_y")? as u64;
+        width
+            .checked_mul(height)?
+            .checked_mul(u64::from(elem_bytes))
+    }
+
+    #[test]
+    fn host_provided_dispatches_cover_every_output_element() {
+        let (width, height) = (1279u32, 799u32);
+        let graph = app::graph(width, height);
+        let snapshot = HashMap::from([(
+            "frame",
+            [(width as f32).to_le_bytes(), (height as f32).to_le_bytes()].concat(),
+        )]);
+        let pass = graph
+            .passes
+            .iter()
+            .find_map(|pass| match pass {
+                Pass::Compute(pass) if pass.label == "tinyporto_frame__compute_3" => Some(pass),
+                _ => None,
             })
-            .unwrap()
+            .expect("postprocess pass");
+        assert_eq!(pass.stages.len(), 2);
+        assert_eq!(
+            resolve_compute_stage_groups(&graph, pass, &pass.stages[0], &snapshot),
+            [(width * height).div_ceil(64), 1, 1]
+        );
+        assert_eq!(
+            resolve_compute_stage_groups(&graph, pass, &pass.stages[1], &snapshot),
+            [(width.div_ceil(8) * height.div_ceil(8)).div_ceil(64), 1, 1,]
+        );
     }
 
     #[test]
@@ -1746,19 +1860,23 @@ mod allocation_tests {
                 entry: "update",
                 groups: [1, 1, 1],
                 bindings: BINDS,
+                host_dispatch: None,
             }],
-            out_bytes: uniform_output_bytes,
+            out_size: host_output_size,
             runtime_counts: [0, 0],
         };
         let graph = Graph {
             resources: vec![],
             passes: vec![Pass::Compute(cp.clone())],
             names: &[],
+            host_buffer_bytes: test_host_buffer_bytes,
+            host_dispatch_groups: |_, _, _, _| None,
         };
         let image_views = HashMap::new();
         let img_formats = HashMap::new();
         let module = gfx.device.create_shader_module(wgpu::ShaderModuleDescriptor { label:Some("binding growth test"),source:wgpu::ShaderSource::Wgsl(
             "@group(0) @binding(0) var<storage,read_write> data: array<u32>; @compute @workgroup_size(1) fn update() { data[0] = data[0] + 1u; }".into()) });
+        let uniforms = HashMap::new();
         let built = build_compute(
             &gfx.device,
             &module,
@@ -1770,6 +1888,7 @@ mod allocation_tests {
                 img_formats: &img_formats,
             },
             &graph,
+            &uniforms,
         );
         let mut renderer = Renderer {
             gfx,

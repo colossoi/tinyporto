@@ -46,6 +46,12 @@ pass (no CPU readback).
   `const GRAPH` in `src/app.rs`, compiled into the binary. The `.json` descriptor
   is a build-time artifact only; a future `build.rs` step will diff `GRAPH`
   against it and fail on drift (that validation is the remaining stub).
+- **Host-provided buffer sizes.** The descriptor publishes the uniform inputs and
+  element stride for `host_provided` outputs. `driver/src/app.rs` supplies the
+  application-owned capacity formulas: full-resolution pixels for `ao_work` and
+  one element per 8x8 tile for `occ`. Those logical counts also size implicit
+  dispatches that produce the buffers. The driver updates both capacity and
+  dispatch coverage after a resize.
 - **Generic host.** `graph.rs`/the executor have no game concepts; `app.rs`
   names resources but is still just generic graph data. All meaning lives in
   `wyn/`.

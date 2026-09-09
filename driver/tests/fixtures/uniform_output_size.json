@@ -110,33 +110,23 @@
           "usage": "output",
           "name": "reproduce_output",
           "length": {
-            "kind": "host_expression",
-            "count": {
-              "kind": "binary",
-              "op": "multiply",
-              "left": {
-                "kind": "convert",
-                "to": "i32",
-                "value": {
-                  "kind": "uniform",
-                  "set": 0,
-                  "binding": 0,
-                  "offset": 0,
-                  "scalar": "f32"
-                }
+            "kind": "host_provided",
+            "inputs": [
+              {
+                "name": "frame_resolution_x",
+                "set": 0,
+                "binding": 0,
+                "offset": 0,
+                "type": "f32"
               },
-              "right": {
-                "kind": "convert",
-                "to": "i32",
-                "value": {
-                  "kind": "uniform",
-                  "set": 0,
-                  "binding": 0,
-                  "offset": 4,
-                  "scalar": "f32"
-                }
+              {
+                "name": "frame_resolution_y",
+                "set": 0,
+                "binding": 0,
+                "offset": 4,
+                "type": "f32"
               }
-            },
+            ],
             "elem_bytes": 4
           }
         }
@@ -290,33 +280,23 @@
         "extent": {
           "kind": "storage_buffer",
           "length": {
-            "kind": "host_expression",
-            "count": {
-              "kind": "binary",
-              "op": "multiply",
-              "left": {
-                "kind": "convert",
-                "to": "i32",
-                "value": {
-                  "kind": "uniform",
-                  "set": 0,
-                  "binding": 0,
-                  "offset": 0,
-                  "scalar": "f32"
-                }
+            "kind": "host_provided",
+            "inputs": [
+              {
+                "name": "frame_resolution_x",
+                "set": 0,
+                "binding": 0,
+                "offset": 0,
+                "type": "f32"
               },
-              "right": {
-                "kind": "convert",
-                "to": "i32",
-                "value": {
-                  "kind": "uniform",
-                  "set": 0,
-                  "binding": 0,
-                  "offset": 4,
-                  "scalar": "f32"
-                }
+              {
+                "name": "frame_resolution_y",
+                "set": 0,
+                "binding": 0,
+                "offset": 4,
+                "type": "f32"
               }
-            },
+            ],
             "elem_bytes": 4
           }
         },

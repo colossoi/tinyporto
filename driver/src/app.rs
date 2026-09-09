@@ -3,8 +3,8 @@
 //! The per-pipeline binding tables and the dispatch/output-size calculations are
 //! GENERATED from `wyn/main.wyn`'s descriptor by build.rs (the `descriptor`
 //! module). This file authors only what the descriptor can't know: which
-//! resources exist, the binding-name -> resource mapping, and the per-frame
-//! schedule.
+//! resources exist, host-provided capacity formulas, the binding-name -> resource
+//! mapping, and the per-frame schedule.
 
 use crate::generated::{GRAPHICS_0_ITEM, GRAPHICS_1_ITEM, GRAPHICS_2_ITEM, GRAPHICS_3_ITEM};
 use crate::graph::*;
@@ -19,6 +19,53 @@ const fn occ_w(w: u32) -> u32 {
 }
 const fn occ_h(h: u32) -> u32 {
     h.div_ceil(OCC_TILE)
+}
+
+fn host_size_f32(name: &str, inputs: &[HostSizeInput], words: &UniformWords<'_>) -> Option<f32> {
+    let input = inputs
+        .iter()
+        .find(|input| input.name == name && input.scalar == HostSizeScalar::F32)?;
+    words(input.binding_name, input.offset).map(f32::from_bits)
+}
+
+/// Capacity formulas intentionally owned by Tinyporto. The compiler publishes
+/// the uniform dependencies and element stride, but no longer guesses how the
+/// application wants to turn those values into an allocation.
+fn host_buffer_elements(
+    resource: &'static str,
+    inputs: &'static [HostSizeInput],
+    words: &UniformWords<'_>,
+) -> Option<u64> {
+    let width = host_size_f32("frame_resolution_x", inputs, words)? as u32;
+    let height = host_size_f32("frame_resolution_y", inputs, words)? as u32;
+    Some(match resource {
+        "ao_work" => u64::from(width).checked_mul(u64::from(height))?,
+        "occ" => u64::from(occ_w(width)).checked_mul(u64::from(occ_h(height)))?,
+        _ => return None,
+    })
+}
+
+fn host_buffer_bytes(
+    resource: &'static str,
+    elem_bytes: u32,
+    inputs: &'static [HostSizeInput],
+    words: &UniformWords<'_>,
+) -> Option<u64> {
+    host_buffer_elements(resource, inputs, words)?.checked_mul(u64::from(elem_bytes))
+}
+
+fn host_dispatch_groups(
+    resource: &'static str,
+    inputs: &'static [HostSizeInput],
+    words: &UniformWords<'_>,
+    workgroup_size: [u32; 3],
+) -> Option<[u32; 3]> {
+    let [x, y, z] = workgroup_size;
+    if x == 0 || y != 1 || z != 1 {
+        return None;
+    }
+    let elements = host_buffer_elements(resource, inputs, words)?;
+    Some([u32::try_from(elements.div_ceil(u64::from(x))).ok()?, 1, 1])
 }
 // Wall-brick budget (must match walls.wyn: BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS =
 // N_WALL*PER_COURSE*COURSES + 128 + 8 = 8*13*24 + 136 = 2632).
@@ -56,6 +103,8 @@ static RESOLVE_ITEMS: [RenderItem; 1] = [RenderItem { ..GRAPHICS_3_ITEM }];
 /// dispatches derive from it; no resolution is hardcoded here or in the shaders.
 pub fn graph(w: u32, h: u32) -> Graph {
     let mut graph = Graph {
+        host_buffer_bytes,
+        host_dispatch_groups,
         resources: vec![
             // Per-frame globals, one std140 uniform block (see `frame_globals` in
             // main.wyn). The driver fills each member by name at the descriptor's
@@ -314,7 +363,8 @@ pub fn graph(w: u32, h: u32) -> Graph {
         ],
     };
     crate::generated::insert_descriptor_prerequisites(
-        &mut graph, u64::from(w) * u64::from(h),
+        &mut graph,
+        u64::from(w) * u64::from(h),
         u64::from(occ_w(w)) * u64::from(occ_h(h)),
     );
     graph
@@ -324,6 +374,40 @@ pub fn graph(w: u32, h: u32) -> Graph {
 mod tests {
     use super::*;
 
+    fn generated_host_bytes(graph: &Graph, resource: &'static str, width: u32, height: u32) -> u64 {
+        let pass = graph
+            .passes
+            .iter()
+            .find_map(|pass| match pass {
+                Pass::Compute(pass) if pass.label == "tinyporto_frame__compute_3" => Some(pass),
+                _ => None,
+            })
+            .expect("GTAO compute pass");
+        let binding =
+            pass.bindings
+                .iter()
+                .find_map(|&(_, binding, _, usage, name)| {
+                    (usage == BindingUsage::Output
+                        && graph.names.iter().any(|&(binding_name, target)| {
+                            binding_name == name && target == resource
+                        }))
+                    .then_some(binding)
+                })
+                .expect("host-sized output binding");
+        let OutputSize::HostProvided { inputs, elem_bytes } =
+            (pass.out_size)(binding, pass.runtime_counts[0], pass.runtime_counts[1])
+        else {
+            panic!("host-provided output")
+        };
+        let words = |name, offset| match (name, offset) {
+            ("frame", 0) => Some((width as f32).to_bits()),
+            ("frame", 4) => Some((height as f32).to_bits()),
+            _ => None,
+        };
+        (graph.host_buffer_bytes)(resource, elem_bytes, inputs, &words)
+            .expect("Tinyporto host capacity")
+    }
+
     #[test]
     fn generated_prerequisites_accept_live_viewport_sizes() {
         let (width, height) = (1279, 799);
@@ -332,14 +416,34 @@ mod tests {
             u64::from(width) * u64::from(height),
             u64::from(occ_w(width)) * u64::from(occ_h(height)),
         ];
-        let compute: Vec<_> = graph.passes.iter().filter_map(|pass| match pass {
-            Pass::Compute(pass) => Some(pass),
-            _ => None,
-        }).collect();
+        let compute: Vec<_> = graph
+            .passes
+            .iter()
+            .filter_map(|pass| match pass {
+                Pass::Compute(pass) => Some(pass),
+                _ => None,
+            })
+            .collect();
         // More than the two authored passes must be generated successfully,
         // including prerequisites whose dispatches have nontrivial domains.
         assert!(compute.len() > 2);
         assert!(compute.iter().all(|pass| pass.runtime_counts == expected));
-        assert!(compute.iter().any(|pass| pass.stages.iter().any(|stage| stage.groups[0] > 1)));
+        assert!(compute
+            .iter()
+            .any(|pass| pass.stages.iter().any(|stage| stage.groups[0] > 1)));
+    }
+
+    #[test]
+    fn host_provided_outputs_use_full_and_coarse_resolution() {
+        let (width, height) = (1279, 799);
+        let graph = graph(width, height);
+        assert_eq!(
+            generated_host_bytes(&graph, "ao_work", width, height),
+            u64::from(width) * u64::from(height) * 16
+        );
+        assert_eq!(
+            generated_host_bytes(&graph, "occ", width, height),
+            u64::from(occ_w(width)) * u64::from(occ_h(height)) * 4
+        );
     }
 }

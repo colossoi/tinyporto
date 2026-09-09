@@ -74,7 +74,7 @@ pub enum BufInit {
 
 /// A storage buffer the graph owns (STORAGE | COPY_DST). `size` is `None` when
 /// the buffer is a compute output — the driver derives it from the descriptor
-/// calc (see `ComputePass::out_bytes`).
+/// policy (see `ComputePass::out_size`).
 #[derive(Clone, Copy, Debug)]
 pub struct BufferDef {
     pub name: &'static str,
@@ -161,10 +161,7 @@ pub enum ImgSize {
     Window,
     // Retained for graphs with images whose extent is independent of the window.
     #[allow(dead_code)]
-    Fixed {
-        w: u32,
-        h: u32,
-    },
+    Fixed { w: u32, h: u32 },
 }
 
 /// How a (set, binding) slot is typed in the shader. Matches the values the
@@ -224,10 +221,66 @@ pub struct ComputeStage {
     pub entry: &'static str,
     pub groups: [u32; 3],
     pub bindings: BindTable,
+    /// An implicit fixed dispatch whose logical domain is owned by the host along
+    /// with the output allocation. Explicit fixed dispatches never set this.
+    pub host_dispatch: Option<HostDispatch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDispatch {
+    pub output_binding: u32,
+    pub workgroup_size: [u32; 3],
 }
 
 /// Lookup of a scalar word in the host uniform snapshot by binding name and byte offset.
 pub type UniformWords<'a> = dyn Fn(&'static str, u32) -> Option<u32> + 'a;
+
+/// Scalar ABI type for one descriptor-published input to a host-provided
+/// allocation. The host decides the formula but can use this metadata to read
+/// the relevant value from the same uniform snapshot submitted to the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum HostSizeScalar {
+    I32,
+    U32,
+    F32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostSizeInput {
+    pub name: &'static str,
+    pub binding_name: &'static str,
+    pub set: u32,
+    pub binding: u32,
+    pub offset: u32,
+    pub scalar: HostSizeScalar,
+}
+
+/// Descriptor-side part of output sizing. `HostProvided` deliberately carries
+/// dependencies rather than a formula; the application resolves it through
+/// `Graph::host_buffer_bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSize {
+    Bytes(u64),
+    HostProvided {
+        inputs: &'static [HostSizeInput],
+        elem_bytes: u32,
+    },
+}
+
+pub type HostBufferBytes = fn(
+    resource: &'static str,
+    elem_bytes: u32,
+    inputs: &'static [HostSizeInput],
+    words: &UniformWords<'_>,
+) -> Option<u64>;
+
+pub type HostDispatchGroups = fn(
+    resource: &'static str,
+    inputs: &'static [HostSizeInput],
+    words: &UniformWords<'_>,
+    workgroup_size: [u32; 3],
+) -> Option<[u32; 3]>;
 
 /// A compute pass: its generated binding table, the ordered stages it lowers to
 /// (each with its own dispatch), and the generated size calc for its output
@@ -241,7 +294,7 @@ pub struct ComputePass {
     pub module: &'static str,
     pub bindings: BindTable,
     pub stages: Vec<ComputeStage>,
-    pub out_bytes: fn(u32, u64, u64, &UniformWords<'_>) -> u64,
+    pub out_size: fn(u32, u64, u64) -> OutputSize,
     /// Temporary host-resolved runtime domains: surface pixels and coarse tiles.
     pub runtime_counts: [u64; 2],
 }
@@ -269,7 +322,8 @@ pub struct RenderItem {
 
 impl RenderItem {
     pub fn binding_visibility(&self, set: u32, binding: u32) -> wgpu::ShaderStages {
-        self.binding_stages.iter()
+        self.binding_stages
+            .iter()
             .find(|&&(s, b, _)| s == set && b == binding)
             .map_or(wgpu::ShaderStages::NONE, |&(_, _, stages)| stages)
     }
@@ -334,6 +388,11 @@ pub struct Graph {
     pub resources: Vec<Resource>,
     pub passes: Vec<Pass>,
     pub names: &'static [(&'static str, &'static str)],
+    /// Application-owned capacity rules for descriptor `HostProvided` outputs.
+    pub host_buffer_bytes: HostBufferBytes,
+    /// Application-owned dispatch coverage for implicit stages producing those
+    /// outputs. Kept separate because a capacity may legally over-allocate.
+    pub host_dispatch_groups: HostDispatchGroups,
 }
 
 impl Graph {

@@ -217,8 +217,9 @@ impl Binding {
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Length {
-    HostExpression {
-        count: wyn_pipeline_descriptor::HostExpression,
+    HostProvided {
+        #[serde(default)]
+        inputs: Vec<wyn_pipeline_descriptor::HostSizeInput>,
         elem_bytes: u32,
     },
     /// A fixed byte size (e.g. a small fixed-shape output array).
@@ -240,6 +241,8 @@ struct Stage {
     entry_point: String,
     owner: String,
     #[serde(default)]
+    workgroup_size: [u32; 3],
+    #[serde(default)]
     stage: Option<String>,
     #[serde(default)]
     dispatch_size: Option<DispatchSize>,
@@ -259,7 +262,13 @@ struct Stage {
 enum DispatchSize {
     /// A constant grid (the entry grid-strides internally, e.g. a multi-domain
     /// `step`): dispatch exactly `x*y*z` workgroups regardless of input size.
-    Fixed { x: u32, y: u32, z: u32 },
+    Fixed {
+        x: u32,
+        y: u32,
+        z: u32,
+        #[serde(default)]
+        explicit: bool,
+    },
     /// Sized from an input binding: ceil(input_len_elems / workgroup_size).
     DerivedFrom { len: Len, workgroup_size: u32 },
 }
@@ -529,41 +538,39 @@ fn ordered_runtime_params(params: &std::collections::BTreeSet<String>) -> Vec<Id
         .collect()
 }
 
-/// Translate one compute pipeline into `<entry>_stages` + `<entry>_out_bytes`
+/// Translate one compute pipeline into `<entry>_stages` + `<entry>_out_size`
 /// functions, with the descriptor's rules inlined as arithmetic. Non-compute
 /// pipelines have nothing to compute, so they generate nothing. A compute entry
 /// lowers to several ordered stages (one per output domain); the canonical entry
 /// (see `pipeline_owner`) names the whole pipeline.
-fn host_expression_tokens(expr: &wyn_pipeline_descriptor::HostExpression) -> TokenStream {
-    use wyn_pipeline_descriptor::HostExpression as E;
-    let scalar = |ty| {
-        let name = id(&format!("{ty:?}"));
-        quote! { wyn_pipeline_descriptor::HostScalar::#name }
-    };
-    match expr {
-        E::Constant { scalar: ty, bits } => {
-            let ty = scalar(ty);
-            quote! { wyn_pipeline_descriptor::HostExpression::Constant { scalar: #ty, bits: #bits } }
-        }
-        E::Uniform {
-            set,
-            binding,
-            offset,
-            scalar: ty,
-        } => {
-            let ty = scalar(ty);
-            quote! { wyn_pipeline_descriptor::HostExpression::Uniform { set: #set, binding: #binding, offset: #offset, scalar: #ty } }
-        }
-        E::Convert { to, value } => {
-            let to = scalar(to);
-            let value = host_expression_tokens(value);
-            quote! { wyn_pipeline_descriptor::HostExpression::Convert { to: #to, value: Box::new(#value) } }
-        }
-        E::Binary { op, left, right } => {
-            let op = id(&format!("{op:?}"));
-            let left = host_expression_tokens(left);
-            let right = host_expression_tokens(right);
-            quote! { wyn_pipeline_descriptor::HostExpression::Binary { op: wyn_pipeline_descriptor::HostBinary::#op, left: Box::new(#left), right: Box::new(#right) } }
+fn host_size_input_tokens(
+    p: &Pipeline,
+    input: &wyn_pipeline_descriptor::HostSizeInput,
+) -> TokenStream {
+    let binding_name = p
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.ty == "uniform" && binding.set == input.set && binding.binding == input.binding
+        })
+        .map(|binding| binding.name.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "descriptor: host-size input {} refers to missing uniform {}:{}",
+                input.name, input.set, input.binding
+            )
+        });
+    let name = input.name.as_str();
+    let (set, binding, offset) = (input.set, input.binding, input.offset);
+    let scalar = id(&format!("{:?}", input.scalar));
+    quote! {
+        crate::graph::HostSizeInput {
+            name: #name,
+            binding_name: #binding_name,
+            set: #set,
+            binding: #binding,
+            offset: #offset,
+            scalar: crate::graph::HostSizeScalar::#scalar,
         }
     }
 }
@@ -575,7 +582,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
     let entry0 = pipeline_owner(p);
     let stages_fn = id(&format!("{entry0}_stages"));
     let count_const = id(&format!("{}_STAGE_COUNT", entry0.to_uppercase()));
-    let out_bytes_fn = id(&format!("{entry0}_out_bytes"));
+    let out_size_fn = id(&format!("{entry0}_out_size"));
     let n_stages = p.stages.len();
     let stage_binding_defs: Vec<TokenStream> = p
         .stages
@@ -589,8 +596,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
     // directly) or ceil(input_len_elems / workgroup_size). The stages_fn takes the
     // byte size of every input a derived stage sizes from (sorted union), so a
     // fixed-grid stage needs no argument.
-    let mut disp_params: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut disp_params: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let stage_rows: Vec<TokenStream> = p
         .stages
         .iter()
@@ -604,7 +610,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
                 .expect("compute stage has dispatch_size");
             let dims = {
                 match ds {
-                    DispatchSize::Fixed { x, y, z } => quote! { [#x, #y, #z] },
+                    DispatchSize::Fixed { x, y, z, .. } => quote! { [#x, #y, #z] },
                     DispatchSize::DerivedFrom {
                         len,
                         workgroup_size,
@@ -642,11 +648,45 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
                     }
                 }
             };
+            let host_dispatch = match ds {
+                DispatchSize::Fixed {
+                    explicit: false, ..
+                } => {
+                    let outputs: Vec<_> = s
+                        .writes
+                        .iter()
+                        .map(|&index| &p.bindings[index])
+                        .filter(|binding| {
+                            matches!(binding.length, Some(Length::HostProvided { .. }))
+                        })
+                        .collect();
+                    assert!(
+                        outputs.len() <= 1,
+                        "descriptor: one stage writes multiple host-provided outputs"
+                    );
+                    outputs.first().map_or_else(
+                        || quote! { None },
+                        |output| {
+                            let output_binding = output.binding;
+                            let [x, y, z] = s.workgroup_size;
+                            assert!(x > 0 && y > 0 && z > 0, "compute workgroup size is zero");
+                            quote! {
+                                Some(crate::graph::HostDispatch {
+                                    output_binding: #output_binding,
+                                    workgroup_size: [#x, #y, #z],
+                                })
+                            }
+                        },
+                    )
+                }
+                _ => quote! { None },
+            };
             quote! {
                 crate::graph::ComputeStage {
                     entry: #entry,
                     groups: #dims,
                     bindings: #bindings,
+                    host_dispatch: #host_dispatch,
                 }
             }
         })
@@ -661,30 +701,24 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
         .iter()
         .filter(|b| matches!(b.usage.as_deref(), Some("output") | Some("intermediate")))
         .collect();
-    let mut params: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut params: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let arms: Vec<TokenStream> = outputs
         .iter()
         .map(|o| {
             let b = o.binding;
             let expr = match o.length.as_ref().expect("output binding has length") {
-                Length::HostExpression { count, elem_bytes } => {
-                    let expr = host_expression_tokens(count);
-                    let uniform_arms: Vec<_> = p.bindings.iter().filter(|b| b.ty == "uniform").map(|b| {
-                        let (set, binding, name) = (b.set,b.binding,&b.name);
-                        quote! { (#set, #binding) => _uniforms(#name, offset) }
-                    }).collect();
+                Length::HostProvided { inputs, elem_bytes } => {
+                    let inputs = inputs
+                        .iter()
+                        .map(|input| host_size_input_tokens(p, input));
                     quote! {
-                        {
-                            static LENGTH: std::sync::LazyLock<wyn_pipeline_descriptor::BufferLen> = std::sync::LazyLock::new(||
-                                wyn_pipeline_descriptor::BufferLen::HostExpression { count: #expr, elem_bytes: #elem_bytes });
-                            LENGTH.resolve_host_bytes(&|set, binding, offset| match (set,binding) {
-                                #(#uniform_arms,)* _ => None,
-                            }).expect("invalid host allocation expression")
+                        crate::graph::OutputSize::HostProvided {
+                            inputs: &[#(#inputs),*],
+                            elem_bytes: #elem_bytes,
                         }
                     }
                 }
-                Length::Fixed { bytes } => quote! { #bytes },
+                Length::Fixed { bytes } => quote! { crate::graph::OutputSize::Bytes(#bytes) },
                 Length::LikeInput {
                     binding,
                     elem_bytes,
@@ -692,11 +726,10 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
                 } => {
                     let src = input_param(p, *binding);
                     params.insert(src.to_string());
-                    quote! { (#src / #src_elem_bytes) * #elem_bytes }
+                    quote! { crate::graph::OutputSize::Bytes((#src / #src_elem_bytes) * #elem_bytes) }
                 }
                 Length::SameAsDispatch { elem_bytes } => {
-                    {
-                        match output_domain(p, o) {
+                    let bytes = match output_domain(p, o) {
                             Some(Len::Fixed { count }) => quote! { #count * #elem_bytes },
                             Some(Len::InputBinding {
                                 binding,
@@ -722,8 +755,8 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
                                 params.insert(src.to_string());
                                 quote! { (#src / #src_elem_bytes) * #elem_bytes }
                             }
-                        }
-                    }
+                        };
+                    quote! { crate::graph::OutputSize::Bytes(#bytes) }
                 }
             };
             quote! { #b => #expr }
@@ -740,8 +773,8 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
         pub const fn #stages_fn(#(#disp_param_ids: u64),*) -> [crate::graph::ComputeStage; #n_stages] {
             [#(#stage_rows),*]
         }
-        /// Byte size of output binding `binding` (descriptor `length` rules).
-        pub fn #out_bytes_fn(binding: u32, #(#out_params: u64),*, _uniforms: &crate::graph::UniformWords<'_>) -> u64 {
+        /// Size policy for output binding `binding` (descriptor `length` rules).
+        pub fn #out_size_fn(binding: u32, #(#out_params: u64),*) -> crate::graph::OutputSize {
             match binding {
                 #(#arms,)*
                 _ => panic!("binding is not an output of this pipeline"),
@@ -833,7 +866,9 @@ fn codegen_graphics_item(key: &str, p: &Pipeline, pipeline_index: usize) -> Toke
     for stage in &p.stages {
         for &index in stage.reads.iter().chain(&stage.writes) {
             let binding = &p.bindings[index];
-            let flags = binding_stages.entry((binding.set, binding.binding)).or_default();
+            let flags = binding_stages
+                .entry((binding.set, binding.binding))
+                .or_default();
             match stage.stage.as_deref() {
                 Some("vertex") => flags.0 = true,
                 Some("fragment") => flags.1 = true,
@@ -841,15 +876,17 @@ fn codegen_graphics_item(key: &str, p: &Pipeline, pipeline_index: usize) -> Toke
             }
         }
     }
-    let visibility = binding_stages.iter().map(|(&(set, binding), &(vertex, fragment))| {
-        let stages = match (vertex, fragment) {
-            (true, true) => quote! { wgpu::ShaderStages::VERTEX_FRAGMENT },
-            (true, false) => quote! { wgpu::ShaderStages::VERTEX },
-            (false, true) => quote! { wgpu::ShaderStages::FRAGMENT },
-            _ => quote! { wgpu::ShaderStages::NONE },
-        };
-        quote! { (#set, #binding, #stages) }
-    });
+    let visibility = binding_stages
+        .iter()
+        .map(|(&(set, binding), &(vertex, fragment))| {
+            let stages = match (vertex, fragment) {
+                (true, true) => quote! { wgpu::ShaderStages::VERTEX_FRAGMENT },
+                (true, false) => quote! { wgpu::ShaderStages::VERTEX },
+                (false, true) => quote! { wgpu::ShaderStages::FRAGMENT },
+                _ => quote! { wgpu::ShaderStages::NONE },
+            };
+            quote! { (#set, #binding, #stages) }
+        });
     let label = format!("{key}:pipeline_{pipeline_index}");
     quote! {
         pub static #item: crate::graph::RenderItem = crate::graph::RenderItem {
@@ -993,14 +1030,14 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
             let args = compute_stage_args(pipeline)?;
             let bindings = binding_table_id(pipeline, pipeline_index);
             let stages = id(&format!("{entry}_stages"));
-            let out_bytes = id(&format!("{entry}_out_bytes"));
+            let out_size = id(&format!("{entry}_out_size"));
             Some(quote! {
                 (#key, #pipeline_index) => Some(crate::graph::ComputePass {
                     label: #entry,
                     module: #key,
                     bindings: #bindings,
                     stages: #stages(window_pixels, occ_pixels, #(#args),*).to_vec(),
-                    out_bytes: #out_bytes,
+                    out_size: #out_size,
                     runtime_counts: [window_pixels, occ_pixels],
                 })
             })
@@ -1016,14 +1053,14 @@ fn codegen_frame_graph(key: &str, desc: &Descriptor) -> TokenStream {
             let args = compute_stage_args(pipeline)?;
             let bindings = binding_table_id(pipeline, pipeline_index);
             let stages = id(&format!("{entry}_stages"));
-            let out_bytes = id(&format!("{entry}_out_bytes"));
+            let out_size = id(&format!("{entry}_out_size"));
             Some(quote! {
                 (#key, #entry) => Some(crate::graph::ComputePass {
                     label: #entry,
                     module: #key,
                     bindings: #bindings,
                     stages: #stages(window_pixels, occ_pixels, #(#args),*).to_vec(),
-                    out_bytes: #out_bytes,
+                    out_size: #out_size,
                     runtime_counts: [window_pixels, occ_pixels],
                 })
             })
@@ -1246,43 +1283,50 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
-    fn uniform_length_codegen_does_not_need_a_dispatch_domain() {
+    fn host_provided_length_codegen_does_not_need_a_dispatch_domain() {
         let desc: Descriptor =
             serde_json::from_str(include_str!("tests/fixtures/uniform_output_size.json")).unwrap();
         let pipeline = desc.pipelines.iter().find(|p| p.kind == "compute").unwrap();
         assert!(pipeline.stages.iter().all(|s| matches!(
             s.dispatch_size,
-            Some(DispatchSize::Fixed { x: 1, y: 1, z: 1 })
+            Some(DispatchSize::Fixed {
+                x: 1,
+                y: 1,
+                z: 1,
+                ..
+            })
         )));
         let code = codegen_pipeline(pipeline, &BufferInterfaces::new());
         syn::parse2::<syn::File>(code.clone()).expect("generated Rust parses");
-        let code = code.to_string();
-        assert!(code.contains("resolve_host_bytes"));
-        assert!(code
-            .split_whitespace()
-            .collect::<String>()
-            .contains("_uniforms(\"frame\",offset)"));
+        let code = code.to_string().split_whitespace().collect::<String>();
+        assert!(code.contains("OutputSize::HostProvided"));
+        assert!(code.contains("HostDispatch"));
+        assert!(code.contains("workgroup_size:[64u32,1u32,1u32]"));
+        assert!(code.contains("binding_name:\"frame\""));
+        assert!(code.contains("name:\"frame_resolution_x\""));
+        assert!(code.contains("name:\"frame_resolution_y\""));
         let output = pipeline
             .bindings
             .iter()
             .find(|b| b.usage.as_deref() == Some("output"))
             .unwrap();
         assert!(output_domain(pipeline, output).is_none());
-        let Length::HostExpression { count, elem_bytes } = output.length.as_ref().unwrap() else {
-            panic!("logical expression")
+        let Length::HostProvided { inputs, elem_bytes } = output.length.as_ref().unwrap() else {
+            panic!("host-provided length")
         };
-        for (w, h) in [(64.0f32, 32.0f32), (31.9, 7.8), (128.0, 65.0)] {
-            let bytes = wyn_pipeline_descriptor::BufferLen::HostExpression {
-                count: count.clone(),
-                elem_bytes: *elem_bytes,
-            }
-            .resolve_host_bytes(&|set, binding, offset| match (set, binding, offset) {
-                (0, 0, 0) => Some(w.to_bits()),
-                (0, 0, 4) => Some(h.to_bits()),
-                _ => None,
-            })
-            .unwrap();
-            assert_eq!(bytes, 4 * (w as i32 as u64) * (h as i32 as u64));
-        }
+        assert_eq!(*elem_bytes, 4);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].name, "frame_resolution_x");
+        assert_eq!(inputs[0].offset, 0);
+        assert_eq!(
+            inputs[0].scalar,
+            wyn_pipeline_descriptor::HostSizeScalar::F32
+        );
+        assert_eq!(inputs[1].name, "frame_resolution_y");
+        assert_eq!(inputs[1].offset, 4);
+        assert_eq!(
+            inputs[1].scalar,
+            wyn_pipeline_descriptor::HostSizeScalar::F32
+        );
     }
 }
