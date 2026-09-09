@@ -129,6 +129,8 @@ pub enum Role {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TexFormat {
     Rgba8Unorm,
+    // Supported descriptor format; the current graph does not request it.
+    #[allow(dead_code)]
     Rgba16Float,
     Rgba32Float,
     R32Float,
@@ -157,6 +159,8 @@ pub enum ImgAccess {
 pub enum ImgSize {
     /// Recreated on resize to match the surface (Hi-Z, G-buffer).
     Window,
+    // Retained for graphs with images whose extent is independent of the window.
+    #[allow(dead_code)]
     Fixed {
         w: u32,
         h: u32,
@@ -178,6 +182,8 @@ pub enum BindingKind {
     Texture,
     /// A `storage_image` view: fixed `vec4f32` texels; `format` is the on-GPU pixel
     /// format and `access` is how the shader reads/writes it.
+    // Generated when a Wyn pipeline declares a storage-image binding.
+    #[allow(dead_code)]
     StorageImage {
         format: TexFormat,
         access: ImgAccess,

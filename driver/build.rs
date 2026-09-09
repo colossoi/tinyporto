@@ -73,14 +73,6 @@ struct Pipeline {
     stages: Vec<Stage>,
     #[serde(default)]
     invocation: Option<Invocation>,
-    #[serde(default)]
-    fragment_outputs: Vec<FragmentOutput>,
-}
-
-#[derive(serde::Deserialize)]
-struct FragmentOutput {
-    location: u32,
-    name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -171,9 +163,9 @@ impl Binding {
             ("storage_texture", acc) => {
                 let format = self.format_tokens();
                 let access = match acc {
-                    Some("read_only") => quote! { ImgAccess::Read },
-                    Some("write_only") => quote! { ImgAccess::Write },
-                    Some("read_write") => quote! { ImgAccess::ReadWrite },
+                    Some("read_only") => quote! { crate::graph::ImgAccess::Read },
+                    Some("write_only") => quote! { crate::graph::ImgAccess::Write },
+                    Some("read_write") => quote! { crate::graph::ImgAccess::ReadWrite },
                     other => panic!("descriptor: storage_texture access {other:?}"),
                 };
                 quote! { BindingKind::StorageImage { format: #format, access: #access } }
@@ -190,9 +182,9 @@ impl Binding {
             "storage_texture" => {
                 let format = self.format_tokens();
                 let access = match (reads, writes) {
-                    (true, false) => quote! { ImgAccess::Read },
-                    (false, true) => quote! { ImgAccess::Write },
-                    (true, true) => quote! { ImgAccess::ReadWrite },
+                    (true, false) => quote! { crate::graph::ImgAccess::Read },
+                    (false, true) => quote! { crate::graph::ImgAccess::Write },
+                    (true, true) => quote! { crate::graph::ImgAccess::ReadWrite },
                     (false, false) => panic!("descriptor: unused stage storage texture"),
                 };
                 quote! { BindingKind::StorageImage { format: #format, access: #access } }
@@ -213,10 +205,10 @@ impl Binding {
     /// The `TexFormat` token for a `storage_texture`'s `format` field.
     fn format_tokens(&self) -> TokenStream {
         match self.format.as_deref() {
-            Some("rgba8_unorm") => quote! { TexFormat::Rgba8Unorm },
-            Some("rgba16_float") => quote! { TexFormat::Rgba16Float },
-            Some("rgba32_float") => quote! { TexFormat::Rgba32Float },
-            Some("r32_float") => quote! { TexFormat::R32Float },
+            Some("rgba8_unorm") => quote! { crate::graph::TexFormat::Rgba8Unorm },
+            Some("rgba16_float") => quote! { crate::graph::TexFormat::Rgba16Float },
+            Some("rgba32_float") => quote! { crate::graph::TexFormat::Rgba32Float },
+            Some("r32_float") => quote! { crate::graph::TexFormat::R32Float },
             other => panic!("descriptor: storage_texture format {other:?}"),
         }
     }
@@ -517,6 +509,7 @@ fn image_pixels_param(p: &Pipeline, set: u32, b: u32) -> Ident {
 
 // These two leading arguments form the ComputePass ABI. A BTreeSet sorts
 // occ_pixels before window_pixels, silently reversing both dispatch and capacity.
+// Keep both slots even when unused, but prefix those parameter names with `_`.
 fn ordered_runtime_params(params: &std::collections::BTreeSet<String>) -> Vec<Ident> {
     ["window_pixels", "occ_pixels"]
         .into_iter()
@@ -526,7 +519,13 @@ fn ordered_runtime_params(params: &std::collections::BTreeSet<String>) -> Vec<Id
                 .map(String::as_str)
                 .filter(|name| *name != "window_pixels" && *name != "occ_pixels"),
         )
-        .map(id)
+        .map(|name| {
+            if params.contains(name) {
+                id(name)
+            } else {
+                id(&format!("_{name}"))
+            }
+        })
         .collect()
 }
 
@@ -591,9 +590,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
     // byte size of every input a derived stage sizes from (sorted union), so a
     // fixed-grid stage needs no argument.
     let mut disp_params: std::collections::BTreeSet<String> =
-        ["window_pixels".to_string(), "occ_pixels".to_string()]
-            .into_iter()
-            .collect();
+        std::collections::BTreeSet::new();
     let stage_rows: Vec<TokenStream> = p
         .stages
         .iter()
@@ -665,9 +662,7 @@ fn codegen_pipeline(p: &Pipeline, interfaces: &BufferInterfaces) -> TokenStream 
         .filter(|b| matches!(b.usage.as_deref(), Some("output") | Some("intermediate")))
         .collect();
     let mut params: std::collections::BTreeSet<String> =
-        ["window_pixels".to_string(), "occ_pixels".to_string()]
-            .into_iter()
-            .collect();
+        std::collections::BTreeSet::new();
     let arms: Vec<TokenStream> = outputs
         .iter()
         .map(|o| {
@@ -1188,8 +1183,7 @@ fn main() {
     // One codegen path (quote). Each root contributes its embedded-SPIR-V row and
     // its descriptor translation; everything is emitted into a single file.
     let mut shader_rows: Vec<TokenStream> = Vec::new();
-    let mut codegen =
-        quote! { use crate::graph::{BindingKind, BindingUsage, ImgAccess, TexFormat}; };
+    let mut codegen = quote! { use crate::graph::{BindingKind, BindingUsage}; };
 
     for (key, rel) in ROOTS {
         let src = repo.join(rel);
