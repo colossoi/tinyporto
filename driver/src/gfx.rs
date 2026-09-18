@@ -27,7 +27,8 @@ async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("tinyporto-device"),
-            required_features: wgpu::Features::empty(),
+            // Pass-boundary timestamps are optional so older adapters still run.
+            required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),

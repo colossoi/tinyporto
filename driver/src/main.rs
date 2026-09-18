@@ -4,6 +4,7 @@
 mod app;
 mod camera;
 mod gfx;
+mod gpu_timer;
 mod graph;
 mod wync;
 
@@ -30,6 +31,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use camera::Camera;
 use gfx::Gfx;
+use gpu_timer::GpuTimer;
 use graph::*;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -143,6 +145,7 @@ struct Renderer {
     )>,
     depth_view: Option<wgpu::TextureView>,
     passes: Vec<BuiltPass>,
+    gpu_timer: Option<GpuTimer>,
     graph: Graph,
     pingpong: HashMap<&'static str, [wgpu::Buffer; 2]>,
     img_formats: HashMap<&'static str, TexFormat>,
@@ -465,6 +468,7 @@ impl Renderer {
             }
         }
 
+        let gpu_timer = GpuTimer::new(device, &gfx.queue, passes.len());
         Ok(Self {
             gfx,
             buffers,
@@ -472,6 +476,7 @@ impl Renderer {
             blocks,
             depth_view,
             passes,
+            gpu_timer,
             graph: graph.clone(),
             pingpong,
             img_formats,
@@ -637,14 +642,26 @@ impl Renderer {
 
     /// Record all passes for one frame into `enc`, drawing into `target`. Shared
     /// by the window path (`render`) and the offscreen path (`screenshot`).
-    fn record(&self, enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+    fn record(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        timestamps: Option<&wgpu::QuerySet>,
+    ) {
         let parity = (self.frame & 1) as usize;
-        for pass in &self.passes {
+        for (index, pass) in self.passes.iter().enumerate() {
+            let query = index as u32 * 2;
             match pass {
                 BuiltPass::Compute(c) => {
                     let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some(c.label),
-                        timestamp_writes: None,
+                        timestamp_writes: timestamps.map(|query_set| {
+                            wgpu::ComputePassTimestampWrites {
+                                query_set,
+                                beginning_of_pass_write_index: Some(query),
+                                end_of_pass_write_index: Some(query + 1),
+                            }
+                        }),
                     });
                     for stage in &c.stages {
                         cp.set_pipeline(&stage.pipeline);
@@ -702,7 +719,13 @@ impl Renderer {
                         label: Some("render"),
                         color_attachments: &color_attachments,
                         depth_stencil_attachment: depth_attach,
-                        timestamp_writes: None,
+                        timestamp_writes: timestamps.map(|query_set| {
+                            wgpu::RenderPassTimestampWrites {
+                                query_set,
+                                beginning_of_pass_write_index: Some(query),
+                                end_of_pass_write_index: Some(query + 1),
+                            }
+                        }),
                         occlusion_query_set: None,
                     });
                     for it in &r.items {
@@ -731,6 +754,9 @@ impl Renderer {
     }
 
     fn render(&mut self, cam: &Camera, mods: u32) -> Result<()> {
+        if let Some(timer) = &mut self.gpu_timer {
+            timer.collect(&self.gfx.device);
+        }
         self.update_uniforms(cam, mods, self.start.elapsed().as_secs_f32());
         let surface = self
             .gfx
@@ -754,8 +780,19 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        self.record(&mut enc, &view);
+        let timing = self
+            .gpu_timer
+            .as_ref()
+            .and_then(|timer| timer.available_slot().map(|slot| (timer, slot)));
+        self.record(&mut enc, &view, timing.map(|(timer, _)| timer.queries()));
+        if let Some((timer, slot)) = timing {
+            timer.resolve(&mut enc, slot);
+        }
+        let timing_slot = timing.map(|(_, slot)| slot);
         self.gfx.queue.submit(Some(enc.finish()));
+        if let Some(slot) = timing_slot {
+            self.gpu_timer.as_mut().unwrap().request_readback(slot);
+        }
         frame.present();
         self.frame = self.frame.wrapping_add(1);
         Ok(())
@@ -863,7 +900,7 @@ impl Renderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("offscreen"),
                 });
-            self.record(&mut enc, &view);
+            self.record(&mut enc, &view, None);
             self.gfx.queue.submit(Some(enc.finish()));
             let _ = self.gfx.device.poll(wgpu::PollType::Wait {
                 submission_index: None,
@@ -1731,9 +1768,15 @@ impl ApplicationHandler for App {
                 let elapsed = now.duration_since(self.fps_start).as_secs_f64();
                 if elapsed >= 0.5 && self.fps_frames > 0 {
                     let fps = f64::from(self.fps_frames) / elapsed;
-                    let frame_ms = elapsed * 1000.0 / f64::from(self.fps_frames);
+                    let timing = match renderer.gpu_timer.as_mut() {
+                        Some(timer) => match timer.take_average_ms() {
+                            Some(ms) => format!("{ms:.2} ms GPU"),
+                            None => "GPU timing pending".into(),
+                        },
+                        None => "GPU timing unavailable".into(),
+                    };
                     if let Some(window) = &self.window {
-                        window.set_title(&format!("tiny porto — {fps:.0} FPS · {frame_ms:.1} ms"));
+                        window.set_title(&format!("tiny porto — {fps:.0} FPS · {timing}"));
                     }
                     self.fps_start = now;
                     self.fps_frames = 0;
@@ -1985,6 +2028,7 @@ mod allocation_tests {
             blocks: vec![],
             depth_view: None,
             passes: vec![BuiltPass::Compute(built)],
+            gpu_timer: None,
             graph,
             output_sizes: vec![(cp.clone(), 2, "pixels"), (cp, 2, "history")],
             frame: 0,

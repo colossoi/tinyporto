@@ -31,6 +31,12 @@ Shaders are compiled at **build time** (`build.rs` → `wyn compile`) and embedd
 into the binary via `include_bytes!`, so the driver does no shader I/O at runtime
 and never shells out to `wyn`. Editing any `wyn/*.wyn` triggers a rebuild.
 
+The window title shows wall-clock FPS and **GPU milliseconds**, averaged over
+completed timestamp samples roughly every half second. GPU time sums the compute
+and rendering passes; it excludes CPU work, frame-cap/vsync waits, and gaps between
+passes. Readback is asynchronous. Adapters without timestamp-query support show
+`GPU timing unavailable`.
+
 You should see a sand ground (a 1 m Voronoi grid) with ochre flat-roofed
 buildings under a tilted-diorama orbit camera, and a cyan brush ring tracking the
 mouse. **Hold the left mouse button** to paint water — canals follow the Voronoi
