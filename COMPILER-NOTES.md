@@ -27,8 +27,8 @@ passing wgpu/naga) run it through the driver to catch validation errors.
 2. **A `loop` inside a `map` must not reference values bound outside the `map`.**
    Doing so panics the compiler: *"FuncParam/BlockParam NodeId(..) should have been
    pre-populated in elaborated map."* Workaround: compute those values **inside** the
-   map body (e.g. in `step`'s tessellation maps, recompute per-element rather than
-   hoisting). Per-invocation image entries sidestep this entirely (no `map`).
+   map body. Per-invocation image and graphics entries sidestep this entirely
+   (no `map`).
 
 3. **A `def` may take a `storage_image`/`texture2d` parameter.** The compiler inlines
    the helper or specializes it per call-site, binding its image ops to the concrete

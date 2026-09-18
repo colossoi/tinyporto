@@ -171,26 +171,8 @@ pub fn graph(w: u32, h: u32) -> Graph {
                 name: "occ",
                 size: None,
             },
-            // Derived `step` outputs: ground geometry (two parallel (pos,kind)/(nrm,attr)
-            // streams) + its draw args; the per-instance prop records + their draw args.
-            Resource::Buffer(BufferDef {
-                name: "geom_pos",
-                size: None,
-                init: BufInit::Zeroed,
-                indirect: false,
-            }),
-            Resource::Buffer(BufferDef {
-                name: "geom_nrm",
-                size: None,
-                init: BufInit::Zeroed,
-                indirect: false,
-            }),
-            Resource::Buffer(BufferDef {
-                name: "draw_args",
-                size: None,
-                init: BufInit::Zeroed,
-                indirect: true,
-            }),
+            // Derived frame outputs: the compacted prop records and their draw args.
+            // Ground vertices are generated directly by the vertex stage.
             Resource::Buffer(BufferDef {
                 name: "prop_inst",
                 size: None,
@@ -276,15 +258,10 @@ pub fn graph(w: u32, h: u32) -> Graph {
             ("tinyporto_frame__compute_0_output_1", "points"),
             ("tinyporto_frame__compute_0_output_2", "items"),
             ("tinyporto_frame__compute_0_output_3", "head"),
-            ("tinyporto_frame__compute_1_output_0", "geom_pos"),
-            ("tinyporto_frame__compute_1_output_1", "geom_nrm"),
-            ("tinyporto_frame__compute_1_output_2", "draw_args"),
-            ("tinyporto_frame__compute_2_output_0", "prop_inst"),
-            ("tinyporto_frame__compute_2_output_1", "prop_args"),
-            ("tinyporto_frame__compute_3_output_0", "ao_work"),
-            ("tinyporto_frame__compute_3_output_1", "occ"),
-            ("geom_pos", "geom_pos"),
-            ("geom_nrm", "geom_nrm"),
+            ("tinyporto_frame__compute_1_output_0", "prop_inst"),
+            ("tinyporto_frame__compute_1_output_1", "prop_args"),
+            ("tinyporto_frame__compute_2_output_0", "ao_work"),
+            ("tinyporto_frame__compute_2_output_1", "occ"),
             // The one instanced prop stream, read by both stages of the prop draw.
             ("prop_inst", "prop_inst"),
             // G-buffer views read by the deferred resolve fragment.
@@ -313,7 +290,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
                 }],
                 items: &SUN_SHADOW_ITEMS,
             }),
-            // Scene: the flat ground (materialized ribbon), then one instanced draw over
+            // Scene: the procedurally tessellated ground, then one instanced draw over
             // every prop — cobble setts and wall blocks. Both depth-tested; the props
             // protrude and self-occlude, and the wall blocks occlude the setts.
             Pass::Render(RenderPass {
@@ -345,7 +322,7 @@ pub fn graph(w: u32, h: u32) -> Graph {
             // invocation integrates horizon AO into ao_work; the first occ_w*occ_h also min
             // their coarse occ_depth tile, which `cull` reads next frame. Runs before the
             // resolve, which reads ao_work and folds the edge-aware denoise into shading.
-            Pass::Compute(compute_entry("main", "tinyporto_frame__compute_3", w, h)),
+            Pass::Compute(compute_entry("main", "tinyporto_frame__compute_2", w, h)),
             // Deferred resolve: one fullscreen triangle whose fragment reads the G-buffer,
             // folds in the GTAO term (including the edge-aware denoise of ao_work) and
             // writes the final colour (sun + shadows + AO-attenuated sky, tonemapped)
@@ -379,21 +356,19 @@ mod tests {
             .passes
             .iter()
             .find_map(|pass| match pass {
-                Pass::Compute(pass) if pass.label == "tinyporto_frame__compute_3" => Some(pass),
+                Pass::Compute(pass) if pass.label == "tinyporto_frame__compute_2" => Some(pass),
                 _ => None,
             })
             .expect("GTAO compute pass");
-        let binding =
-            pass.bindings
-                .iter()
-                .find_map(|&(_, binding, _, usage, name)| {
-                    (usage == BindingUsage::Output
-                        && graph.names.iter().any(|&(binding_name, target)| {
-                            binding_name == name && target == resource
-                        }))
+        let binding = pass
+            .bindings
+            .iter()
+            .find_map(|&(_, binding, _, usage, name)| {
+                (usage == BindingUsage::Output
+                    && crate::name_to_resource(graph, pass.module, name) == resource)
                     .then_some(binding)
-                })
-                .expect("host-sized output binding");
+            })
+            .expect("host-sized output binding");
         let OutputSize::HostProvided { inputs, elem_bytes } =
             (pass.out_size)(binding, pass.runtime_counts[0], pass.runtime_counts[1])
         else {

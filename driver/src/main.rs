@@ -1166,10 +1166,13 @@ fn name_to_resource(
     let Some(descriptor) = generated::descriptor_resource(module, binding_name) else {
         return binding_name;
     };
-    descriptor
-        .binding_names
-        .iter()
-        .find_map(|alias| authored(alias))
+    authored(descriptor.name)
+        .or_else(|| {
+            descriptor
+                .binding_names
+                .iter()
+                .find_map(|alias| authored(alias))
+        })
         .unwrap_or(descriptor.name)
 }
 
@@ -1474,14 +1477,16 @@ fn build_item(
         bind_group_layouts: &layout_refs,
         push_constant_ranges: &[],
     });
-    let depth_stencil = if has_depth && it.depth_test != DepthTest::Disabled {
-        // Depth-writers test LessEqual: protruding geometry self-occludes, while
-        // coplanar fragments at equal depth let the later draw win, preserving
-        // painter order within the geometry stream. Non-writers test Always.
+    let depth_stencil = if has_depth {
+        // The format must match the pass even when this item ignores depth.
+        // Disabled testing neither rejects fragments nor changes stored depth.
         Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: it.depth_write,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_write_enabled: it.depth_test != DepthTest::Disabled && it.depth_write,
+            depth_compare: match it.depth_test {
+                DepthTest::Disabled => wgpu::CompareFunction::Always,
+                DepthTest::LessEqual => wgpu::CompareFunction::LessEqual,
+            },
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         })
@@ -1888,17 +1893,22 @@ mod allocation_tests {
             .passes
             .iter()
             .find_map(|pass| match pass {
-                Pass::Compute(pass) if pass.label == "tinyporto_frame__compute_3" => Some(pass),
+                Pass::Compute(pass) if pass.label == "tinyporto_frame__compute_2" => Some(pass),
                 _ => None,
             })
             .expect("postprocess pass");
-        assert_eq!(pass.stages.len(), 2);
+        let host_stages = pass
+            .stages
+            .iter()
+            .filter(|stage| stage.host_dispatch.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(host_stages.len(), 2);
         assert_eq!(
-            resolve_compute_stage_groups(&graph, pass, &pass.stages[0], &snapshot),
+            resolve_compute_stage_groups(&graph, pass, host_stages[0], &snapshot),
             [(width * height).div_ceil(64), 1, 1]
         );
         assert_eq!(
-            resolve_compute_stage_groups(&graph, pass, &pass.stages[1], &snapshot),
+            resolve_compute_stage_groups(&graph, pass, host_stages[1], &snapshot),
             [(width.div_ceil(8) * height.div_ceil(8)).div_ceil(64), 1, 1,]
         );
     }

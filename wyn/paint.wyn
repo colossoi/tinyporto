@@ -7,8 +7,9 @@
 --   * water  (kind 1): a stroke (control-point polyline) swept by a big radius
 --   * fence  (kind 2): a stroke swept by a small half-width
 --   * building (kind 3): a single center point, fixed-size rectangle
--- Strokes capture control points online (Reumann-Witkam); ground_pos/ground_nrm
--- tessellate them into a flat triangle ribbon. Nothing is drawn above the ground.
+-- Strokes capture control points online (Reumann-Witkam); `ground_vertex_at`
+-- tessellates them directly in the ground vertex stage. Nothing is drawn above
+-- the ground.
 --
 -- Library module: no `open`; f32.* qualified (see math.wyn for the idiom).
 
@@ -55,10 +56,6 @@ def pack_paint_item(it: paint_item) vec4f32 =
   @[it.kind, f32(it.point_start), f32(it.point_count), it.param]
 
 type ground_vertex = { pos: vec3f32, kind: f32, nrm: vec3f32, attr: f32 }
-
-def ground_vertex_from_packed(pos: vec4f32, nrm: vec4f32) ground_vertex =
-  { pos = @[pos.x, pos.y, pos.z], kind = pos.w,
-    nrm = @[nrm.x, nrm.y, nrm.z], attr = nrm.w }
 
 -- Rendering.
 def GROUND_HALF: f32 = 20.0    -- half-size of the ground quad (40 m patch)
@@ -117,12 +114,3 @@ def ground_vertex_at(vertex_index: i32, items: []vec4f32, points: []vec2f32) gro
         let u1 = f32(sub + 1) / f32(CR_SUB)
         let (position, edge) = curves.ribbon_vertex(p0, p1, p2, p3, u0, u1, item.param, corner) in
         { pos = @[position.x, 0.0, position.y], kind = item.kind, nrm = up, attr = edge }
-
--- Pack position/kind and normal/edge into the two render streams.
-def ground_pos(vertex_index: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
-  let vertex = ground_vertex_at(vertex_index, items, points) in
-  @[vertex.pos.x, vertex.pos.y, vertex.pos.z, vertex.kind]
-
-def ground_nrm(vertex_index: i32, items: []vec4f32, points: []vec2f32) vec4f32 =
-  let vertex = ground_vertex_at(vertex_index, items, points) in
-  @[vertex.nrm.x, vertex.nrm.y, vertex.nrm.z, vertex.attr]

@@ -68,6 +68,8 @@ struct FrameGraphBinding {
 struct Pipeline {
     kind: String,
     #[serde(default)]
+    source_operation: Option<u32>,
+    #[serde(default)]
     bindings: Vec<Binding>,
     #[serde(default)]
     stages: Vec<Stage>,
@@ -547,22 +549,30 @@ fn host_size_input_tokens(
     p: &Pipeline,
     input: &wyn_pipeline_descriptor::HostSizeInput,
 ) -> TokenStream {
+    let wyn_pipeline_descriptor::HostSizeInput::Uniform {
+        name,
+        set,
+        binding: slot,
+        offset,
+        scalar,
+    } = input
+    else {
+        panic!("Tinyporto requires uniform-backed host size inputs");
+    };
     let binding_name = p
         .bindings
         .iter()
-        .find(|binding| {
-            binding.ty == "uniform" && binding.set == input.set && binding.binding == input.binding
-        })
+        .find(|binding| binding.ty == "uniform" && binding.set == *set && binding.binding == *slot)
         .map(|binding| binding.name.as_str())
         .unwrap_or_else(|| {
             panic!(
                 "descriptor: host-size input {} refers to missing uniform {}:{}",
-                input.name, input.set, input.binding
+                name, set, slot
             )
         });
-    let name = input.name.as_str();
-    let (set, binding, offset) = (input.set, input.binding, input.offset);
-    let scalar = id(&format!("{:?}", input.scalar));
+    let name = name.as_str();
+    let binding = slot;
+    let scalar = id(&format!("{scalar:?}"));
     quote! {
         crate::graph::HostSizeInput {
             name: #name,
@@ -903,6 +913,30 @@ fn codegen_graphics_item(key: &str, p: &Pipeline, pipeline_index: usize) -> Toke
     }
 }
 
+/// Graphics aliases use explicit source-operation identity, independent of
+/// descriptor scheduling order and opaque shader entry-point names.
+fn codegen_graphics_aliases(pipelines: &[Pipeline]) -> TokenStream {
+    let mut aliases = TokenStream::new();
+    let mut seen = std::collections::HashSet::new();
+    for (pipeline_index, p) in pipelines
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind == "graphics")
+    {
+        let Some(ordinal) = p.source_operation else {
+            panic!("descriptor: graphics pipeline {pipeline_index} has no source_operation");
+        };
+        assert!(
+            seen.insert(ordinal),
+            "descriptor: duplicate graphics operation {ordinal}"
+        );
+        let item = id(&format!("PIPELINE_{pipeline_index}_ITEM"));
+        let alias = id(&format!("GRAPHICS_{ordinal}_ITEM"));
+        aliases.extend(quote! { pub use #item as #alias; });
+    }
+    aliases
+}
+
 /// Emit the `UNIFORM_BLOCKS` table: every record-typed uniform block across all
 /// pipelines (deduped by name), each with its std140 size and (field, offset,
 /// size) members. The driver packs its `frame_globals` fill against this.
@@ -1222,21 +1256,34 @@ fn main() {
     let mut shader_rows: Vec<TokenStream> = Vec::new();
     let mut codegen = quote! { use crate::graph::{BindingKind, BindingUsage}; };
 
+    println!("cargo:rerun-if-env-changed=WYN_PRECOMPILED_DIR");
+    let precompiled = std::env::var_os("WYN_PRECOMPILED_DIR").map(PathBuf::from);
+
     for (key, rel) in ROOTS {
         let src = repo.join(rel);
         let spv = out_dir.join(format!("{key}.spv"));
-        let status = Command::new(&wyn)
-            .args(["build", "--graphics"])
-            .arg(&src)
-            .arg("-o")
-            .arg(&spv)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to run `wyn build` ({e}); is `wyn` on PATH?"));
-        assert!(
-            status.success(),
-            "`wyn build --graphics {}` failed",
-            src.display()
-        );
+        if let Some(directory) = &precompiled {
+            // The compiler can be run manually; consume exactly those artifacts.
+            for extension in ["spv", "json"] {
+                let source = directory.join(format!("{key}.{extension}"));
+                println!("cargo:rerun-if-changed={}", source.display());
+                std::fs::copy(&source, out_dir.join(format!("{key}.{extension}")))
+                    .unwrap_or_else(|e| panic!("copy {}: {e}", source.display()));
+            }
+        } else {
+            let status = Command::new(&wyn)
+                .args(["build", "--graphics"])
+                .arg(&src)
+                .arg("-o")
+                .arg(&spv)
+                .status()
+                .unwrap_or_else(|e| panic!("failed to run `wyn build` ({e}); is `wyn` on PATH?"));
+            assert!(
+                status.success(),
+                "`wyn build --graphics {}` failed",
+                src.display()
+            );
+        }
 
         let spv_rel = format!("/{key}.spv");
         shader_rows.push(quote! { (#key, include_bytes!(concat!(env!("OUT_DIR"), #spv_rel))) });
@@ -1253,18 +1300,7 @@ fn main() {
             codegen.extend(codegen_bindings(p, pipeline_index));
             codegen.extend(codegen_graphics_item(key, p, pipeline_index));
         }
-        // Graphics ordinals stay stable when compute materializations are inserted.
-        for (ordinal, (pipeline_index, _)) in desc
-            .pipelines
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.kind == "graphics")
-            .enumerate()
-        {
-            let item = id(&format!("PIPELINE_{pipeline_index}_ITEM"));
-            let alias = id(&format!("GRAPHICS_{ordinal}_ITEM"));
-            codegen.extend(quote! { pub use #item as #alias; });
-        }
+        codegen.extend(codegen_graphics_aliases(&desc.pipelines));
         codegen.extend(codegen_uniform_blocks(&desc.pipelines));
         codegen.extend(codegen_frame_graph(key, &desc));
     }
@@ -1282,6 +1318,40 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphics_aliases_preserve_operation_identity_after_scheduling() {
+        // Compute insertion and graphics reordering must both preserve the
+        // application's mapping: shadow=0, ground=1, props=2, resolve=3.
+        let pipelines = [None, Some(0), Some(1), None, Some(3), Some(2)]
+            .into_iter()
+            .map(|ordinal| {
+                let Some(ordinal) = ordinal else {
+                    return serde_json::from_str::<Pipeline>(r#"{"kind":"compute"}"#).unwrap();
+                };
+                serde_json::from_value(serde_json::json!({
+                    "kind": "graphics",
+                    "source_operation": ordinal,
+                    "stages": [
+                        {"entry_point": format!("opaque_vertex_{ordinal}"), "owner": "frame", "stage": "vertex"},
+                        {"entry_point": format!("opaque_fragment_{ordinal}"), "owner": "frame", "stage": "fragment"}
+                    ]
+                })).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let code = codegen_graphics_aliases(&pipelines);
+        let file = syn::parse2::<syn::File>(code).expect("aliases parse");
+        assert_eq!(
+            prettyplease::unparse(&file),
+            concat!(
+                "pub use PIPELINE_1_ITEM as GRAPHICS_0_ITEM;\n",
+                "pub use PIPELINE_2_ITEM as GRAPHICS_1_ITEM;\n",
+                "pub use PIPELINE_4_ITEM as GRAPHICS_3_ITEM;\n",
+                "pub use PIPELINE_5_ITEM as GRAPHICS_2_ITEM;\n",
+            )
+        );
+    }
+
     #[test]
     fn host_provided_length_codegen_does_not_need_a_dispatch_domain() {
         let desc: Descriptor =
@@ -1316,17 +1386,11 @@ mod tests {
         };
         assert_eq!(*elem_bytes, 4);
         assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[0].name, "frame_resolution_x");
-        assert_eq!(inputs[0].offset, 0);
-        assert_eq!(
-            inputs[0].scalar,
-            wyn_pipeline_descriptor::HostSizeScalar::F32
+        assert!(
+            matches!(&inputs[0], wyn_pipeline_descriptor::HostSizeInput::Uniform { name, offset: 0, scalar: wyn_pipeline_descriptor::HostSizeScalar::F32, .. } if name == "frame_resolution_x")
         );
-        assert_eq!(inputs[1].name, "frame_resolution_y");
-        assert_eq!(inputs[1].offset, 4);
-        assert_eq!(
-            inputs[1].scalar,
-            wyn_pipeline_descriptor::HostSizeScalar::F32
+        assert!(
+            matches!(&inputs[1], wyn_pipeline_descriptor::HostSizeInput::Uniform { name, offset: 4, scalar: wyn_pipeline_descriptor::HostSizeScalar::F32, .. } if name == "frame_resolution_y")
         );
     }
 }

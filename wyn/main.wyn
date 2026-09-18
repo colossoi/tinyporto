@@ -75,12 +75,6 @@ type draw_command = {
   first_instance: u32,
 }
 
-type scene_geometry = {
-  geom_pos: []vec4f32,
-  geom_nrm: []vec4f32,
-  draw: draw_command,
-}
-
 type visibility = {
   prop_inst: []prop,
   draw: draw_command,
@@ -108,16 +102,6 @@ def create_or_extend_item(previous_items: []vec4f32, head: stroke_head,
                               point_count = item.point_count + capture.emitted_count, param = item.param })
           else previous_items[i], iota(ITEMS_CAP))
 
-def ground_positions(items: []vec4f32, points: []vec2f32) []vec4f32 =
-  map(|s| ground_pos(s, items, points), iota(TESS_CAP))
-
-def ground_normals(items: []vec4f32, points: []vec2f32) []vec4f32 =
-  map(|s| ground_nrm(s, items, points), iota(TESS_CAP))
-
-def ground_draw: draw_command =
-  { vertex_count = u32(TESS_CAP), instance_count = 1u32,
-    first_vertex = 0u32, first_instance = 0u32 }
-
 -- Apply UI shortcuts, capture stroke points, and create or extend the current item.
 def update_world(frame: frame_globals, events: []vec4f32, previous_world: world) world =
   let ui = ui_state_from_buffer(previous_world.ui)
@@ -131,15 +115,6 @@ def update_world(frame: frame_globals, events: []vec4f32, previous_world: world)
     points = append_captured_points(previous_world.points, head.point_count, capture),
     items = create_or_extend_item(previous_world.items, head, capture, ui.tool),
     head = pack_stroke_head(record_capture_progress(head, capture)) }
-
--- Ground geometry derived from the (previous) world: two parallel vertex streams
--- (geom_pos = pos.xyz+kind, geom_nrm = nrm.xyz+attr) over the tessellation domain,
--- plus the non-indexed ground draw args. Tessellates the PREVIOUS points/items, so
--- rendered geometry lags input by one frame (imperceptible).
-def tessellate_ground(painted_world: world) scene_geometry =
-  { geom_pos = ground_positions(painted_world.items, painted_world.points),
-    geom_nrm = ground_normals(painted_world.items, painted_world.points),
-    draw = ground_draw }
 
 ------------------------------------------------------------
 -- Coarse-depth occlusion. Each tile stores the nearest surface depth from the
@@ -240,16 +215,15 @@ def occ_reduce_tile(scene: render_target<gbuffer>, resolution: vec3f32,
 -- Project tessellated ground vertices and write their surface data to the G-buffer.
 type scene_varying = { kind: f32, attr: f32, normal: vec3f32 }
 
--- Pull (pos.xyz, kind) and (nrm.xyz, attr) for one requested vertex and project.
--- The complete varying payload is an ordinary record in the unified vocabulary.
-def scene_vertex(frame: frame_globals, vertex_positions: []vec4f32,
-                 vertex_normals: []vec4f32, vertex_index: u32,
+-- Derive the requested ground vertex directly from the previous painted state,
+-- then project it.  The tessellation domain has exactly one consumer with the
+-- same vertex index, so a materialized intermediate stream is unnecessary.
+def scene_vertex(frame: frame_globals, painted_scene: painted,
+                 vertex_index: u32,
                  _instance_index: u32, _draw_index: u32)
   vertex<scene_varying> =
   let vid = i32(vertex_index)
-  let p = vertex_positions[vid]
-  let n = vertex_normals[vid]
-  let v = ground_vertex_from_packed(p, n) in
+  let v = ground_vertex_at(vid, painted_scene.items, painted_scene.points) in
   vertex_output(
     world_to_clip(v.pos, frame.resolution, camera_from_frame(frame)),
     { kind = v.kind, attr = v.attr, normal = v.nrm })
@@ -582,7 +556,6 @@ entry tinyporto_frame(
     ([]f32, []vec2f32, []vec4f32, []f32, []f32,
      render_target<f32>, render_target<gbuffer>, render_target<vec4f32>) =
   let next_world = update_world(frame, events, { ui = uistate_in, points = points_in, items = items_in, head = head_in })
-  let ground = tessellate_ground({ ui = uistate_in, points = points_in, items = items_in, head = head_in })
   let visible = cull_props({ points = points_in, items = items_in }, frame, occ_in)
 
   -- Render sunlight visibility from all walls, independently of the camera.
@@ -592,8 +565,8 @@ entry tinyporto_frame(
 
   -- Fill the scene G-buffer with the ground, then the visible props.
   let ground_triangles = rasterize_triangles(
-    indirect_draw(ground.draw),
-    scene_vertex(frame, ground.geom_pos, ground.geom_nrm, _, _, _))
+    direct_draw(u32(TESS_CAP), 1u32),
+    scene_vertex(frame, { points = points_in, items = items_in }, _, _, _))
   let ground_image = shade_with(opaque_depth, scene, ground_triangles, scene_fragment)
   let prop_triangles = rasterize_triangles(
     indirect_draw(visible.draw), prop_vertex(frame, visible.prop_inst, _, _, _))
