@@ -1,0 +1,74 @@
+-- REGRESSION: fixed in the compiler retested on 2026-09-22 (installed 12:34).
+-- GPU readback now returns 0.8 for sampled[0], scene[0,0], and surface[0,0].x.
+-- The full tinyporto frame also produces 0/1000 coarse-depth tile mismatches
+-- against the final scene depth at 320x200, down from 56/1000 before the fix.
+-- The original failure and passing control are documented below.
+--
+-- ORIGINAL BUG: rust-wgpu schedules a compute consumer of a render target before the
+-- draw that produces the target's requested version. The source below draws
+-- 0.2, then draws 0.8 using filtered vertices, then reads the finished image in
+-- a compute map and displays that map. Every sampled value must therefore be 0.8.
+--
+-- Reproduce from this file's directory:
+-- wyn build --graphics -O --target-double rust-wgpu --target spirv rust_host_draw_consumer_order.wyn -o draw_order.spv
+-- Inspect draw_order.rs, or include it as a module in a wgpu 27 program and call
+-- let mut host = HostContext::new(&device)?;
+-- host_reproduce(&mut host, &queue, &values, &coords, &scene, &surface).
+-- values: STORAGE buffer of three vec4f32 fullscreen-triangle vertices:
+--   [-1,-1,0,1], [3,-1,0,1], [-1,3,0,1]. All pass the filter unchanged.
+-- coords: STORAGE buffer containing one vec2i32 [0,0].
+-- scene: 16x16 R32Float; surface: separate 16x16 Rgba32Float.
+-- Both textures need RENDER_ATTACHMENT | TEXTURE_BINDING; add COPY_SRC to read
+-- them back. No depth attachment or optional device feature is needed.
+--
+-- EXPECTED: output.values[0] (the sampled buffer), scene[0,0], and surface[0,0].x
+-- are all 0.8. The second draw must finish before the sampling map; the resolve
+-- draw must follow that map.
+-- BEFORE THE FIX: sampled[0] = 0.2, final scene[0,0] = 0.8, surface[0,0].x = 0.2.
+-- Confirmed by GPU readback on wgpu 27 / Vulkan on 2026-09-22.
+-- This also reproduced with the initial persistent HostContext API that day.
+-- The incorrect emitted order was first draw (reproduce_vertex), sampling dispatch
+-- (reproduce_compute_1_compute), resolve draw (reproduce_vertex_3), and only
+-- then the second scene draw (reproduce_vertex_2). Filter stages occur between
+-- these operations. The consumer reads the previous contents of the attachment.
+-- This is a scheduling error, not a missing memory barrier or host input error.
+--
+-- CONTROL: replace only filtered's body with map(|v| v, values). For the three
+-- vertices above this produces the same vertex array, but removes the filter's
+-- multi-stage dependency chain. The generated order and all three values are
+-- then correct (0.8).
+--
+-- In tinyporto the corresponding error ran the coarse-depth reduction before
+-- the prop draw, so next-frame occlusion missed props. GPU readback at 320x200
+-- found 56/1000 tiles different from the minimum depth of the finished scene.
+-- The compiler must schedule each vertex/fragment pair as one draw, or otherwise
+-- ensure no consumer of its attachment can run until the whole draw is ready.
+
+def filtered(values: []vec4f32) []vec4f32 =
+  let selected = filter(|v: vec4f32| v.w > 0.0, values) in
+  map(|v| v, selected)
+
+def replace_state: fragment_state = {
+  depth_test = #disabled, depth_write = false,
+  blend = #replace, color_write = true,
+}
+
+entry reproduce(values: []vec4f32, coords: []vec2i32,
+                scene: render_target<f32>, surface: render_target<vec4f32>)
+    ([]f32, render_target<f32>, render_target<vec4f32>) =
+  let visible = filtered(values)
+  let ground_raster = rasterize_triangles(direct_draw(3u32, 1u32),
+    |index: u32, _: u32, _: u32| vertex_output(values[i32(index)], 0.2))
+  let ground = shade_with(replace_state, scene, ground_raster,
+    |value, _, _, _, _| value)
+  let prop_raster = rasterize_triangles(direct_draw(3u32, 1u32),
+    |index: u32, _: u32, _: u32| vertex_output(visible[i32(index)], 0.8))
+  let scene_image = shade_with(replace_state, ground, prop_raster,
+    |value, _, _, _, _| value)
+  let sampled = map(|coord: vec2i32| target_load(scene_image, coord, 0u32), coords)
+  let resolve_raster = rasterize_triangles(direct_draw(3u32, 1u32),
+    |index: u32, _: u32, _: u32| vertex_output(values[i32(index)], 0.0))
+  let image = shade(surface, resolve_raster,
+    |_, position, _, _, _|
+      @[sampled[i32(position.x) % length(sampled)], 0.0, 0.0, 1.0]) in
+  (sampled, scene_image, image)

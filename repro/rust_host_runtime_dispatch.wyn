@@ -1,0 +1,60 @@
+-- FIXED: static inspection with the compiler installed 2026-09-22 13:01
+-- confirms this case now launches min(65535, max(1,
+-- ceil((reproduce_compute_gather_b2.size() / 16) / 64))) workgroups.
+-- Tinyporto's GTAO and coarse-depth launches now scale the same way.
+-- No performance benchmark was run for this verification.
+-- The original failure and reproduction procedure are preserved below.
+--
+-- ORIGINAL BUG: the generated Rust host launches only one workgroup for a parallel map
+-- whose runtime length is width * height from a uniform record. Providing the
+-- output buffer's capacity does not make the generated dispatch scale with it.
+-- This reproduces tinyporto's ambient-occlusion and coarse-depth dispatch problem.
+--
+-- Reproduce from this file's directory (no GPU run or benchmark is needed):
+-- wyn build --graphics -O --target-double rust-wgpu --target spirv rust_host_runtime_dispatch.wyn -o runtime_dispatch.spv
+-- spirv-dis runtime_dispatch.spv -o runtime_dispatch.spvasm
+-- Inspect runtime_dispatch.rs: host_reproduce takes a persistent HostContext,
+-- queue, frame uniform buffer, caller-sized reproduce_compute_gather_b2 buffer,
+-- and surface texture. Its compute block unconditionally sets groups = [1,1,1].
+-- The output buffer holds width * height vec4f32 elements (16 bytes each).
+--
+-- EXPECTED: derive a suitable parallel launch from the logical runtime domain.
+-- Matching tinyporto's previous host means ceil(width * height / 64) groups:
+-- 1,000 at 320x200 and 16,000 at 1280x800. A bounded multi-workgroup launch can
+-- also be valid because the shader supports a grid-stride loop. One workgroup
+-- for every viewport size leaves nearly all GPU parallelism unused.
+--
+-- ACTUAL: SPIR-V declares LocalSize 64 1 1 and loops from GlobalInvocationID.x
+-- while i < width * height, advancing i by NumWorkGroups.x * 64. With one group,
+-- there are only 64 invocations, each doing 16,000 iterations at 1280x800.
+-- Results remain correct, so output-value tests alone do not detect this
+-- performance regression. Tinyporto executes its full GTAO algorithm per
+-- iteration, rather than the deliberately trivial expression in this example.
+--
+-- CONTROL: add an indices: []i32 entry parameter and replace iota(w * h) with
+-- indices, supplying [0,1,...,width*height-1]. The generated Rust then dispatches
+-- min(65535, max(1, ceil((indices.size() / 4) / 64))) workgroups.
+-- The intended array values are identical; only how the runtime domain is
+-- expressed changes. This control was compiled and inspected, not benchmarked.
+--
+-- Verified with the compiler installed 2026-09-22 12:34 (SHA-256 prefix
+-- D3E293BDE2C5092D8FE49C5DD3F54D97). SPIR-V validation passes.
+-- The fix belongs in compiler dispatch planning/emission; callers should not
+-- have to patch generated Rust or maintain a second scheduling implementation.
+
+type frame_globals = { resolution: vec3f32 }
+
+entry reproduce(frame: frame_globals, surface: render_target<vec4f32>)
+    ([]vec4f32, render_target<vec4f32>) =
+  let w = i32(frame.resolution.x)
+  let h = i32(frame.resolution.y)
+  let pixels = map(|i| @[f32(i), 0.0, 0.0, 1.0], iota(w * h))
+  let triangles = rasterize_triangles(direct_draw(3u32, 1u32),
+    |index: u32, _: u32, _: u32|
+      let positions = [@[-1.0, -1.0, 0.0, 1.0],
+                       @[3.0, -1.0, 0.0, 1.0],
+                       @[-1.0, 3.0, 0.0, 1.0]] in
+      vertex_output(positions[i32(index)], 0.0))
+  let image = shade(surface, triangles,
+    |_, position, _, _, _| pixels[i32(position.y) * w + i32(position.x)]) in
+  (pixels, image)

@@ -1,0 +1,31 @@
+-- REGRESSION: fixed in the compiler retested on 2026-09-22. This generated host
+-- now passes on wgpu 27 / Vulkan unchanged. Original failure documented below.
+--
+-- ORIGINAL BUG: the generated Rust bind-group layout uses pipeline-wide storage access
+-- instead of the access declared by the SPIR-V entry point being instantiated.
+--
+-- Reproduce from this file's directory:
+-- wyn build -O --target-double rust-wgpu --target spirv rust_host_storage_access_mismatch.wyn -o storage_access.spv
+-- Include storage_access.rs as a Rust module using wgpu 27 with its spirv feature,
+-- create let mut host = HostContext::new(&device)?, then call
+-- host_reproduce(&mut host, &queue). No input resources are required.
+--
+-- EXPECTED: all filter phases have layouts matching their shader declarations;
+-- the call completes and returns the compacted multiples of three.
+-- BEFORE THE FIX: create_compute_pipeline for reproduce_local_offsets fails at group 0,
+-- binding 2. Rust emits Storage { read_only: false }, while that SPIR-V stage's
+-- storage declaration is read-only. wgpu reports:
+-- "Storage class Storage { access: StorageAccess(LOAD | STORE) } doesn't match
+-- the shader Storage { access: StorageAccess(LOAD) }".
+--
+-- The scratch buffer is written by an earlier phase and read by local_offsets.
+-- Its pipeline-wide access union cannot specify the layout of each physical
+-- stage: wgpu checks the shader's actual storage declaration. Wyn's rust_layout
+-- currently filters bindings by stage but passes their pipeline-wide access to
+-- binding_type unchanged. The layout must agree with the selected shader ABI.
+--
+-- CONTROL: compile the same source with --target wgsl and -o storage_access.wgsl.
+-- That generated host call completes successfully. Failure (SPIR-V) and passing
+-- control (WGSL) were both confirmed with wgpu 27 / Vulkan on 2026-09-22.
+entry reproduce() []i32 =
+  filter(|i| i % 3i32 == 0i32, iota(128i32))

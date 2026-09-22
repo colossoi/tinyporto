@@ -1,0 +1,34 @@
+-- REGRESSION: fixed in the compiler retested on 2026-09-22. This generated host
+-- now passes on wgpu 27 / Vulkan unchanged. Original failure documented below.
+--
+-- ORIGINAL BUG: target_load generates a filterable texture binding even though the shader
+-- only performs textureLoad and never uses a filtering sampler.
+--
+-- Reproduce from this file's directory:
+-- wyn build --graphics -O --target-double rust-wgpu --target wgsl rust_host_unfiltered_float_texture.wyn -o texture_load.wgsl
+-- Include texture_load.rs as a Rust module using wgpu 27. On a device without
+-- the optional FLOAT32_FILTERABLE feature, create two separate R32Float textures
+-- with TEXTURE_BINDING | RENDER_ATTACHMENT usage, then call
+-- host_reproduce(&mut host, &queue, &source, &target), where host was created
+-- with HostContext::new(&device)?.
+--
+-- EXPECTED: the source binding uses TextureSampleType::Float { filterable: false }.
+-- An integer-coordinate target_load is valid for R32Float with default features.
+-- BEFORE THE FIX: Rust emits filterable: true. create_bind_group fails with:
+-- "Texture binding 2 expects sample type Float { filterable: true }, but was given
+-- a view with format R32Float (sample type Float { filterable: false })".
+-- The same unnecessary requirement blocks tinyporto's Rgba32Float normal buffer
+-- and R32Float depth textures. No source operation requests filtered sampling.
+--
+-- CONTROL: change only the generated filterable: true to filterable: false.
+-- The same host call then completes and returns the target texture.
+-- Failure and passing control confirmed with WGSL / wgpu 27 / Vulkan on 2026-09-22.
+entry reproduce(source: render_target<f32>, target: render_target<f32>) render_target<f32> =
+  let triangles = rasterize_triangles(direct_draw(3u32, 1u32),
+    |index: u32, _: u32, _: u32|
+      let positions = [@[-1.0, -1.0, 0.0, 1.0],
+                       @[ 3.0, -1.0, 0.0, 1.0],
+                       @[-1.0,  3.0, 0.0, 1.0]] in
+      vertex_output(positions[i32(index)], 0.0)) in
+  shade(target, triangles,
+    |_, _, _, _, _| target_load(source, @[0i32, 0i32], 0u32))

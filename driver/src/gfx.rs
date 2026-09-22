@@ -1,6 +1,5 @@
 //! wgpu context: instance/surface/device/queue + surface configuration.
-//! Generic — no knowledge of the graph or the game. `surface` is `None` in
-//! headless mode (used by `--screenshot`, which renders to an offscreen texture).
+//! `surface` is `None` in headless mode (`--screenshot` renders offscreen).
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -13,22 +12,15 @@ pub struct Gfx {
     pub config: wgpu::SurfaceConfiguration,
 }
 
-/// Request a device, raising the per-stage storage-buffer limit (the `step`
-/// entry binds well past the default 8) to the adapter's maximum.
+/// Request the storage limits needed by the generated frame function.
 async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
     let mut limits = wgpu::Limits::default();
     limits.max_storage_buffers_per_shader_stage =
         adapter.limits().max_storage_buffers_per_shader_stage;
-    // The deferred `light` pass binds 5 storage textures (G-buffer albedo/normal,
-    // scene depth, sun shadow map, lit output) — past the default 4. Raise to the
-    // adapter's maximum, as with storage buffers above.
-    limits.max_storage_textures_per_shader_stage =
-        adapter.limits().max_storage_textures_per_shader_stage;
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("tinyporto-device"),
-            // Pass-boundary timestamps are optional so older adapters still run.
-            required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+            required_features: wgpu::Features::empty(),
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -113,10 +105,12 @@ impl Gfx {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        if let (Some(surface), true) = (&self.surface, width > 0 && height > 0) {
+        if width > 0 && height > 0 {
             self.config.width = width;
             self.config.height = height;
-            surface.configure(&self.device, &self.config);
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.config);
+            }
         }
     }
 }

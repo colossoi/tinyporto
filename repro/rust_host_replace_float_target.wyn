@@ -1,0 +1,33 @@
+-- REGRESSION: fixed in the compiler retested on 2026-09-22. The generated host
+-- now emits blend: None and this case passes on wgpu 27 / Vulkan unchanged.
+-- The original failure and passing control are documented below.
+--
+-- ORIGINAL BUG: rust-wgpu emits Some(BlendState::REPLACE) for an unblended draw, which
+-- enables blending and makes an ordinary R32Float render target invalid.
+--
+-- Reproduce from this file's directory:
+-- wyn build --graphics -O --target-double rust-wgpu --target spirv rust_host_replace_float_target.wyn -o float_target.spv
+-- Include float_target.rs as a Rust module using wgpu 27. Create an R32Float
+-- texture with RENDER_ATTACHMENT usage and call
+-- host_reproduce(&mut host, &queue, &target) on a device with default features,
+-- where host was created with HostContext::new(&device)?.
+--
+-- EXPECTED: #replace writes the fragment value directly; the generated color
+-- target state uses blend: None and accepts R32Float.
+-- BEFORE THE FIX: the color target has blend: Some(BlendState::REPLACE). wgpu rejects
+-- create_render_pipeline with: "Color state [0] is invalid: Format R32Float is
+-- not blendable". BlendState::REPLACE still enables the blending stage; it does
+-- not express disabled blending. This blocks tinyporto's sun-depth pass.
+-- CONTROL: change only the generated blend: Some(BlendState::REPLACE) to
+-- blend: None. The same host call succeeds and returns the texture.
+-- Failure and passing control confirmed with SPIR-V / Vulkan on 2026-09-22.
+entry reproduce(target: render_target<f32>) render_target<f32> =
+  let triangles = rasterize_triangles(direct_draw(3u32, 1u32),
+    |index: u32, _: u32, _: u32|
+      let positions = [@[-1.0, -1.0, 0.0, 1.0],
+                       @[ 3.0, -1.0, 0.0, 1.0],
+                       @[-1.0,  3.0, 0.0, 1.0]] in
+      vertex_output(positions[i32(index)], 0.0)) in
+  shade_with({ depth_test = #disabled, depth_write = false,
+               blend = #replace, color_write = true },
+             target, triangles, |_, _, _, _, _| 0.5)

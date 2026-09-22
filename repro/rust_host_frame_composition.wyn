@@ -1,0 +1,46 @@
+-- REGRESSION: fixed in the compiler retested on 2026-09-22. Both SPIR-V and WGSL
+-- now emit one host_reproduce with both dispatches, the draw, and all results.
+-- The original failure and its control case are documented below.
+--
+-- ORIGINAL BUG: Rust host generation splits one source entry into disconnected functions
+-- when that entry contains more than one computed value and a graphics operation.
+-- Confirmed with both SPIR-V and WGSL output on 2026-09-22.
+--
+-- Reproduce from this file's directory:
+-- wyn build --graphics -O --target-double rust-wgpu --target spirv rust_host_frame_composition.wyn -o composition.spv
+-- Inspect composition.rs; no GPU run is needed. For WGSL, use --target wgsl and
+-- -o composition.wgsl instead.
+--
+-- With the current API, first create host = HostContext::new(&device)? and reuse it.
+-- EXPECTED: host_reproduce(&mut host, queue, values, target) performs both maps,
+-- draws using the computed shifted array, and returns (shifted, doubled, image)
+-- as two buffer results followed by the texture. shifted must be computed before
+-- the draw; doubled must be computed because it is part of the source result.
+--
+-- BEFORE THE FIX: host_reproduce contains the draw but neither map dispatch. It allocates
+-- a fresh reproduce__compute_0_output_0 buffer and binds it for the vertex shader
+-- without ever writing the shifted values into it. Its OutputDescriptor contains
+-- only the target texture, dropping both array results from the source tuple.
+-- The map dispatches and buffer results appear in separate generated functions,
+-- host_reproduce__compute_0 and host_reproduce__compute_1, which the root never
+-- calls. Calling those helpers first does not fix the root: they allocate their
+-- own output buffers, and host_reproduce has no parameter accepting those buffers.
+--
+-- CONTROL: remove the doubled definition and its element from the return tuple
+-- (and return type). With only one computed array, the generated host_reproduce
+-- contains both its map dispatch and the draw and returns the buffer and texture.
+--
+-- Cause: stage extraction names multiple compute entries root__compute_N; their
+-- published owners retain those names while graphics retains the source root.
+-- The host generator groups operations and results by owner, separating work
+-- that belongs to the same source call. Source-root ownership and result identity
+-- must survive extraction independently of the physical stage names.
+entry reproduce(values: []vec4f32, target: render_target<vec4f32>)
+    ([]vec4f32, []vec4f32, render_target<vec4f32>) =
+  let shifted = map(|v: vec4f32| v + @[0.1, 0.0, 0.0, 0.0], values)
+  let doubled = map(|v: vec4f32| v * 2.0, values)
+  let triangles = rasterize_triangles(direct_draw(3u32, 1u32),
+    |vertex_index: u32, _: u32, _: u32|
+      vertex_output(shifted[i32(vertex_index)], @[1.0, 0.0, 0.0, 1.0]))
+  let image = shade(target, triangles, |value, _, _, _, _| value) in
+  (shifted, doubled, image)
