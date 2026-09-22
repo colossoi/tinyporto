@@ -1,0 +1,109 @@
+-- Hybrid scene visibility: screen-space detail, then a BVH over wall footprints.
+-- Scene geometry/material policy lives here; intersection math lives in ray.
+import "walls"
+import "math"
+import "camera"
+import "render_types"
+import "paint"
+import "ray"
+import "screen_trace"
+
+module scene_trace = {
+
+  type hit = { t: f32, normal: vec3f32, albedo: vec3f32 }
+  type node = { low: vec4f32, high: vec4f32 }
+  type intersection = {
+    point: vec3f32, normal: vec3f32, albedo: vec3f32,
+    pixel: vec2i32, hit: bool, screen: bool,
+  }
+  -- Existing secondary-ray range and screen march tuning, in world metres.
+  def FAR: f32 = 80.0
+  def SCREEN: screen_trace.settings =
+    { steps = 24, refinements = 4, start = 0.015, distance = 12.0, thickness = 0.12 }
+  def TREE_DEPTH: i32 = i32(f32.ceil(f32.log2(f32(N_WALL))))
+  def LEAVES: i32 = i32(f32.pow(2.0, f32(TREE_DEPTH)))
+  def NODE_COUNT: i32 = LEAVES * 2 - 1
+
+  def min_bounds(a: vec3f32, b: vec3f32) vec3f32 =
+    @[f32.min(a.x, b.x), f32.min(a.y, b.y), f32.min(a.z, b.z)]
+  def max_bounds(a: vec3f32, b: vec3f32) vec3f32 =
+    @[f32.max(a.x, b.x), f32.max(a.y, b.y), f32.max(a.z, b.z)]
+
+  def wall_bounds(i: i32) (vec3f32, vec3f32) =
+    let (a, b, h, _yaw) = wall(i)
+    let center = @[(a.x + b.x) * 0.5, h * 0.5, (a.y + b.y) * 0.5]
+    let half = @[f32.abs(b.x - a.x) * 0.5 + BRK_HZ, h * 0.5,
+                 f32.abs(b.y - a.y) * 0.5 + BRK_HZ] in
+    (center - half, center + half)
+
+  -- Complete binary BVH in heap order, padding to a power-of-two leaf count.
+  -- Grouping by building provides a spatial partition. Bounds derive from wall(),
+  -- never from the visible draw list. Rebuild from the geometry every frame.
+  def build_node(index: i32) node =
+    let level = loop level = 1 for _k < TREE_DEPTH do
+      if index >= level * 2 - 1 then level * 2 else level
+    let span = LEAVES / level
+    let first = (index - level + 1) * span
+    let (low, high) =
+      loop (low, high) = (v3(FAR), v3(0.0 - FAR)) for i < N_WALL do
+        if i < first || i >= first + span then (low, high)
+        else let (a, b) = wall_bounds(i) in (min_bounds(low, a), max_bounds(high, b)) in
+    { low = @[low.x, low.y, low.z, if span == 1 then f32(first) else -1.0],
+      high = @[high.x, high.y, high.z, 0.0] }
+
+  -- Next depth-first node after skipping a subtree, without a per-ray stack.
+  def next_node(index: i32) i32 =
+    let (next, _done) = loop (node, done) = (index, false) for _k < TREE_DEPTH + 1 do
+      if done then (node, true)
+      else if node == 0 then (NODE_COUNT, true)
+      else if node % 2 == 1 then (node + 1, true)
+      else ((node - 1) / 2, false) in next
+  def world(nodes: []node, ro: vec3f32, rd: vec3f32) hit =
+    let gt = if rd.y < -0.000001 then ray.plane_y(ro, rd, 0.0) else FAR
+    let gp = ro + rd * gt
+    let ground_valid = gt > 0.002 && gt < FAR
+                       && f32.abs(gp.x) < GROUND_HALF && f32.abs(gp.z) < GROUND_HALF
+    let ground_albedo = if dot(gp.xz, gp.xz) < 64.0
+                         then (COBBLE_WARM + COBBLE_COOL) * 0.35 else SAND_COLOR
+    let (_index, t, n, wall_hit) =
+      loop (index, t, n, wall_hit) =
+        (0, if ground_valid then gt else FAR, @[0.0, 1.0, 0.0], false)
+      for _step < NODE_COUNT do
+        if index >= length(nodes) then (index, t, n, wall_hit)
+        else
+          let node = nodes[index]
+          let (near, far, normal) = ray.box(ro, rd, node.low.xyz, node.high.xyz, 0.002)
+          let intersects = node.low.x <= node.high.x
+                            && far >= f32.max(near, 0.002) && f32.max(near, 0.0) < t
+          let leaf = node.low.w >= 0.0
+          let hit_t = if near < 0.002 then far else near in
+          if !intersects then (next_node(index), t, n, wall_hit)
+          else if !leaf then (index * 2 + 1, t, n, wall_hit)
+          else if hit_t < t then (next_node(index), hit_t, normal, true)
+          else (next_node(index), t, n, wall_hit)
+    in { t = t, normal = n,
+         albedo = if wall_hit then mix((BRICK_BASE + BRICK_BASE2) * 0.5, GROUT_COLOR, 0.12)
+                  else ground_albedo }
+
+  def trace(scene: render_target<gbuffer>, nodes: []node, resolution: vec3f32,
+            camera: orbit, ro: vec3f32, rd: vec3f32) intersection =
+    let (xy, screen_hit) = screen_trace.trace(scene, resolution, camera, ro, rd, SCREEN) in
+    if screen_hit then
+      let g = target_load(scene, xy, 0u32) in
+      { point = screen_trace.position(scene, resolution, camera, xy), normal = normalize(g.normal.xyz),
+        albedo = g.albedo.xyz, pixel = xy, hit = true, screen = true }
+    else
+      let hit = world(nodes, ro, rd)
+      let p = ro + rd * hit.t
+      let (pixel, visible) = project_pixel(p, resolution, camera)
+      let px = @[clampi(i32(pixel.x), 0, i32(resolution.x) - 1),
+                 clampi(i32(pixel.y), 0, i32(resolution.y) - 1)]
+      let g = target_load(scene, px, 0u32)
+      let surface = screen_trace.position(scene, resolution, camera, px)
+      let on_screen = hit.t < FAR && visible && g.albedo.w > 0.5
+                      && distance(surface, p) < 0.18 && dot(g.normal.xyz, hit.normal) > 0.5 in
+      { point = if on_screen then surface else p,
+        normal = if on_screen then normalize(g.normal.xyz) else hit.normal,
+        albedo = if on_screen then g.albedo.xyz else hit.albedo,
+        pixel = px, hit = hit.t < FAR, screen = on_screen }
+}

@@ -1,0 +1,23 @@
+-- SH2 radiance coefficients (DC, x, y, z), evaluated as irradiance / pi.
+
+module sh = {
+
+  -- SH basis divided by the uniform hemisphere PDF 1/(2*pi).
+  def uniform_hemisphere_basis(direction: vec3f32) vec4f32 =
+    @[1.77245385, 3.06998012 * direction.x, 3.06998012 * direction.y, 3.06998012 * direction.z]
+
+  -- ZH3 curve-fit (Roughton et al., 2024, section 3.4 / eq.21).
+  -- https://www.ppsloan.org/publications/ZH3.pdf
+  -- Shared luminance axis; cosine convolution factors: 1, 2/3, 1/4.
+  def channel(coefficients: vec4f32, n: vec3f32, axis: vec3f32) f32 =
+    let ratio = f32.abs(dot(coefficients.yzw, axis)) / f32.max(coefficients.x, 0.00001)
+    let quadratic = coefficients.x * (0.08 * ratio + 0.6 * ratio * ratio)
+    let z = dot(axis, n) in
+    f32.max(0.0, coefficients.x * 0.28209479 + dot(coefficients.yzw, n) * 0.32573501
+                 + quadratic * 0.07884789 * (3.0 * z * z - 1.0))
+
+  def evaluate(red: vec4f32, green: vec4f32, blue: vec4f32, n: vec3f32) vec3f32 =
+    let luminance = red.yzw * 0.2126 + green.yzw * 0.7152 + blue.yzw * 0.0722
+    let axis = luminance / f32.max(magnitude(luminance), 0.00001) in
+    @[channel(red, n, axis), channel(green, n, axis), channel(blue, n, axis)]
+}

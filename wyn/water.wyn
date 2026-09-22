@@ -1,12 +1,12 @@
 -- water.wyn — the canal/harbour water field and its palette.
 --
--- Venice-style water: the painter sweeps canals (channels) through the plaza. This
--- module answers, for any ground point (x,z): is it water, and how far below the
--- ground plane does the surface sit — as a signed distance field so the shoreline
--- (a quay wall dropping to the water) and the sett culling both read from one source.
+-- Retained water renderer, currently disconnected from the scene. Callers supply
+-- water footprints as items and control points; this module creates no geometry
+-- of its own. The field supplies the shoreline and the sunken quay/water shading.
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
+import "ray"
 import "math"     -- v2 / v3 / dot / magnitude / mix
 import "clouds"   -- sky reflection off the water surface
 import "shade"    -- sun (specular glint)
@@ -24,8 +24,7 @@ def WATER_SILT:    vec3f32 = @[0.13, 0.17, 0.16]
 def QUAY_COLOR:    vec3f32 = @[0.30, 0.29, 0.27]
 def FOAM_COLOR:    vec3f32 = @[0.62, 0.65, 0.64]   -- scummy off-white shoreline foam
 
--- Loop caps for the painted-water evaluation (bounded so the per-pixel field is a
--- fixed-cost loop): at most this many item slots scanned, this many segments each.
+-- Bounds for evaluating supplied water footprints.
 def MAX_WATER_ITEMS: i32 = 16
 def MAX_SEG:         i32 = 40
 
@@ -36,23 +35,19 @@ def seg_dist(p: vec2f32, a: vec2f32, b: vec2f32) f32 =
   let h = f32.min(1.0, f32.max(0.0, dot(pa, ba) / dot(ba, ba))) in
   magnitude(pa - ba * v2(h))
 
--- Signed distance (metres) from (x,z) to the nearest painted canal edge: negative
--- inside a canal, positive on land, ~0 at the quay line. Reads the item list (a water
--- stroke is kind 1, its control points at [pstart, pstart+pcount), swept at half-width
--- `param`) — the painter's source of truth. Distance to a stroke = the min distance to
--- its centre-line segments (capsule chain) minus its half-width; the field is the min
--- over all water strokes.
+-- Signed distance to supplied water footprints: negative in water, positive on
+-- land. Item kind 1 encodes (kind, point start, point count, half-width).
+-- The interactive painter no longer produces these items.
 def water_sdf(p: vec2f32, items: []vec4f32, points: []vec2f32) f32 =
   loop best = 100.0 for ii < MAX_WATER_ITEMS do
     let it = items[ii] in
-    if it.x > 0.5 && it.x < 1.5 then           -- a water stroke (kind 1)
+    if it.x > 0.5 && it.x < 1.5 then
       let pstart = i32(it.y)
       let pcount = i32(it.z)
       let hw = it.w
       let dmin =
         if pcount <= 1 then magnitude(p - points[pstart])
         else
-          -- Evaluate live segments up to MAX_SEG; longer strokes truncate.
           let nseg = if pcount - 1 < MAX_SEG then pcount - 1 else MAX_SEG in
           loop d = 100.0 for s < nseg do
             f32.min(d, seg_dist(p, points[pstart + s], points[pstart + s + 1]))
@@ -60,8 +55,6 @@ def water_sdf(p: vec2f32, items: []vec4f32, points: []vec2f32) f32 =
       f32.min(best, dmin - hw)
     else best
 
--- Reflect view direction `v` about surface normal `n`.
-def reflect3(v: vec3f32, n: vec3f32) vec3f32 = v - n * v3(2.0 * dot(v, n))
 
 -- Wave field ported from Alexander Alekseev's "Seascape" (Shadertoy Ms2SD1). Its
 -- `sea_octave` — a domain-warped, ridged abs(sin) crest raised to a choppiness power —
@@ -129,7 +122,7 @@ def water_grad(p: vec2f32, items: []vec4f32, points: []vec2f32) vec2f32 =
 -- little except at grazing) and a sharp sun glint on the wavelets. Overshooting the far
 -- edge gives the quay wall. Returns a display-range colour (sky/reflection are in range).
 def shade_water(p0: vec3f32, rd: vec3f32, t: f32, items: []vec4f32, points: []vec2f32) vec3f32 =
-  let t_floor = (0.0 - WATER_DEPTH - p0.y) / rd.y
+  let t_floor = ray.plane_y(p0, rd, 0.0 - WATER_DEPTH)
   let pf = p0 + rd * v3(t_floor)
   let sf = water_sdf(@[pf.x, pf.z], items, points) in     -- floor point vs the canal edge
   if sf < 0.0 then
@@ -137,7 +130,7 @@ def shade_water(p0: vec3f32, rd: vec3f32, t: f32, items: []vec4f32, points: []ve
     let ndv = f32.max(0.03, 0.0 - dot(rd, wn))           -- 1 top-down .. 0 grazing
     let m = 1.0 - ndv
     let fres = 0.02 + 0.24 * (m * m * m * m * m)           -- low reflectivity (murky)
-    let rr = reflect3(rd, wn)
+    let rr = reflect(rd, wn)
     let sky = clouds.sky(rr)
     let spec = f32.pow(f32.max(0.0, dot(rr, sun)), 80.0) * 0.9   -- sun sparkle on ripples
     let absorb = 1.0 - f32.exp(0.0 - t_floor * 2.5)       -- silt fades to deep with depth

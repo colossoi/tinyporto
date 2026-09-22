@@ -32,10 +32,6 @@ def get_ray(resolution: vec3f32, fragCoord: vec2f32, o: orbit) (vec3f32, vec3f32
   let direction = gfx.camera.ray_direction(FOV, resolution.xy, fragCoord) in
   gfx.camera.orbit.ray(direction, shared_orbit(o))
 
--- Intersect a ray with the y = 0 ground plane. Returns t (<0 if pointing away).
-def ground_t(ro: vec3f32, rd: vec3f32) f32 =
-  if f32.abs(rd.y) < 1e-6 then 0.0 - 1.0
-  else 0.0 - ro.y / rd.y
 
 ------------------------------------------------------------
 -- View-projection for rasterizing geometry (M1+).
@@ -82,3 +78,14 @@ def frustum_keep_clip(c: vec4f32, r: f32, resolution: vec3f32) bool =
 -- World-space convenience wrapper for callers that do not otherwise need clip.
 def frustum_keep(p: vec3f32, r: f32, resolution: vec3f32, o: orbit) bool =
   frustum_keep_clip(world_to_clip(p, resolution, o), r, resolution)
+
+-- World position -> top-left floating pixel coordinates and clip visibility.
+-- Validate before converting to integer pixels, so negative fractions stay out.
+def project_pixel(p: vec3f32, resolution: vec3f32, camera: orbit) (vec2f32, bool) =
+  let c = world_to_clip(p, resolution, camera)
+  let w = f32.max(c.w, 0.00001)
+  let pixel = @[(c.x / w * 0.5 + 0.5) * resolution.x,
+               (0.5 - c.y / w * 0.5) * resolution.y] in
+  (pixel, c.w > 0.0 && c.z >= 0.0 && c.z <= c.w
+          && pixel.x >= 0.0 && pixel.y >= 0.0
+          && pixel.x < resolution.x && pixel.y < resolution.y)

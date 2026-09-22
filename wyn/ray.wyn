@@ -1,0 +1,68 @@
+-- Geometric ray intersections. No scene, camera, material, or lighting state.
+
+module ray = {
+
+  -- Intersect y = height. Returns -1 for a parallel ray; negative t is behind ro.
+  def plane_y(ro: vec3f32, rd: vec3f32, height: f32) f32 =
+    if f32.abs(rd.y) < 1e-6 then -1.0 else (height - ro.y) / rd.y
+
+  def slab(origin: f32, direction: f32, low: f32, high: f32) (f32, f32) =
+    if f32.abs(direction) < 0.000001 then
+      if origin >= low && origin <= high then (-100000.0, 100000.0)
+      else (100000.0, -100000.0)
+    else
+      let a = (low - origin) / direction
+      let b = (high - origin) / direction in (f32.min(a, b), f32.max(a, b))
+
+  -- Returns the entry/exit interval and the normal at the first surface beyond
+  -- min_t. A hit requires far >= max(near, min_t); the caller applies its range.
+  def box(ro: vec3f32, rd: vec3f32, lo: vec3f32, hi: vec3f32,
+          min_t: f32) (f32, f32, vec3f32) =
+    let (ax, bx) = slab(ro.x, rd.x, lo.x, hi.x)
+    let (ay, by) = slab(ro.y, rd.y, lo.y, hi.y)
+    let (az, bz) = slab(ro.z, rd.z, lo.z, hi.z)
+    let near = f32.max(ax, f32.max(ay, az))
+    let far = f32.min(bx, f32.min(by, bz))
+    let inside = near < min_t
+    let axis = if inside then
+                 if bx <= by && bx <= bz then 0 else if by <= bz then 1 else 2
+               else if ax >= ay && ax >= az then 0 else if ay >= az then 1 else 2
+    let face = if inside then 1.0 else -1.0
+    let normal = if axis == 0 then @[face * f32.sign(rd.x), 0.0, 0.0]
+                 else if axis == 1 then @[0.0, face * f32.sign(rd.y), 0.0]
+                 else @[0.0, 0.0, face * f32.sign(rd.z)] in
+    (near, far, normal)
+
+  -- Smooth local-space normal of a rounded box at a surface point. `half` is the
+  -- outer half-size and `radius` must not exceed its smallest component.
+  def rounded_normal(p: vec3f32, half: vec3f32, radius: f32) vec3f32 =
+    let qx = f32.max(f32.abs(p.x) - (half.x - radius), 0.0)
+    let qy = f32.max(f32.abs(p.y) - (half.y - radius), 0.0)
+    let qz = f32.max(f32.abs(p.z) - (half.z - radius), 0.0) in
+    normalize(@[f32.sign(p.x) * qx + 1e-6 * p.x,
+                f32.sign(p.y) * qy,
+                f32.sign(p.z) * qz])
+
+  -- Exterior rounded-box distance for sphere tracing. The full signed-distance
+  -- interior term is intentionally omitted because tracing starts outside.
+  def rounded_distance(p: vec3f32, half: vec3f32, radius: f32) f32 =
+    let qx = f32.max(f32.abs(p.x) - (half.x - radius), 0.0)
+    let qy = f32.max(f32.abs(p.y) - (half.y - radius), 0.0)
+    let qz = f32.max(f32.abs(p.z) - (half.z - radius), 0.0) in
+    magnitude(@[qx, qy, qz]) - radius
+
+  -- Trace from outside (or on the enclosing proxy) in box-local space. rd must
+  -- be unit length; half is the outer half-size. Returns (distance, normal, hit).
+  -- The caller chooses the iteration budget/tolerance and transforms the result.
+  def rounded_box(ro: vec3f32, rd: vec3f32, half: vec3f32, radius: f32,
+                  steps: i32, tolerance: f32) (f32, vec3f32, bool) =
+    let (t, hit) =
+      loop (t, hit) = (0.0, false) for _i < steps do
+        if hit then (t, hit)
+        else
+          let d = rounded_distance(ro + rd * t, half, radius) in
+          if d < tolerance then (t, true) else (t + d, false)
+    let normal = if hit then rounded_normal(ro + rd * t, half, radius)
+                   else @[0.0, 0.0, 0.0] in
+    (t, normal, hit)
+}

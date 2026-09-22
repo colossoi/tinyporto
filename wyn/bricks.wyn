@@ -7,7 +7,6 @@
 import "pkg:rng"
 import "math"
 import "camera"
-import "paint"
 import "hiz"
 
 -- Sett palette. Cobble is a mid-tone neutral ranging from warm earthy greige to
@@ -39,23 +38,6 @@ def brick_center(i: i32) vec2f32 =
   let z = (f32(row) - f32(BROWS) * 0.5 + 0.5) * CELLZ in
   @[x, z]
 
--- Smooth local-space normal of a rounded box at a surface point. `half` is the
--- outer half-size and `radius` must not exceed its smallest component.
-def round_normal(p: vec3f32, half: vec3f32, radius: f32) vec3f32 =
-  let qx = f32.max(f32.abs(p.x) - (half.x - radius), 0.0)
-  let qy = f32.max(f32.abs(p.y) - (half.y - radius), 0.0)
-  let qz = f32.max(f32.abs(p.z) - (half.z - radius), 0.0) in
-  normalize(@[f32.sign(p.x) * qx + 1e-6 * p.x,
-              f32.sign(p.y) * qy,
-              f32.sign(p.z) * qz])
-
--- Exterior rounded-box distance for sphere tracing. The full signed-distance
--- interior term is intentionally omitted because tracing starts outside.
-def sd_round_box(p: vec3f32, half: vec3f32, radius: f32) f32 =
-  let qx = f32.max(f32.abs(p.x) - (half.x - radius), 0.0)
-  let qy = f32.max(f32.abs(p.y) - (half.y - radius), 0.0)
-  let qz = f32.max(f32.abs(p.z) - (half.z - radius), 0.0) in
-  magnitude(@[qx, qy, qz]) - radius
 
 -- Per-sett deterministic value in [0,1) for color variation.
 def brick_hash(i: i32) f32 =
@@ -140,11 +122,10 @@ def sett_center(i: i32) vec2f32 =
   let jz = (brick_hash(i + 53) - 0.5) * 0.016 in
   @[base.x, base.y + jz]
 
--- Visibility is intentionally a cheapest-first control-flow ladder. In particular,
--- the water SDF scans the painted stroke data only after distance, frustum, and
--- coarse-occlusion rejection. The clip projection is shared by the latter two tests.
+-- Reject by distance, then frustum and coarse occlusion. The clip projection is
+-- shared by the latter two tests.
 def sett_visible(resolution: vec3f32, camera: orbit,
-                 items: []vec4f32, points: []vec2f32, od: []f32, i: i32) bool =
+                 od: []f32, i: i32) bool =
   let center = sett_center(i) in
   if dot(center, center) >= 64.0 then false
   else
@@ -154,9 +135,7 @@ def sett_visible(resolution: vec3f32, camera: orbit,
     if !frustum_keep_clip(clip, 0.25, resolution) then false
     -- Hidden only if the nearest recorded surface wins across the whole tile
     -- neighbourhood, so a partly-visible sett stays.
-    else if occ_test(od, clip, resolution) then false
-    -- Water converts cobble to canal: reject setts near a painted canal edge.
-    else water_sdf(center, items, points) >= 0.08
+    else !occ_test(od, clip, resolution)
 
 -- Build the complete record only after the candidate index survives compaction.
 def sett_prop(i: i32) prop =

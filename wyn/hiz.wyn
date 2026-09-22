@@ -8,9 +8,9 @@
 --
 -- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
 
-def OCC_TILE: i32 = 8    -- source pixels per coarse texel, per axis
+import "math"
 
-def clampi(v: i32, lo: i32, hi: i32) i32 = if v < lo then lo else if v > hi then hi else v
+def OCC_TILE: i32 = 8    -- source pixels per coarse texel, per axis
 
 def ceil_div(a: i32, b: i32) i32 = (a + b - 1) / b
 

@@ -8,11 +8,9 @@ def SUN_COLOR: vec3f32 = @[2.0, 1.95, 1.85]
 def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
 
 def SAND_COLOR: vec3f32 = @[0.24, 0.16, 0.10]
-def WATER_COLOR: vec3f32 = @[0.10, 0.34, 0.46]
 -- 1950s Venetian render / ochre plaster for the flat-roofed buildings.
 def BUILDING_COLOR: vec3f32 = @[0.78, 0.42, 0.30]
--- Wall / fence painted ground: sage hedge green (distinct in hue from both
--- water-teal and building-terracotta).
+-- Wall / fence painted ground: sage hedge green beside building-terracotta.
 def WALL_COLOR: vec3f32 = @[0.34, 0.48, 0.30]
 -- Subtle darker outline drawn at an item's boundary (the edging course).
 def OUTLINE_COLOR: vec3f32 = @[0.12, 0.11, 0.10]
@@ -44,3 +42,13 @@ def shade_surface(albedo: vec3f32, n: vec3f32, ao: f32, shc: f32, shm_frac: f32)
   let col = lit_ao_sh(albedo, n, ao, sh)
   let m = tonemap_aces(col) in
   @[m.x, m.y, m.z, 1.0]
+
+-- GI supplies the indirect illumination: no constant ambient or artificial sun
+-- floor in this path. GTAO adds only the fine detail absent from the trace proxies.
+def shade_surface_gi(albedo: vec3f32, n: vec3f32, ao: f32, shadow: f32,
+                      indirect: vec3f32, indirect_only: bool) vec4f32 =
+  let direct = if indirect_only then v3(0.0)
+               else SUN_COLOR * (clamp01(dot(n, sun)) * (1.0 - clamp01(shadow)))
+  let light = albedo * (direct + indirect * (1.0 - 0.2 * clamp01(ao)))
+  let mapped = tonemap_aces(light) in
+  @[mapped.x, mapped.y, mapped.z, 1.0]

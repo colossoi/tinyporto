@@ -44,6 +44,15 @@ impl FromStr for FrameRate {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+enum GiMode {
+    On = 0,
+    Off = 1,
+    Indirect = 2,
+    Reference = 3,
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Tiny Porto — Wyn-generated Rust/WGPU application.")]
 struct Args {
@@ -57,7 +66,10 @@ struct Args {
     /// Maximum interactive frame rate in Hz. Use `-` for uncapped.
     #[arg(long, default_value = "60", allow_hyphen_values = true)]
     fps: FrameRate,
-    /// Render a scripted scenario offscreen to this PNG and exit (no window).
+    /// Lighting: realtime GI, old ambient, indirect only, or an explicit path reference.
+    #[arg(long, value_enum, default_value_t = GiMode::On)]
+    gi: GiMode,
+    /// Render the demo scene offscreen to this PNG and exit (no window).
     #[arg(long)]
     screenshot: Option<std::path::PathBuf>,
     /// Screenshot orbit camera: eye distance from the target.
@@ -73,8 +85,8 @@ struct Args {
     /// 3 super) — exercises modifier-gated features headless (e.g. Ctrl = AO off).
     #[arg(long, default_value_t = 0)]
     mods: u32,
-    /// Screenshot scene time (seconds) fed to `frame.time` — animates time-varying
-    /// effects (e.g. the water) for a still. The window path uses real elapsed time.
+    /// Screenshot scene time (seconds) fed to `frame.time`, reserved for animated
+    /// effects. The window path uses real elapsed time.
     #[arg(long, default_value_t = 0.0)]
     time: f32,
     /// After a screenshot render, read these exposed buffers back and print their
@@ -153,7 +165,8 @@ impl ApplicationHandler for App {
         let renderer =
             Gfx::new(window.clone()).and_then(|gfx| Renderer::new(gfx, &self.cam, self.mods, 0.0));
         match renderer {
-            Ok(r) => {
+            Ok(mut r) => {
+                r.gi_mode = self.args.gi as u32;
                 self.window = Some(window);
                 self.renderer = Some(r);
                 let now = Instant::now();
@@ -321,12 +334,13 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Headless: render a scripted scenario offscreen to a PNG and exit.
+    // Headless: render the demo scene offscreen to a PNG and exit.
     if let Some(path) = args.screenshot.clone() {
         let gfx = Gfx::new_headless(args.width, args.height)?;
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
         let mut renderer = Renderer::new(gfx, &cam, args.mods, args.time)?;
+        renderer.gi_mode = args.gi as u32;
         renderer.screenshot(&path, &cam, args.mods, args.time)?;
         for name in &args.dump {
             renderer.dump_buffer(name)?;

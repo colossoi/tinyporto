@@ -1,0 +1,288 @@
+-- Tiny Glade talk sections 4.2-4.3: hybrid final gather, SH2, radiance feedback,
+-- and AO-guided self-stabilizing recurrent filtering. See docs/gi.md.
+import "scene_trace"
+import "hemisphere"
+import "math"
+import "camera"
+import "render_types"
+import "sh"
+import "clouds"
+import "shade"
+import "shadow"
+
+module gi = {
+
+  def LIFT: f32 = 0.02
+  def SKY: f32 = 0.4
+
+  def direct_light(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node,
+                   resolution: vec3f32, camera: orbit, p: vec3f32, n: vec3f32,
+                   on_screen: bool) vec3f32 =
+    let ndl = f32.max(0.0, dot(n, sun))
+    let origin = p + n * LIFT
+    let shadow = if ndl <= 0.0 then 1.0
+                 else if on_screen then f32.max(sun_shadow_pcf(sun_depth, origin, resolution.x, resolution.y),
+                                                 contact_shadow(scene, origin, n, resolution, camera))
+                 else if scene_trace.world(nodes, origin, sun).t < scene_trace.FAR then 1.0 else 0.0 in
+    SUN_COLOR * (ndl * (1.0 - shadow))
+
+  -- Independent three-segment reference integrator: cosine sampling, explicit
+  -- bounces, no radiance feedback, SH projection or spatial denoising.
+  def reference_path(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
+                     nodes: []scene_trace.node, resolution: vec3f32, camera: orbit,
+                     p: vec3f32, normal: vec3f32, seed: u32) vec3f32 =
+    let result = loop (ro, rd, throughput, light, active) =
+      (p + normal * LIFT, hemisphere.direction(normal, hemisphere.uniform2(seed), true), v3(1.0), v3(0.0), true)
+    for bounce < 3 do
+      if !active then (ro, rd, throughput, light, false)
+      else
+        let hit = scene_trace.trace(scene, nodes, resolution, camera, ro, rd) in
+        if !hit.hit then (ro, rd, throughput, light + throughput * clouds.sky(rd) * SKY, false)
+        else
+          let weight = throughput * hit.albedo
+          let direct = direct_light(scene, sun_depth, nodes, resolution, camera,
+                                  hit.point, hit.normal, hit.screen) in
+          (hit.point + hit.normal * LIFT, hemisphere.direction(hit.normal, hemisphere.uniform2(seed + u32(bounce + 1) * 2u32), true),
+           weight, light + weight * direct, true)
+    in result.3
+
+  -- Seven vec4s / 112 bytes. light.rgb = irradiance/pi, light.w = history age.
+  -- SH radiance order: (DC, x, y, z) per channel. guide.x = GTAO visibility;
+  -- guide.y = reference flag. normal.w = mean albedo for history validation.
+  type sample = {
+    light: vec4f32, position: vec4f32, normal: vec4f32,
+    red: vec4f32, green: vec4f32, blue: vec4f32, guide: vec4f32,
+  }
+  def HISTORY: f32 = 32.0
+  def width(resolution: vec3f32, reference: bool) i32 =
+    if reference then i32(resolution.x) else (i32(resolution.x) + 1) / 2
+  def height(resolution: vec3f32, reference: bool) i32 =
+    if reference then i32(resolution.y) else (i32(resolution.y) + 1) / 2
+  def trace_width(resolution: vec3f32) i32 = (i32(resolution.x) + 3) / 4
+  def trace_height(resolution: vec3f32) i32 = (i32(resolution.y) + 3) / 4
+  def zero: vec4f32 = @[0.0, 0.0, 0.0, 0.0]
+  def empty: sample =
+    { light = zero, position = zero, normal = zero,
+      red = zero, green = zero, blue = zero, guide = zero }
+
+  def copy(s: sample) sample =
+    -- Reconstruct loaded records at branch joins; avoids Wyn's current
+    -- record/tuple phi mismatch without changing the storage layout.
+    { light = s.light, position = s.position, normal = s.normal,
+      red = s.red, green = s.green, blue = s.blue, guide = s.guide }
+
+  def with_sh(surface: sample, red: vec4f32, green: vec4f32, blue: vec4f32,
+              age: f32) sample =
+    let light = sh.evaluate(red, green, blue, surface.normal.xyz) in
+    { light = @[light.x, light.y, light.z, age], position = surface.position,
+      normal = surface.normal, red = red, green = green, blue = blue, guide = surface.guide }
+
+  def load_surface(scene: render_target<gbuffer>, ao: []vec4f32, resolution: vec3f32,
+                   camera: orbit, pixel: vec2i32, reference: bool) sample =
+    let g = target_load(scene, pixel, 0u32) in
+    if g.albedo.w < 0.5 then empty
+    else
+      let p = screen_trace.position(scene, resolution, camera, pixel)
+      let n = normalize(g.normal.xyz)
+      let visibility = ao[pixel.y * i32(resolution.x) + pixel.x].x in
+      { light = zero, position = @[p.x, p.y, p.z, 1.0],
+        normal = @[n.x, n.y, n.z, (g.albedo.x + g.albedo.y + g.albedo.z) / 3.0],
+        red = zero, green = zero, blue = zero,
+        guide = @[visibility, if reference then 1.0 else 0.0, 0.0, 0.0] }
+
+  def history_index(surface: sample, history: []sample, resolution: vec3f32,
+                    previous_camera: orbit, history_valid: bool, reference: bool) i32 =
+    if !history_valid || surface.position.w < 0.5 then -1
+    else
+      let p = surface.position.xyz
+      let (projected, visible) = project_pixel(p, resolution, previous_camera)
+      let scale = if reference then 1.0 else 2.0
+      let center = if reference then 0.5 else 1.5
+      let base = @[i32(f32.floor((projected.x - center) / scale)),
+                   i32(f32.floor((projected.y - center) / scale))]
+      let w = width(resolution, reference)
+      let h = height(resolution, reference)
+      let tolerance = 0.04 + distance(p, cam_eye(previous_camera)) * 1.0 / resolution.y
+      let (best, _distance) = loop (best, best_distance) = (-1, tolerance) for k < 4 do
+        let x = base.x + k % 2
+        let y = base.y + k / 2 in
+        if !visible || x < 0 || y < 0 || x >= w || y >= h then (best, best_distance)
+        else
+          let candidate = history[y * w + x]
+          let delta = candidate.position.xyz - p
+          let d = magnitude(delta) in
+          if candidate.light.w > 0.5 && d < best_distance
+             && f32.abs(dot(delta, surface.normal.xyz)) < 0.04
+             && dot(candidate.normal.xyz, surface.normal.xyz) > 0.85
+             && f32.abs(candidate.normal.w - surface.normal.w) < 0.12
+             && candidate.guide.y == surface.guide.y then (y * w + x, d)
+          else (best, best_distance)
+      in best
+
+  -- Current linear screen radiance. Reproject only the indirect light; direct
+  -- lighting and materials are current. Gather hits feed this back across frames.
+  def screen_radiance(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
+                      nodes: []scene_trace.node, ao: []vec4f32, history: []sample,
+                      resolution: vec3f32, camera: orbit, previous_camera: orbit,
+                      history_valid: bool, enabled: bool, index: i32) vec4f32 =
+    if !enabled then zero
+    else
+      let xy = @[index % i32(resolution.x), index / i32(resolution.x)]
+      let surface = load_surface(scene, ao, resolution, camera, xy, false) in
+      if surface.position.w < 0.5 then zero
+      else
+        let old_index = history_index(surface, history, resolution, previous_camera, history_valid, false)
+        let indirect = if old_index < 0 then v3(0.0)
+                        else let old = history[old_index] in sh.evaluate(old.red, old.green, old.blue, surface.normal.xyz)
+        let direct = direct_light(scene, sun_depth, nodes, resolution, camera,
+                                surface.position.xyz, surface.normal.xyz, true)
+        let albedo = target_load(scene, xy, 0u32).albedo.xyz
+        let light = albedo * (direct + indirect * (0.8 + 0.2 * surface.guide.x)) in
+        @[light.x, light.y, light.z, 1.0]
+
+  def gather(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node,
+             radiance: []vec4f32, resolution: vec3f32, camera: orbit,
+             surface: sample, seed: u32) sample =
+    let rd = hemisphere.direction(surface.normal.xyz, hemisphere.uniform2(seed), false)
+    let hit = scene_trace.trace(scene, nodes, resolution, camera, surface.position.xyz + surface.normal.xyz * LIFT, rd)
+    let incoming = if !hit.hit then clouds.sky(rd) * SKY
+                    else if hit.screen then radiance[hit.pixel.y * i32(resolution.x) + hit.pixel.x].xyz
+                    else hit.albedo * direct_light(scene, sun_depth, nodes, resolution, camera,
+                                                 hit.point, hit.normal, false)
+    -- Uniform hemisphere PDF = 1/(2*pi). Project radiance, not cosine-weighted
+    -- irradiance, so normal-dependent evaluation remains possible after filtering.
+    let basis = sh.uniform_hemisphere_basis(rd) in
+    let directional = with_sh(surface, basis * incoming.x, basis * incoming.y, basis * incoming.z, 1.0) in
+    { light = directional.light, position = directional.position, normal = directional.normal,
+      red = directional.red, green = directional.green, blue = directional.blue,
+      guide = @[surface.guide.x, 0.0, if hit.screen then 1.0 else 0.0, if hit.hit then 0.0 else 1.0] }
+
+  -- One ray per 4x4 tile. Cycle primary locations to cover thin details over time.
+  def trace_pixel(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node,
+                  ao: []vec4f32, radiance: []vec4f32, resolution: vec3f32, camera: orbit,
+                  frame_index: u32, index: i32, enabled: bool) sample =
+    if !enabled then empty
+    else
+      let phase = i32(frame_index % 16u32)
+      let w = trace_width(resolution)
+      let pixel = @[clampi(index % w * 4 + phase % 4, 0, i32(resolution.x) - 1),
+                     clampi(index / w * 4 + phase / 4, 0, i32(resolution.y) - 1)]
+      let surface = load_surface(scene, ao, resolution, camera, pixel, false) in
+      if surface.position.w < 0.5 then empty
+      else gather(scene, sun_depth, nodes, radiance, resolution, camera, surface,
+                       u32(index) * 128u32 + frame_index * 1048576u32)
+
+  def filter_weight(center: sample, sample: sample, reach: f32) f32 =
+    let delta = sample.position.xyz - center.position.xyz
+    let agreement = f32.max(0.0, dot(center.normal.xyz, sample.normal.xyz))
+    let plane = f32.abs(dot(delta, center.normal.xyz)) in
+    if sample.light.w < 0.5 || magnitude(delta) > reach || agreement < 0.6 then 0.0
+    else f32.pow(agreement, 8.0) * f32.exp(-plane / 0.035)
+         * f32.exp(-f32.abs(center.guide.x - sample.guide.x) * 6.0)
+
+  def reconstruct(surface: sample, rays: []sample, resolution: vec3f32,
+                  camera: orbit, pixel: vec2i32, frame_index: u32) sample =
+    let w = trace_width(resolution)
+    let h = trace_height(resolution)
+    let reach = 0.18 + distance(surface.position.xyz, cam_eye(camera)) * 5.0 / resolution.y
+    let (r, g, b, weight) = loop (r, g, b, weight) = (zero, zero, zero, 0.0) for k < 8 do
+      -- Eight nearby trace outputs; rotate the omitted corner each frame.
+      let phase = i32(frame_index % 4u32)
+      let corner = if phase < 2 then phase * 2 else phase * 2 + 2
+      let cell = if k >= corner then k + 1 else k
+      let x = pixel.x / 4 + cell % 3 - 1
+      let y = pixel.y / 4 + cell / 3 - 1 in
+      if x < 0 || y < 0 || x >= w || y >= h then (r, g, b, weight)
+      else
+        let sample = rays[y * w + x]
+        let sw = filter_weight(surface, sample, reach) in
+        (r + sample.red * sw, g + sample.green * sw, b + sample.blue * sw, weight + sw)
+    in if weight < 0.001 then copy(surface)
+       else with_sh(surface, r / weight, g / weight, b / weight, 1.0)
+
+  def accumulate(current: sample, history: []sample, resolution: vec3f32,
+                 previous_camera: orbit, history_valid: bool, reference: bool) sample =
+    let old_index = history_index(current, history, resolution, previous_camera, history_valid, reference) in
+    if current.position.w < 0.5 || old_index < 0 then copy(current)
+    else
+      let old = history[old_index]
+      let count = f32.min(if reference then 4096.0 else HISTORY, old.light.w + 1.0)
+      let alpha = if current.light.w > 0.5 then 1.0 / count else 0.0
+      let rgb = mix(old.light.xyz, current.light.xyz, alpha) in
+      if reference then
+        { light = @[rgb.x, rgb.y, rgb.z, count], position = current.position,
+          normal = current.normal, red = zero, green = zero, blue = zero, guide = current.guide }
+      else with_sh(current, mix(old.red, current.red, alpha), mix(old.green, current.green, alpha),
+                       mix(old.blue, current.blue, alpha), if alpha > 0.0 then count else old.light.w)
+
+  def temporal_pixel(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node,
+                     ao: []vec4f32, radiance: []vec4f32, rays: []sample, history: []sample,
+                     resolution: vec3f32, camera: orbit, previous_camera: orbit, frame_index: u32,
+                     history_valid: bool, enabled: bool, reference: bool, index: i32) sample =
+    if !enabled then empty
+    else
+      let w = width(resolution, reference)
+      let pixel = if reference then @[index % w, index / w]
+                   else @[clampi(index % w * 2 + 1, 0, i32(resolution.x) - 1),
+                           clampi(index / w * 2 + 1, 0, i32(resolution.y) - 1)]
+      let surface = load_surface(scene, ao, resolution, camera, pixel, reference)
+      let seed = u32(index) * 128u32 + frame_index * 1048576u32 in
+      if surface.position.w < 0.5 then empty
+      else if reference then
+        let light = loop light = v3(0.0) for k < 8 do
+          light + reference_path(scene, sun_depth, nodes, resolution, camera,
+                    surface.position.xyz, surface.normal.xyz, seed + u32(k) * 8u32) * 0.125
+        let sample = { light = @[light.x, light.y, light.z, 1.0], position = surface.position,
+                       normal = surface.normal, red = zero, green = zero, blue = zero, guide = surface.guide } in
+        accumulate(sample, history, resolution, previous_camera, history_valid, true)
+      else
+        let current = reconstruct(surface, rays, resolution, camera, pixel, frame_index)
+        let temporal = accumulate(current, history, resolution, previous_camera, history_valid, false) in
+        if temporal.light.w > 0.5 then copy(temporal)
+        -- Deterministic gap fill after both spatial reconstruction and reprojection
+        -- fail. An extra fresh ray avoids same-dispatch read/write races.
+        else gather(scene, sun_depth, nodes, radiance, resolution, camera, surface, seed)
+
+  -- Feed the filtered SH back into history. The kernel shrinks as history matures.
+  def recurrent_pixel(temporal: []sample, resolution: vec3f32, camera: orbit,
+                      reference: bool, index: i32) sample =
+    let center = temporal[index] in
+    if reference || center.position.w < 0.5 then copy(center)
+    else
+      let w = width(resolution, false)
+      let h = height(resolution, false)
+      let stride = if center.light.w < 4.0 then 3 else if center.light.w < 12.0 then 2 else 1
+      let reach = 0.12 + distance(center.position.xyz, cam_eye(camera)) * f32(stride) * 2.5 / resolution.y
+      let (r, g, b, weight) = loop (r, g, b, weight) = (zero, zero, zero, 0.0) for k < 9 do
+        let dx = k % 3 - 1
+        let dy = k / 3 - 1
+        let x = index % w + dx * stride
+        let y = index / w + dy * stride in
+        if x < 0 || y < 0 || x >= w || y >= h then (r, g, b, weight)
+        else
+          let sample = temporal[y * w + x]
+          let sw = filter_weight(center, sample, reach) * (if k == 4 then 4.0 else 1.0) in
+          (r + sample.red * sw, g + sample.green * sw, b + sample.blue * sw, weight + sw)
+      in if weight < 0.001 then copy(center)
+         else with_sh(center, r / weight, g / weight, b / weight, center.light.w)
+
+  def resolve(samples: []sample, resolution: vec3f32, camera: orbit, pixel: vec2i32,
+              p: vec3f32, n: vec3f32, ao_visibility: f32, reference: bool) vec3f32 =
+    if reference then samples[pixel.y * i32(resolution.x) + pixel.x].light.xyz
+    else
+      let w = width(resolution, false)
+      let h = height(resolution, false)
+      let surface = { light = zero, position = @[p.x, p.y, p.z, 1.0], normal = @[n.x, n.y, n.z, 0.0],
+                      red = zero, green = zero, blue = zero, guide = @[ao_visibility, 0.0, 0.0, 0.0] }
+      let reach = 0.12 + distance(p, cam_eye(camera)) * 2.5 / resolution.y
+      let (r, g, b, weight) = loop (r, g, b, weight) = (zero, zero, zero, 0.0) for k < 9 do
+        let x = pixel.x / 2 + k % 3 - 1
+        let y = pixel.y / 2 + k / 3 - 1 in
+        if x < 0 || y < 0 || x >= w || y >= h then (r, g, b, weight)
+        else
+          let sample = samples[y * w + x]
+          let sw = filter_weight(surface, sample, reach) in
+          (r + sample.red * sw, g + sample.green * sw, b + sample.blue * sw, weight + sw)
+      in if weight < 0.001 then v3(0.0)
+         else sh.evaluate(r / weight, g / weight, b / weight, n)
+}

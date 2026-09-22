@@ -15,6 +15,7 @@ struct World {
     items: wgpu::Buffer,
     head: wgpu::Buffer,
     occ: wgpu::Buffer,
+    gi: wgpu::Buffer,
 }
 
 impl World {
@@ -25,11 +26,13 @@ impl World {
             items: storage(device, "items", 128 * 16),
             head: storage(device, "head", 12 * 4),
             occ: storage(device, "previous occlusion", occlusion_bytes(width, height)),
+            gi: storage(device, "previous GI", gi_bytes(width, height, false)),
         }
     }
 
     fn from_output(output: &OutputDescriptor) -> Result<Self> {
-        // tinyporto_frame returns (ui, points, items, head, occ, sun, scene, image).
+        // The first six results are persistent state; later results expose GI
+        // diagnostics and render targets without being retained as next inputs.
         // Retain the actual returned allocations for the next call.
         let buffer = |index: usize| match output.values.get(index).map(|value| &value.resource) {
             Some(OutputResource::Buffer { buffer, .. }) => Ok(buffer.clone()),
@@ -44,6 +47,7 @@ impl World {
             items: buffer(2)?,
             head: buffer(3)?,
             occ: buffer(4)?,
+            gi: buffer(5)?,
         })
     }
 
@@ -54,6 +58,7 @@ impl World {
             "items" => Some(&self.items),
             "head" => Some(&self.head),
             "occ" => Some(&self.occ),
+            "gi" => Some(&self.gi),
             _ => None,
         }
     }
@@ -62,6 +67,19 @@ impl World {
 fn occlusion_bytes(width: u32, height: u32) -> u64 {
     // Must match OCC_TILE in hiz.wyn.
     u64::from(width.div_ceil(8)) * u64::from(height.div_ceil(8)) * 4
+}
+
+fn gi_bytes(width: u32, height: u32, reference: bool) -> u64 {
+    // gi.sample in gi.wyn: seven vec4s. Reference has full-resolution history.
+    let divisor = if reference { 1 } else { 2 };
+    u64::from(width.div_ceil(divisor)) * u64::from(height.div_ceil(divisor)) * 112
+}
+
+struct FrameHistory {
+    camera: Camera,
+    frame_index: u32,
+    valid: u32,
+    gi_mode: u32,
 }
 
 fn storage(device: &wgpu::Device, name: &str, bytes: u64) -> wgpu::Buffer {
@@ -76,7 +94,14 @@ fn storage(device: &wgpu::Device, name: &str, bytes: u64) -> wgpu::Buffer {
 }
 
 /// Pack application values using the compiler's published field offsets.
-fn frame_bytes(width: u32, height: u32, cam: &Camera, mods: u32, time: f32) -> Result<Vec<u8>> {
+fn frame_bytes(
+    width: u32,
+    height: u32,
+    cam: &Camera,
+    mods: u32,
+    time: f32,
+    history: &FrameHistory,
+) -> Result<Vec<u8>> {
     let id = generated::RESOURCE_NAMES
         .iter()
         .find(|(_, name)| *name == "frame")
@@ -105,6 +130,16 @@ fn frame_bytes(width: u32, height: u32, cam: &Camera, mods: u32, time: f32) -> R
         ("cam_elev", bytemuck::bytes_of(&cam.elev)),
         ("cam_dist", bytemuck::bytes_of(&cam.dist)),
         ("time", bytemuck::bytes_of(&time)),
+        (
+            "previous_target",
+            bytemuck::cast_slice(&history.camera.target),
+        ),
+        ("previous_az", bytemuck::bytes_of(&history.camera.az)),
+        ("previous_elev", bytemuck::bytes_of(&history.camera.elev)),
+        ("previous_dist", bytemuck::bytes_of(&history.camera.dist)),
+        ("frame_index", bytemuck::bytes_of(&history.frame_index)),
+        ("history_valid", bytemuck::bytes_of(&history.valid)),
+        ("gi_mode", bytemuck::bytes_of(&history.gi_mode)),
     ] {
         let (_, _, offset, size) = fields
             .iter()
@@ -128,6 +163,7 @@ struct Targets {
     scene_z: wgpu::Texture,
     ao: wgpu::Buffer,
     next_occ: wgpu::Buffer,
+    gi_rays: wgpu::Buffer,
 }
 
 impl Targets {
@@ -158,15 +194,17 @@ impl Targets {
             scene_z: image("scene depth attachment", wgpu::TextureFormat::Depth32Float),
             ao: storage(device, "ao_work", u64::from(width) * u64::from(height) * 16),
             next_occ: storage(device, "next occlusion", occlusion_bytes(width, height)),
+            gi_rays: storage(
+                device,
+                "GI quarter-resolution rays",
+                u64::from(width.div_ceil(4)) * u64::from(height.div_ceil(4)) * 112,
+            ),
         }
     }
 
-    fn clear(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    fn record_clears(&self, encoder: &mut wgpu::CommandEncoder) {
         // Generated draws load their attachments. Both scene draws share scene_z,
         // so the ground depth survives into the prop draw. Shadows have their own.
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("clear frame targets"),
-        });
         for (texture, color) in [
             (&self.sun, wgpu::Color::WHITE),
             (
@@ -212,13 +250,13 @@ impl Targets {
                 ..Default::default()
             });
         }
-        queue.submit(Some(encoder.finish()));
     }
 }
 
 pub struct Renderer {
     pub gfx: Gfx,
     pub frame: u32,
+    pub gi_mode: u32,
     // Retain Wyn's pipelines and scratch buffers across frames and resizes.
     host: generated::HostContext,
     world: World,
@@ -226,12 +264,27 @@ pub struct Renderer {
     events: wgpu::Buffer,
     globals: wgpu::Buffer,
     start: Instant,
+    previous_camera: Camera,
+    gi_reset_frames: u32,
+    paint_held: bool,
 }
 
 impl Renderer {
     pub fn new(gfx: Gfx, cam: &Camera, mods: u32, time: f32) -> Result<Self> {
         let (w, h) = (gfx.config.width, gfx.config.height);
-        let bytes = frame_bytes(w, h, cam, mods, time)?;
+        let bytes = frame_bytes(
+            w,
+            h,
+            cam,
+            mods,
+            time,
+            &FrameHistory {
+                camera: *cam,
+                frame_index: 0,
+                valid: 0,
+                gi_mode: 0,
+            },
+        )?;
         let globals = gfx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame"),
             size: bytes.len() as u64,
@@ -249,7 +302,11 @@ impl Renderer {
             gfx,
             globals,
             frame: 0,
+            gi_mode: 0,
             start: Instant::now(),
+            previous_camera: *cam,
+            gi_reset_frames: 1,
+            paint_held: false,
         })
     }
 
@@ -268,12 +325,31 @@ impl Renderer {
             "previous occlusion",
             occlusion_bytes(width, height),
         );
+        self.world.gi = storage(
+            &self.gfx.device,
+            "previous GI",
+            gi_bytes(width, height, self.gi_mode == 3),
+        );
+        self.gi_reset_frames = 1;
     }
 
-    pub fn upload_events(&self, events: &[[f32; 4]]) {
+    pub fn upload_events(&mut self, events: &[[f32; 4]]) {
         let mut padded = [[0f32; 4]; EV_CAP];
         let count = events.len().min(EV_CAP);
         padded[..count].copy_from_slice(&events[..count]);
+        for event in &events[..count] {
+            let kind = event[0] as u32 / 256;
+            if kind == crate::EV_MOUSEDOWN && event[1] == 0.0 {
+                self.paint_held = true;
+                self.gi_reset_frames = 2;
+            } else if kind == crate::EV_MOUSEUP && event[1] == 0.0 {
+                self.paint_held = false;
+                self.gi_reset_frames = 2;
+            } else if kind == crate::EV_MOUSEMOVE && self.paint_held {
+                // The frame renders the previous world, so edits invalidate two frames.
+                self.gi_reset_frames = 2;
+            }
+        }
         self.gfx
             .queue
             .write_buffer(&self.events, 0, bytemuck::cast_slice(&padded));
@@ -286,42 +362,68 @@ impl Renderer {
         mods: u32,
         time: f32,
     ) -> Result<()> {
+        let history_bytes = gi_bytes(
+            self.gfx.config.width,
+            self.gfx.config.height,
+            self.gi_mode == 3,
+        );
+        if self.world.gi.size() != history_bytes {
+            self.world.gi = storage(&self.gfx.device, "previous GI", history_bytes);
+            self.gi_reset_frames = 1;
+        }
         let bytes = frame_bytes(
             self.gfx.config.width,
             self.gfx.config.height,
             cam,
             mods,
             time,
+            &FrameHistory {
+                camera: self.previous_camera,
+                frame_index: self.frame,
+                valid: u32::from(self.gi_reset_frames == 0),
+                gi_mode: self.gi_mode,
+            },
         )?;
         self.gfx.queue.write_buffer(&self.globals, 0, &bytes);
-        self.targets.clear(&self.gfx.device, &self.gfx.queue);
-        let output = generated::host_tinyporto_frame(
+        let mut encoder = self
+            .gfx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tinyporto frame"),
+            });
+        self.targets.record_clears(&mut encoder);
+        let output = generated::encode_tinyporto_frame(
             &mut self.host,
-            &self.gfx.queue,
-            &self.world.ui,
+            &mut encoder,
             &self.world.head,
+            &self.world.ui,
             &self.events,
             &self.globals,
             &self.world.points,
             &self.world.items,
             &self.world.occ,
+            &self.world.gi,
             &self.targets.albedo,
             &self.targets.normal,
             &self.targets.depth,
             &self.targets.ao,
             &self.targets.next_occ,
             &self.targets.sun,
+            &self.targets.gi_rays,
             target,
             &self.targets.shadow_z,
             &self.targets.scene_z,
             &self.targets.scene_z,
         )
         .context("execute Wyn frame")?;
+        self.gfx.queue.submit(Some(encoder.finish()));
         let next = World::from_output(&output)?;
         let previous = std::mem::replace(&mut self.world, next);
         // The caller-provided occlusion output cannot alias next frame's input.
         self.targets.next_occ = previous.occ;
         self.frame = self.frame.wrapping_add(1);
+        self.previous_camera = *cam;
+        self.gi_reset_frames = self.gi_reset_frames.saturating_sub(1);
         Ok(())
     }
 
@@ -360,7 +462,7 @@ impl Renderer {
 
     pub fn dump_buffer(&self, name: &str) -> Result<()> {
         let buffer = self.buffer(name).with_context(|| format!(
-            "no exposed buffer '{name}'; available: uistate, points, items, head, occ, events, frame, ao_work"
+            "no exposed buffer '{name}'; available: uistate, points, items, head, occ, gi, events, frame, ao_work"
         ))?;
         let bytes = read_buffer(&self.gfx, buffer)?;
         let words: Vec<_> = bytes
@@ -379,7 +481,7 @@ impl Renderer {
         }
         Ok(())
     }
-    /// Headless: render a scripted scenario into an offscreen texture and write it
+    /// Headless: render the demo scene into an offscreen texture and write it
     /// to `path` as a PNG. Used to eyeball the pipeline without a window.
     pub fn screenshot(
         &mut self,
@@ -404,33 +506,11 @@ impl Renderer {
             view_formats: &[],
         });
 
-        use crate::{encode_event, EV_MOUSEDOWN, EV_MOUSEMOVE, EV_MOUSEUP};
-
-        // Script a water-stroke drag across the middle of the screen, then release,
-        // so the shot exercises capture -> tessellation -> ribbon, not just the base.
-        // Drive it as the same event stream the live path produces: a MouseDown on
-        // the first held frame, a MouseMove each held frame, a MouseUp on release.
-        let total = 20u32;
+        // Warm the renderer and occlusion history without painting into the scene.
+        let total = 40u32;
         let mut frame_ms: Vec<f32> = Vec::new();
-        let mut prev_held = false;
-        for f in 0..total {
-            let t = f as f32 / (total - 1).max(1) as f32;
-            // A curved sweep (one sine arch) so the ribbon shows the spline curving.
-            let mx = (0.25 + 0.50 * t) * w as f32;
-            let my = (0.5 - 0.18 * (t * std::f32::consts::PI).sin()) * h as f32;
-            let held = f + 4 < total; // release near the end
-            let mut events: Vec<[f32; 4]> = Vec::new();
-            if held && !prev_held {
-                events.push(encode_event(EV_MOUSEDOWN, 0, 0.0, mx, my));
-            }
-            if held {
-                events.push(encode_event(EV_MOUSEMOVE, 0, 0.0, mx, my));
-            }
-            if !held && prev_held {
-                events.push(encode_event(EV_MOUSEUP, 0, 0.0, mx, my));
-            }
-            prev_held = held;
-            self.upload_events(&events);
+        self.upload_events(&[]);
+        for _ in 0..total {
             let t0 = Instant::now();
             self.execute(&tex, cam, mods, time)?;
             self.gfx.device.poll(wgpu::PollType::Wait {
@@ -561,7 +641,7 @@ mod tests {
         let cam = Camera::default();
         let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
         let target = offscreen(&renderer.gfx);
-        // Tab selects fence for the next frame; this frame still paints water.
+        // Tab selects building for the next frame; this frame still paints fence.
         renderer.upload_events(&[
             encode_event(crate::EV_KEYDOWN, 0, 1.0, 0.0, 0.0),
             encode_event(EV_MOUSEDOWN, 0, 0.0, 32.0, 24.0),
@@ -573,7 +653,7 @@ mod tests {
         assert_eq!(f32::from_le_bytes(head[..4].try_into().unwrap()), 1.0);
         assert_eq!(f32::from_le_bytes(head[4..8].try_into().unwrap()), 1.0);
         let items = read_buffer(&renderer.gfx, &renderer.world.items).unwrap();
-        assert_eq!(f32::from_le_bytes(items[..4].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(items[..4].try_into().unwrap()), 2.0);
         let points = read_buffer(&renderer.gfx, &renderer.world.points).unwrap();
         let occlusion = read_buffer(&renderer.gfx, &renderer.world.occ).unwrap();
         assert!(occlusion
@@ -614,6 +694,188 @@ mod tests {
             read_buffer(&renderer.gfx, &renderer.world.points).unwrap(),
             points
         );
-        assert_eq!(renderer.frame, 3);
+        // Cycling again wraps to fence; the current building tool paints kind 3.
+        renderer.upload_events(&[
+            encode_event(crate::EV_KEYDOWN, 0, 1.0, 0.0, 0.0),
+            encode_event(EV_MOUSEDOWN, 0, 0.0, 40.0, 27.0),
+        ]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        let ui = read_buffer(&renderer.gfx, &renderer.world.ui).unwrap();
+        assert_eq!(f32::from_le_bytes(ui[..4].try_into().unwrap()), 0.0);
+        let items = read_buffer(&renderer.gfx, &renderer.world.items).unwrap();
+        assert_eq!(f32::from_le_bytes(items[16..20].try_into().unwrap()), 3.0);
+        assert_eq!(renderer.frame, 4);
+    }
+
+    fn gi_samples(renderer: &Renderer) -> Vec<[f32; 28]> {
+        read_buffer(&renderer.gfx, &renderer.world.gi)
+            .unwrap()
+            .chunks_exact(112)
+            .map(|pixel| {
+                std::array::from_fn(|i| {
+                    f32::from_le_bytes(pixel[i * 4..i * 4 + 4].try_into().unwrap())
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gi_accumulates_reprojects_and_invalidates_history() {
+        let gfx = Gfx::new_headless(80, 60).expect("GPU device");
+        let mut cam = Camera::default();
+        cam.set([0.0, 0.0, 0.0], 0.6, -1.1, 25.0);
+        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let target = offscreen(&renderer.gfx);
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        let first_buffer = renderer.world.gi.clone();
+        let first_bytes = read_buffer(&renderer.gfx, &first_buffer).unwrap();
+        let first = gi_samples(&renderer);
+        assert_eq!(first.len(), 40 * 30);
+        assert!(first.iter().filter(|p| p[3] == 1.0).count() > 500);
+        for _ in 0..39 {
+            renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        }
+        // Retained input must never be overwritten by the generated output.
+        assert_eq!(
+            read_buffer(&renderer.gfx, &first_buffer).unwrap(),
+            first_bytes
+        );
+        let settled = gi_samples(&renderer);
+        assert!(settled.iter().filter(|p| p[3] >= 10.0).count() > 500);
+        assert!(settled.iter().all(|p| p[3] <= 32.0));
+        assert!(settled.iter().flatten().all(|v| v.is_finite()));
+        assert!(settled
+            .iter()
+            .all(|p| p[..3].iter().all(|&v| (0.0..8.0).contains(&v))));
+
+        // Open ground receives blue sky; the open-topped brick rooms receive
+        // occluded sky and warmer bounced light. Check actual traced illumination,
+        // not display mapping or a uniform ambient multiplier.
+        let mean = |inside: bool| {
+            let samples: Vec<_> = settled
+                .iter()
+                .filter(|p| {
+                    let in_room = (p[4] - 2.6).abs() < 0.9 && (p[6] + 1.0).abs() < 0.5;
+                    let open = p[4].abs() < 1.0 && p[6].abs() < 1.0;
+                    p[7] > 0.5 && p[5] < 0.08 && if inside { in_room } else { open }
+                })
+                .collect();
+            assert!(
+                samples.len() >= 3,
+                "missing GI test surfaces: {}",
+                samples.len()
+            );
+            let mut rgb = [0.0f32; 3];
+            for pixel in &samples {
+                for i in 0..3 {
+                    rgb[i] += pixel[i] / samples.len() as f32;
+                }
+            }
+            rgb
+        };
+        let room = mean(true);
+        let open = mean(false);
+        eprintln!("GI mean: room {room:?}, open ground {open:?}");
+        assert!(
+            room[0] / room[2].max(0.001) > open[0] / open[2].max(0.001) + 0.1,
+            "brick room must receive colored bounce light"
+        );
+        assert!(room[2] < open[2] * 0.8, "walls must occlude blue sky light");
+
+        let rays = read_buffer(&renderer.gfx, &renderer.targets.gi_rays).unwrap();
+        assert_eq!(rays.len(), 20 * 15 * 112);
+        let ray_guides: Vec<_> = rays
+            .chunks_exact(112)
+            .map(|p| {
+                (
+                    f32::from_le_bytes(p[104..108].try_into().unwrap()),
+                    f32::from_le_bytes(p[108..112].try_into().unwrap()),
+                    f32::from_le_bytes(p[12..16].try_into().unwrap()),
+                )
+            })
+            .collect();
+        assert!(
+            ray_guides.iter().any(|p| p.0 == 1.0),
+            "screen-space hits must contribute"
+        );
+        assert!(
+            ray_guides
+                .iter()
+                .any(|p| p.0 == 0.0 && p.1 == 0.0 && p.2 == 1.0),
+            "world-space fallback must hit geometry"
+        );
+        assert!(
+            ray_guides.iter().any(|p| p.1 == 1.0),
+            "sky misses must contribute"
+        );
+
+        // Compare against independent, full-resolution, 512-sample explicit paths.
+        // The reference bypasses SH, feedback and spatial filtering, and switches
+        // history dimensions. Compare the exact primary pixels traced by realtime.
+        renderer.gi_mode = 3;
+        for _ in 0..64 {
+            renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        }
+        let reference = gi_samples(&renderer);
+        assert_eq!(reference.len(), 80 * 60);
+        assert!(reference.iter().flatten().all(|v| v.is_finite()));
+        assert!(reference.iter().any(|p| p[3] > 32.0));
+        assert!(reference
+            .iter()
+            .all(|p| p[12..24].iter().all(|&v| v == 0.0)));
+        let mut squared_error = 0.0;
+        let mut energy = 0.0;
+        let mut count = 0;
+        for (i, sample) in settled.iter().enumerate() {
+            let exact = &reference[(i / 40 * 2 + 1) * 80 + i % 40 * 2 + 1];
+            if sample[7] > 0.5 && exact[7] > 0.5 {
+                for c in 0..3 {
+                    squared_error += (sample[c] - exact[c]).powi(2);
+                    energy += exact[c].powi(2);
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 1500);
+        let relative_rmse = (squared_error / energy.max(0.001)).sqrt();
+        eprintln!("GI relative RMS error against reference: {relative_rmse:.3}");
+        assert!(
+            relative_rmse < 0.4,
+            "realtime GI departed from reference lighting"
+        );
+        renderer.gi_mode = 0;
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        assert_eq!(gi_samples(&renderer).len(), 40 * 30);
+        assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+
+        // A modest orbit keeps some history and rejects newly exposed surfaces.
+        cam.az += 0.18;
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        let moved = gi_samples(&renderer);
+        assert!(moved.iter().any(|p| p[3] > 1.0));
+        assert!(moved.iter().any(|p| p[3] == 1.0));
+
+        renderer.gi_mode = 1;
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        assert!(gi_samples(&renderer).iter().flatten().all(|&v| v == 0.0));
+        renderer.gi_mode = 0;
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
+
+        renderer.resize(81, 55);
+        assert_eq!(renderer.world.gi.size(), 41 * 28 * 112);
+        assert!(gi_samples(&renderer).iter().flatten().all(|&v| v == 0.0));
+        let resized = offscreen(&renderer.gfx);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
+
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        renderer.upload_events(&[encode_event(EV_MOUSEDOWN, 0, 0.0, 40.0, 27.0)]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
+        renderer.upload_events(&[]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
     }
 }
