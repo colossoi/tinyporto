@@ -5,8 +5,12 @@
 -- tiny shared module lets the scene, GTAO, and shadow helpers all read the same
 -- target without reintroducing host-visible binding or attachment identities.
 
+import "octahedral"
+
+-- Physical formats are selected in driver/src/app.rs: 12 bytes/pixel total.
+-- Geometry writes octahedral.encode(normal); lighting/tracing reads decode it.
 type gbuffer = {
-  albedo: vec4f32,
-  normal: vec4f32,
-  depth: f32,
+  albedo: vec4f32, -- RGBA8Unorm: linear albedo RGB; A = 0 for sky, 0.5 + 0.5*roughness for surfaces
+  normal: vec2f32, -- RG16Float: octahedral world normal, not Cartesian XY
+  depth: f32,     -- R32Float: window depth (hardware depth is separate)
 }

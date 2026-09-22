@@ -90,7 +90,7 @@ module scene_trace = {
     let (xy, screen_hit) = screen_trace.trace(scene, resolution, camera, ro, rd, SCREEN) in
     if screen_hit then
       let g = target_load(scene, xy, 0u32) in
-      { point = screen_trace.position(scene, resolution, camera, xy), normal = normalize(g.normal.xyz),
+      { point = screen_trace.position(scene, resolution, camera, xy), normal = octahedral.decode(g.normal),
         albedo = g.albedo.xyz, pixel = xy, hit = true, screen = true }
     else
       let hit = world(nodes, ro, rd)
@@ -99,11 +99,12 @@ module scene_trace = {
       let px = @[clampi(i32(pixel.x), 0, i32(resolution.x) - 1),
                  clampi(i32(pixel.y), 0, i32(resolution.y) - 1)]
       let g = target_load(scene, px, 0u32)
+      let normal = octahedral.decode(g.normal)
       let surface = screen_trace.position(scene, resolution, camera, px)
       let on_screen = hit.t < FAR && visible && g.albedo.w > 0.5
-                      && distance(surface, p) < 0.18 && dot(g.normal.xyz, hit.normal) > 0.5 in
+                      && distance(surface, p) < 0.18 && dot(normal, hit.normal) > 0.5 in
       { point = if on_screen then surface else p,
-        normal = if on_screen then normalize(g.normal.xyz) else hit.normal,
+        normal = if on_screen then normal else hit.normal,
         albedo = if on_screen then g.albedo.xyz else hit.albedo,
         pixel = px, hit = hit.t < FAR, screen = on_screen }
 }

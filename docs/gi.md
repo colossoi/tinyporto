@@ -89,6 +89,16 @@ integrator over the hybrid scene representation, **not ground truth**.
 
 All passes, their dependencies, tracing and filtering live in Wyn. The Rust
 shell supplies camera history, frame index, capacities, mode and invalidation.
+G-buffer normals use octahedral encoding in an `RG16Float` attachment. All GI
+surface reads decode them to unit world normals before tracing, lighting, or
+history validation. GI history still stores Cartesian normals plus mean albedo;
+its layout and filtering are unchanged. GTAO reconstructs normals from depth.
+Textured props write palette-relative color variation and shading normals into
+the same G-buffer. Roughness shares albedo alpha while preserving the existing
+validity threshold. Direct GGX highlights are added only in final lighting;
+they do not enter diffuse radiance feedback. Off-screen proxies keep their
+coarse palette colors and geometric normals. `--no-textures` restores the
+original material evaluation and invalidates GI history when toggled.
 `build_gi` groups the array dependencies into one generated compute graph;
 separate top-level maps currently cause Wyn to expose disconnected producer
 outputs as new inputs. Reconstructing loaded records at branch joins also
@@ -127,7 +137,8 @@ warm color bounce and sky occlusion inside the brick rooms; history age and
 non-aliasing; camera reprojection; mode switches; odd-size resizing; and edit
 invalidation. It compares realtime indirect lighting after 40 frames against
 512-path-per-pixel reference lighting at the same primary pixels. The measured
-relative RGB RMS error in that 80x60 scene is about 0.158; this is one regression
+relative RGB RMS error in that 80x60 scene is about 0.157 with surface textures;
+this is one regression
 scene, not a general accuracy estimate.
 
 The generated SPIR-V is validated with `spirv-val`. Realtime, indirect-only and

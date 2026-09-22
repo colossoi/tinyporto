@@ -22,6 +22,7 @@ cargo run -- --screenshot scene.png    # headless demo scene
 cargo run -- --gi off                   # compare with the previous ambient model
 cargo run -- --gi indirect              # indirect light only
 cargo run -- --gi reference             # slower explicit path-traced comparison
+cargo run -- --no-textures              # compare original flat materials
 ```
 
 `build.rs` invokes `wyn build --graphics -O --target-double rust-wgpu --target
@@ -66,6 +67,12 @@ to compare with the previous ambient model; hold Ctrl to suppress final AO.
 The separate reference mode uses explicit paths without SH or spatial filtering.
 See [GI design, comparison modes, and limitations](docs/gi.md).
 
+Brick, cobble, quoin, and mortar surfaces use CC0 color, normal, and roughness
+maps by default. [`assets/textures`](assets/textures/README.md) documents sources,
+checksums, mipmaps, and mapping. `driver/src/materials.rs` embeds and uploads the
+maps once; `wyn/material.wyn` evaluates them at each rounded-box surface hit.
+`--no-textures` restores flat colors/geometric normals for comparison.
+
 ## Host integration
 
 `driver/src/app.rs` creates `generated::HostContext` once per renderer and passes
@@ -83,6 +90,14 @@ buffers, and three outputs whose capacities are caller-provided: one `vec4f32`
 per pixel for ambient occlusion, one `f32` per 8x8 tile for coarse occlusion,
 and one 112-byte GI ray sample per 4x4 tile.
 Ground and props share their depth attachment; shadows use a separate one.
+
+The G-buffer uses 12 bytes per pixel: `RGBA8Unorm` albedo/roughness, `RG16Float`
+octahedral world normals, and `R32Float` window depth. Geometry encodes normals
+after interpolation and material evaluation; lighting and GI decode point-sampled
+values. Albedo alpha is zero for sky or `0.5 + 0.5 * roughness` for a surface,
+preserving the validity test without another attachment. World position
+is reconstructed from depth. The separate `Depth32Float` attachment adds another
+4 bytes per pixel for hardware depth testing; it is not yet reused for sampling.
 
 The generated output descriptor's first six buffers are retained as the next
 frame's UI, points, items, stroke head, occlusion and GI inputs. The two

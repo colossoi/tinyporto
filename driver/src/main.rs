@@ -2,6 +2,7 @@
 mod app;
 mod camera;
 mod gfx;
+mod materials;
 include!(concat!(env!("OUT_DIR"), "/module.rs"));
 
 use anyhow::Result;
@@ -69,6 +70,9 @@ struct Args {
     /// Lighting: realtime GI, old ambient, indirect only, or an explicit path reference.
     #[arg(long, value_enum, default_value_t = GiMode::On)]
     gi: GiMode,
+    /// Compare with the original flat surface colors and geometric normals.
+    #[arg(long)]
+    no_textures: bool,
     /// Render the demo scene offscreen to this PNG and exit (no window).
     #[arg(long)]
     screenshot: Option<std::path::PathBuf>,
@@ -167,6 +171,7 @@ impl ApplicationHandler for App {
         match renderer {
             Ok(mut r) => {
                 r.gi_mode = self.args.gi as u32;
+                r.textures_enabled = !self.args.no_textures;
                 self.window = Some(window);
                 self.renderer = Some(r);
                 let now = Instant::now();
@@ -341,6 +346,7 @@ fn main() -> Result<()> {
         cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
         let mut renderer = Renderer::new(gfx, &cam, args.mods, args.time)?;
         renderer.gi_mode = args.gi as u32;
+        renderer.textures_enabled = !args.no_textures;
         renderer.screenshot(&path, &cam, args.mods, args.time)?;
         for name in &args.dump {
             renderer.dump_buffer(name)?;

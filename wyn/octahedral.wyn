@@ -1,0 +1,23 @@
+-- Unit-vector encoding on the [-1, 1]^2 octahedral domain.
+-- Based on JCGT 3(2), A Survey of Efficient Representations for Independent
+-- Unit Vectors, section 3.1: https://jcgt.org/published/0003/02/01/
+module octahedral = {
+  -- sign(0) must be +1, otherwise the -Z pole collapses onto +Z.
+  def sign_nonzero(v: vec2f32) vec2f32 =
+    @[if v.x >= 0.0 then 1.0 else -1.0, if v.y >= 0.0 then 1.0 else -1.0]
+
+  def fold(v: vec2f32) vec2f32 =
+    @[1.0 - f32.abs(v.y), 1.0 - f32.abs(v.x)] * sign_nonzero(v)
+
+  -- Input must be nonzero; unit length is not required. Store the result as RG16F.
+  def encode(n: vec3f32) vec2f32 =
+    let p = n.xy / (f32.abs(n.x) + f32.abs(n.y) + f32.abs(n.z)) in
+    if n.z < 0.0 then fold(p) else p
+
+  -- Decode only after interpolation of geometry, never interpolate packed normals.
+  -- G-buffer reads use target_load (point sampling); decoded normals are unit length.
+  def decode(p: vec2f32) vec3f32 =
+    let z = 1.0 - f32.abs(p.x) - f32.abs(p.y)
+    let xy = if z < 0.0 then fold(p) else p in
+    normalize(@[xy.x, xy.y, z])
+}

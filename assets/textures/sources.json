@@ -1,0 +1,150 @@
+{
+  "provider": "Poly Haven",
+  "license": "CC0-1.0",
+  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "provider_license_url": "https://polyhaven.com/license",
+  "downloaded_at_utc": "2026-09-22T21:18:37Z",
+  "assets": [
+    {
+      "id": "red_brick",
+      "author": "Rob Tuytel",
+      "source_url": "https://polyhaven.com/a/red_brick",
+      "intended_use": "brick face regions",
+      "source_width_m": 1.4,
+      "resolution": "2k",
+      "maps": {
+        "albedo": {
+          "path": "red_brick/red_brick_diff_2k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/red_brick/red_brick_diff_2k.png",
+          "color_space": "sRGB",
+          "width": 2048,
+          "height": 2048,
+          "bit_depth": 16,
+          "png_color_type": 2,
+          "size_bytes": 22217598,
+          "source_md5": "5ff6f18025bccf81596feb4f0359fab5",
+          "sha256": "4b814528cb900a65e2a2600254a06326d2966a6188b325283fdf74891e7e1f04"
+        },
+        "normal": {
+          "path": "red_brick/red_brick_nor_gl_2k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/red_brick/red_brick_nor_gl_2k.png",
+          "color_space": "linear",
+          "width": 2048,
+          "height": 2048,
+          "bit_depth": 8,
+          "png_color_type": 2,
+          "size_bytes": 8907641,
+          "source_md5": "4602a931ef31b2ab63f93543dce17289",
+          "sha256": "e3ca21654988c8ee348fff4a71ccd57fce35073d6898902f185c1f86799e9ae1",
+          "normal_convention": "OpenGL tangent space, +Y"
+        },
+        "roughness": {
+          "path": "red_brick/red_brick_rough_2k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/2k/red_brick/red_brick_rough_2k.png",
+          "color_space": "linear",
+          "width": 2048,
+          "height": 2048,
+          "bit_depth": 16,
+          "png_color_type": 0,
+          "size_bytes": 5487715,
+          "source_md5": "2a5a607763d30efdb33a966d5a9348a9",
+          "sha256": "388da5e4bf39ee608d0c642f1020101b51bb77f014e4b676695805b4dfd275bd"
+        }
+      }
+    },
+    {
+      "id": "rock_surface",
+      "author": "Amal Kumar",
+      "source_url": "https://polyhaven.com/a/rock_surface",
+      "intended_use": "cobble surface",
+      "source_width_m": 2.0,
+      "resolution": "1k",
+      "maps": {
+        "albedo": {
+          "path": "rock_surface/rock_surface_diff_1k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/rock_surface/rock_surface_diff_1k.png",
+          "color_space": "sRGB",
+          "width": 1024,
+          "height": 1024,
+          "bit_depth": 16,
+          "png_color_type": 2,
+          "size_bytes": 5690986,
+          "source_md5": "a2cbe1ea8c241ecba920239bd8a26498",
+          "sha256": "3581fe9abecdf2e2afc0b7d64a7af4f05b4dc01f3058ac02b90f39977466df5c"
+        },
+        "normal": {
+          "path": "rock_surface/rock_surface_nor_gl_1k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/rock_surface/rock_surface_nor_gl_1k.png",
+          "color_space": "linear",
+          "width": 1024,
+          "height": 1024,
+          "bit_depth": 16,
+          "png_color_type": 2,
+          "size_bytes": 5865641,
+          "source_md5": "13b443535b42f9b6809ecf211bfe4bf0",
+          "sha256": "a9e14af4267b6c512987575bd1120f5fba5d6b1a178e4e58d3bab44be8895ffa",
+          "normal_convention": "OpenGL tangent space, +Y"
+        },
+        "roughness": {
+          "path": "rock_surface/rock_surface_rough_1k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/rock_surface/rock_surface_rough_1k.png",
+          "color_space": "linear",
+          "width": 1024,
+          "height": 1024,
+          "bit_depth": 16,
+          "png_color_type": 0,
+          "size_bytes": 1861150,
+          "source_md5": "a788943087cf8fc1be659f5f20519bed",
+          "sha256": "01061a50b9f356580966f4d2c124c6c688bd11c27fd945be00e78c9712056e09"
+        }
+      }
+    },
+    {
+      "id": "rough_concrete",
+      "author": "Dimitrios Savva",
+      "source_url": "https://polyhaven.com/a/rough_concrete",
+      "intended_use": "mortar candidate",
+      "source_width_m": 1.2,
+      "resolution": "1k",
+      "maps": {
+        "albedo": {
+          "path": "rough_concrete/rough_concrete_diff_1k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/rough_concrete/rough_concrete_diff_1k.png",
+          "color_space": "sRGB",
+          "width": 1024,
+          "height": 1024,
+          "bit_depth": 16,
+          "png_color_type": 2,
+          "size_bytes": 5917410,
+          "source_md5": "74e2677b4694ed9ac270fb3e6efd21fc",
+          "sha256": "5d1fc425ae5fffdd8c4b8245394301c1fedbf19b26567c43619d2ba5a40d9aff"
+        },
+        "normal": {
+          "path": "rough_concrete/rough_concrete_nor_gl_1k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/rough_concrete/rough_concrete_nor_gl_1k.png",
+          "color_space": "linear",
+          "width": 1024,
+          "height": 1024,
+          "bit_depth": 16,
+          "png_color_type": 2,
+          "size_bytes": 6069295,
+          "source_md5": "f4cd1b868a1cc1ea89b4174e78e5de11",
+          "sha256": "36f547dc69d3cf9ea076b68e59fe6fe5af2b6281196ec913a54fcd9822fef3cf",
+          "normal_convention": "OpenGL tangent space, +Y"
+        },
+        "roughness": {
+          "path": "rough_concrete/rough_concrete_rough_1k.png",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/rough_concrete/rough_concrete_rough_1k.png",
+          "color_space": "linear",
+          "width": 1024,
+          "height": 1024,
+          "bit_depth": 16,
+          "png_color_type": 2,
+          "size_bytes": 2463653,
+          "source_md5": "01948ac6f99840acf5304518b7e99621",
+          "sha256": "6bafcc1ca5646fe0b1f9da8099a835e157687bd65a50dda125d83e1c8ec7789b"
+        }
+      }
+    }
+  ]
+}

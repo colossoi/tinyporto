@@ -109,6 +109,7 @@ type prop = {
   up: vec3f32,
   fwd: vec3f32,
   albedo: vec3f32,
+  material: u32,      -- material.STONE/BRICK/MORTAR/LIMESTONE
 }
 
 -- Stable world centre shared by the visibility predicate and live-prop builder.
@@ -156,4 +157,4 @@ def sett_prop(i: i32) prop =
   let sat = 0.7 + 0.8 * brick_hash(seed + 29)
   let albedo = mix(v3(g), hued, sat) * v3(0.5 + 0.9 * sett_var(center.x, center.y)) in
   { center = @[center.x, height * 0.5, center.y], radius = radius, half = half,
-    right = right, up = up, fwd = fwd, albedo = albedo }
+    right = right, up = up, fwd = fwd, albedo = albedo, material = 0u32 }

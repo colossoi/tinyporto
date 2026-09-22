@@ -83,7 +83,7 @@ module gi = {
     if g.albedo.w < 0.5 then empty
     else
       let p = screen_trace.position(scene, resolution, camera, pixel)
-      let n = normalize(g.normal.xyz)
+      let n = octahedral.decode(g.normal)
       let visibility = ao[pixel.y * i32(resolution.x) + pixel.x].x in
       { light = zero, position = @[p.x, p.y, p.z, 1.0],
         normal = @[n.x, n.y, n.z, (g.albedo.x + g.albedo.y + g.albedo.z) / 3.0],

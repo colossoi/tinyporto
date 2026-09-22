@@ -64,5 +64,6 @@ module screen_trace = {
       let (pixel, _visible) = project_pixel(p, resolution, camera)
       let xy = @[i32(pixel.x), i32(pixel.y)]
       let g = target_load(scene, xy, 0u32) in
-      (xy, valid && penetration < options.thickness && g.albedo.w > 0.5 && dot(g.normal.xyz, rd) < -0.01)
+      (xy, valid && penetration < options.thickness && g.albedo.w > 0.5
+             && dot(octahedral.decode(g.normal), rd) < -0.01)
 }

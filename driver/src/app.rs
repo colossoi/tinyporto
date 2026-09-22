@@ -1,7 +1,7 @@
 //! Application inputs, retained frame results, and caller-owned render targets.
 //! All shader loading, pipeline creation, dispatches, and draws belong to Wyn.
 
-use crate::{camera::Camera, generated, gfx::Gfx};
+use crate::{camera::Camera, generated, gfx::Gfx, materials::Materials};
 use anyhow::{bail, Context, Result};
 use generated::output::{OutputDescriptor, OutputResource};
 use std::time::Instant;
@@ -80,6 +80,7 @@ struct FrameHistory {
     frame_index: u32,
     valid: u32,
     gi_mode: u32,
+    textures_enabled: u32,
 }
 
 fn storage(device: &wgpu::Device, name: &str, bytes: u64) -> wgpu::Buffer {
@@ -140,6 +141,10 @@ fn frame_bytes(
         ("frame_index", bytemuck::bytes_of(&history.frame_index)),
         ("history_valid", bytemuck::bytes_of(&history.valid)),
         ("gi_mode", bytemuck::bytes_of(&history.gi_mode)),
+        (
+            "textures_enabled",
+            bytemuck::bytes_of(&history.textures_enabled),
+        ),
     ] {
         let (_, _, offset, size) = fields
             .iter()
@@ -181,14 +186,15 @@ impl Targets {
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
         };
         Self {
             sun: image("sun", wgpu::TextureFormat::R32Float),
             albedo: image("scene albedo", wgpu::TextureFormat::Rgba8Unorm),
-            normal: image("scene normal", wgpu::TextureFormat::Rgba32Float),
+            normal: image("scene octahedral normal", wgpu::TextureFormat::Rg16Float),
             depth: image("scene window depth", wgpu::TextureFormat::R32Float),
             shadow_z: image("shadow depth attachment", wgpu::TextureFormat::Depth32Float),
             scene_z: image("scene depth attachment", wgpu::TextureFormat::Depth32Float),
@@ -257,16 +263,19 @@ pub struct Renderer {
     pub gfx: Gfx,
     pub frame: u32,
     pub gi_mode: u32,
+    pub textures_enabled: bool,
     // Retain Wyn's pipelines and scratch buffers across frames and resizes.
     host: generated::HostContext,
     world: World,
     targets: Targets,
+    materials: Materials,
     events: wgpu::Buffer,
     globals: wgpu::Buffer,
     start: Instant,
     previous_camera: Camera,
     gi_reset_frames: u32,
     paint_held: bool,
+    previous_textures_enabled: bool,
 }
 
 impl Renderer {
@@ -283,6 +292,7 @@ impl Renderer {
                 frame_index: 0,
                 valid: 0,
                 gi_mode: 0,
+                textures_enabled: 1,
             },
         )?;
         let globals = gfx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -298,15 +308,18 @@ impl Renderer {
             host: generated::HostContext::new(&gfx.device).context("initialize Wyn host")?,
             world: World::new(&gfx.device, w, h),
             targets: Targets::new(&gfx.device, w, h),
+            materials: Materials::new(&gfx.device, &gfx.queue).context("load surface textures")?,
             events: storage(&gfx.device, "events", EV_CAP as u64 * 16),
             gfx,
             globals,
             frame: 0,
             gi_mode: 0,
+            textures_enabled: true,
             start: Instant::now(),
             previous_camera: *cam,
             gi_reset_frames: 1,
             paint_held: false,
+            previous_textures_enabled: true,
         })
     }
 
@@ -362,6 +375,9 @@ impl Renderer {
         mods: u32,
         time: f32,
     ) -> Result<()> {
+        if self.textures_enabled != self.previous_textures_enabled {
+            self.gi_reset_frames = 1;
+        }
         let history_bytes = gi_bytes(
             self.gfx.config.width,
             self.gfx.config.height,
@@ -382,6 +398,7 @@ impl Renderer {
                 frame_index: self.frame,
                 valid: u32::from(self.gi_reset_frames == 0),
                 gi_mode: self.gi_mode,
+                textures_enabled: u32::from(self.textures_enabled),
             },
         )?;
         self.gfx.queue.write_buffer(&self.globals, 0, &bytes);
@@ -403,6 +420,13 @@ impl Renderer {
             &self.world.items,
             &self.world.occ,
             &self.world.gi,
+            &self.materials.brick.color,
+            &self.materials.brick.normal,
+            &self.materials.stone.color,
+            &self.materials.stone.normal,
+            &self.materials.mortar.color,
+            &self.materials.mortar.normal,
+            &self.materials.sampler,
             &self.targets.albedo,
             &self.targets.normal,
             &self.targets.depth,
@@ -423,6 +447,7 @@ impl Renderer {
         self.targets.next_occ = previous.occ;
         self.frame = self.frame.wrapping_add(1);
         self.previous_camera = *cam;
+        self.previous_textures_enabled = self.textures_enabled;
         self.gi_reset_frames = self.gi_reset_frames.saturating_sub(1);
         Ok(())
     }
@@ -717,6 +742,119 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    fn image_bytes(gfx: &Gfx, texture: &wgpu::Texture) -> Vec<u8> {
+        let stride = (texture.width() * 4).div_ceil(256) * 256;
+        let buffer = gfx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test image readback"),
+            size: u64::from(stride) * u64::from(texture.height()),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gfx.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(texture.height()),
+                },
+            },
+            texture.size(),
+        );
+        gfx.queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
+        });
+        gfx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        let mapped = slice.get_mapped_range();
+        let result = mapped
+            .chunks_exact(stride as usize)
+            .flat_map(|row| row[..texture.width() as usize * 4].iter().copied())
+            .collect();
+        drop(mapped);
+        buffer.unmap();
+        result
+    }
+
+    #[test]
+    fn textures_change_materials_preserve_geometry_and_reset_gi() {
+        let gfx = Gfx::new_headless(160, 120).expect("GPU device");
+        let mut cam = Camera::default();
+        cam.set([0.0, 0.0, 0.0], 0.6, -0.7, 18.0);
+        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let target = offscreen(&renderer.gfx);
+        renderer.textures_enabled = false;
+        for _ in 0..3 {
+            renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        }
+        let color = image_bytes(&renderer.gfx, &renderer.targets.albedo);
+        let normal = image_bytes(&renderer.gfx, &renderer.targets.normal);
+        let depth = image_bytes(&renderer.gfx, &renderer.targets.depth);
+        renderer.textures_enabled = true;
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        let textured = image_bytes(&renderer.gfx, &renderer.targets.albedo);
+        let normals = image_bytes(&renderer.gfx, &renderer.targets.normal);
+        assert_eq!(
+            depth,
+            image_bytes(&renderer.gfx, &renderer.targets.depth),
+            "material maps must not move surfaces"
+        );
+        assert!(
+            color
+                .chunks_exact(4)
+                .zip(textured.chunks_exact(4))
+                .filter(|(a, b)| a[..3] != b[..3])
+                .count()
+                > 1000,
+            "albedo maps must affect visible surfaces"
+        );
+        assert!(
+            normal
+                .chunks_exact(4)
+                .zip(normals.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+                > 1000,
+            "normal maps must reach the G-buffer"
+        );
+        assert!(
+            textured
+                .chunks_exact(4)
+                .filter(|p| (185..254).contains(&p[3]))
+                .count()
+                > 100,
+            "roughness must be packed into surface alpha"
+        );
+        assert!(textured.chunks_exact(4).all(|p| p[3] == 0 || p[3] >= 185));
+        assert!(
+            gi_samples(&renderer).iter().all(|p| p[3] <= 1.0),
+            "material changes must invalidate lighting history"
+        );
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        assert_eq!(
+            textured,
+            image_bytes(&renderer.gfx, &renderer.targets.albedo),
+            "texture mapping must be stable across frames"
+        );
+        renderer.textures_enabled = false;
+        renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        assert_eq!(color, image_bytes(&renderer.gfx, &renderer.targets.albedo));
+        assert_eq!(normal, image_bytes(&renderer.gfx, &renderer.targets.normal));
+        assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
     }
 
     #[test]

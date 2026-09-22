@@ -37,18 +37,38 @@ def tonemap_aces(x: vec3f32) vec3f32 =
 -- (shadow-attenuated), tonemapped to an opaque colour. `ao` is the occlusion amount
 -- (1 = fully occluded); `shc`/`shm_frac` are the contact-march and sun-shadow-map
 -- occlusion, combined by `max` (either one blocks the sun).
-def shade_surface(albedo: vec3f32, n: vec3f32, ao: f32, shc: f32, shm_frac: f32) vec4f32 =
+-- Dielectric GGX sunlight, with Schlick Fresnel and Smith masking. GI remains
+-- diffuse: do not feed this view-dependent highlight back into its radiance.
+def sun_specular(n: vec3f32, view: vec3f32, roughness: f32) vec3f32 =
+  let nl = clamp01(dot(n, sun))
+  let nv = f32.max(0.001, clamp01(dot(n, view)))
+  let h = normalize(sun + view)
+  let nh = clamp01(dot(n, h))
+  let vh = clamp01(dot(view, h))
+  let a = f32.max(0.04, roughness * roughness)
+  let a2 = a * a
+  let denom = nh * nh * (a2 - 1.0) + 1.0
+  let distribution = a2 / (f32.pi * denom * denom)
+  let visibility = 0.5 / f32.max(0.001,
+    nl * f32.sqrt(nv * nv * (1.0 - a2) + a2)
+      + nv * f32.sqrt(nl * nl * (1.0 - a2) + a2))
+  let fresnel = 0.04 + 0.96 * f32.pow(1.0 - vh, 5.0) in
+  SUN_COLOR * (distribution * visibility * fresnel * nl)
+
+def shade_surface(albedo: vec3f32, n: vec3f32, ao: f32, shc: f32, shm_frac: f32,
+                   specular: vec3f32) vec4f32 =
   let sh = f32.max(shc, shm_frac)
-  let col = lit_ao_sh(albedo, n, ao, sh)
+  let col = lit_ao_sh(albedo, n, ao, sh) + specular * (1.0 - clamp01(sh))
   let m = tonemap_aces(col) in
   @[m.x, m.y, m.z, 1.0]
 
 -- GI supplies the indirect illumination: no constant ambient or artificial sun
 -- floor in this path. GTAO adds only the fine detail absent from the trace proxies.
 def shade_surface_gi(albedo: vec3f32, n: vec3f32, ao: f32, shadow: f32,
-                      indirect: vec3f32, indirect_only: bool) vec4f32 =
+                      indirect: vec3f32, indirect_only: bool, specular: vec3f32) vec4f32 =
   let direct = if indirect_only then v3(0.0)
                else SUN_COLOR * (clamp01(dot(n, sun)) * (1.0 - clamp01(shadow)))
   let light = albedo * (direct + indirect * (1.0 - 0.2 * clamp01(ao)))
+                + (if indirect_only then v3(0.0) else specular * (1.0 - clamp01(shadow)))
   let mapped = tonemap_aces(light) in
   @[mapped.x, mapped.y, mapped.z, 1.0]

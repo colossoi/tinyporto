@@ -8,7 +8,7 @@
 --
 -- Ground ribbons and rounded-box props fill a shared G-buffer. Deferred lighting
 -- combines that surface data with sunlight, ambient occlusion, and sky.
--- Sett placement and materials live in bricks.wyn; curve math comes from wyn/curves.
+-- Sett placement lives in bricks.wyn; surface textures in material.wyn.
 --
 -- Idiom: root does `open f32`; library modules pulled in via bare `import`.
 
@@ -27,6 +27,7 @@ import "hiz"
 import "gi"
 import "ray"
 import "render_types"
+import "material"
 import "pkg:gfx"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
@@ -54,6 +55,7 @@ type frame_globals = {
   frame_index: u32,
   history_valid: u32,
   gi_mode: u32,       -- 0 = GI, 1 = original ambient, 2 = indirect, 3 = reference
+  textures_enabled: u32,
 }
 
 -- The orbit camera the host drives, unpacked from the frame block. Built locally
@@ -156,7 +158,7 @@ def wall_visible(frame: frame_globals, wall_brick_index: i32) bool =
 
 -- One surviving wall block. Blocks carry their own half-extents and a yaw; a tiny
 -- corner radius keeps the edges crisp. `kind` (0 brick, 1 quoin, 2 grout) selects
--- colour here and is not carried into the draw stream.
+-- colour and surface material carried into the draw stream.
 def wall_prop(wall_brick_index: i32) prop =
   let brk = wall_brick(wall_brick_index)
   let center = brk.center
@@ -171,7 +173,9 @@ def wall_prop(wall_brick_index: i32) prop =
                else mix(BRICK_BASE, BRICK_BASE2, hue) * v3(0.80 + 0.40 * cv)
   in
   { center = center, radius = 0.004, half = brk.half,
-    right = right, up = up, fwd = fwd, albedo = albedo }
+    right = right, up = up, fwd = fwd, albedo = albedo,
+    material = if brk.kind == 2u32 then material.MORTAR
+               else if brk.kind == 1u32 then material.LIMESTONE else material.BRICK }
 
 -- Filter original candidate indices before constructing their full prop records.
 def prop_index_visible(frame: frame_globals,
@@ -216,7 +220,7 @@ def occ_reduce_tile(scene: render_target<gbuffer>, resolution: vec3f32,
 -- write a thin G-buffer (albedo, world normal,
 -- window depth) as MRT targets, and a fullscreen `resolve_fragment` reads it back
 -- and does the lighting + tonemap once, over the whole image. This unifies shading
--- and is where AO / contact shadows belong. g_albedo.w is a valid mask (0 = sky).
+-- and is where AO / contact shadows belong. g_albedo.w packs roughness (0 = sky).
 ------------------------------------------------------------
 
 -- Project tessellated ground vertices and write their surface data to the G-buffer.
@@ -254,7 +258,7 @@ def scene_fragment(value: scene_varying, position: vec4f32,
   let edge = smoothstep(0.78, 1.0, f32.abs(attr))
   let surf = mix(base, OUTLINE_COLOR, edge * 0.5) in
   { albedo = @[surf.x, surf.y, surf.z, 1.0],
-    normal = @[nrm.x, nrm.y, nrm.z, 1.0],
+    normal = octahedral.encode(nrm),
     depth = position.z }
 
 ------------------------------------------------------------
@@ -296,7 +300,7 @@ def prop_vertex(frame: frame_globals, prop_instances: []prop,
 -- Sphere-trace this instance's rounded box from the proxy's front face. On a hit,
 -- shade from the SDF normal and write the hit's true depth; on a miss (the ray
 -- grazes a rounded-off corner) discard the fragment to carve the silhouette.
-def prop_fragment(frame: frame_globals, prop_instances: []prop,
+def prop_fragment(frame: frame_globals, maps: material.textures, prop_instances: []prop,
                   value: prop_varying) fragment_output<gbuffer> =
   let world = value.world
   let p = prop_instances[i32(value.instance)]
@@ -307,13 +311,20 @@ def prop_fragment(frame: frame_globals, prop_instances: []prop,
   let (t, nl, hit) = ray.rounded_box(ro_local, rd_local, p.half, p.radius, 24, 0.0004)
   let pos = world + rd * t in
   if hit then
-    let n = gfx.transform.orient(nl, p.right, p.up, p.fwd)
+    let local = ro_local + rd_local * t
+    let seed = i32(p.center.x * 53.0 + p.center.z * 131.0 + p.center.y * 311.0 + 10000.0)
+    let footprint = 2.0 * f32.tan(f32.radians(10.0)) * distance(pos, cam_eye(camera_from_frame(frame)))
+                    / (frame.resolution.y * f32.max(0.15, f32.abs(dot(nl, rd_local))))
+    let surface = if frame.textures_enabled != 0u32 then
+                    material.evaluate(maps, p.material, seed, local, p.half, nl, p.albedo, footprint)
+                  else { albedo = p.albedo, normal = nl, roughness = 1.0 }
+    let n = gfx.transform.orient(surface.normal, p.right, p.up, p.fwd)
     let clip = world_to_clip(pos, frame.resolution, camera_from_frame(frame))
     let d = clip.z / clip.w in
-    -- G-buffer: albedo @0 (valid mask a=1), world normal @1, depth @2 + frag_depth.
+    -- G-buffer: albedo/roughness @0, world normal @1, depth @2 + frag_depth.
     #depth(
-      { albedo = @[p.albedo.x, p.albedo.y, p.albedo.z, 1.0],
-        normal = @[n.x, n.y, n.z, 1.0],
+      { albedo = @[surface.albedo.x, surface.albedo.y, surface.albedo.z, 0.5 + 0.5 * surface.roughness],
+        normal = octahedral.encode(n),
         depth = d },
       d)
   else
@@ -483,23 +494,24 @@ def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
   let fragc = @[f32(pixel_x) + 0.5, ry - (f32(pixel_y) + 0.5)] in    -- pixel centre, bottom-up
   if alb.w < 0.5 then shade_sky(resl, fragc, o)
   else
-    let gnv = g.normal
-    let n = normalize(@[gnv.x, gnv.y, gnv.z])
+    let n = octahedral.decode(g.normal)
     let cd = g.depth
     let pg = world_from_depth(resl, fragc, o, cd)
     let base = @[alb.x, alb.y, alb.z]
+    let specular = if frame.textures_enabled == 0u32 then v3(0.0)
+                   else sun_specular(n, normalize(cam_eye(o) - pg), clamp01(alb.w * 2.0 - 1.0))
     let ao = if ao_off then 0.0
              else let (aov, _e) = denoise_ao(@[pixel_x, pixel_y], occlusion_samples, gtao_consts(resl)) in 1.0 - aov
     let p = pg + n * SH_LIFT
     let shc = contact_shadow(scene, p, n, resl, o)
     let shm_frac = sun_shadow_pcf(sun_depth, p, rx, ry) in
     if frame.gi_mode == 1u32 || (frame.mods & 4u32) != 0u32 then
-      shade_surface(base, n, ao, shc, shm_frac)
+      shade_surface(base, n, ao, shc, shm_frac, specular)
     else
       let bounce = gi.resolve(indirect, resl, o, @[pixel_x, pixel_y], pg, n,
                               1.0 - ao, frame.gi_mode == 3u32) in
       shade_surface_gi(base, n, if frame.gi_mode == 3u32 then 0.0 else ao,
-                        f32.max(shc, shm_frac), bounce, frame.gi_mode == 2u32)
+                        f32.max(shc, shm_frac), bounce, frame.gi_mode == 2u32, specular)
 
 ------------------------------------------------------------
 -- Deferred resolve. One fullscreen triangle covers every pixel and its fragment
@@ -567,6 +579,10 @@ entry tinyporto_frame(
     head_in: []f32,
     occ_in: []f32,
     gi_in: []gi.sample,
+    brick_color: texture2d, brick_normal: texture2d,
+    stone_color: texture2d, stone_normal: texture2d,
+    mortar_color: texture2d, mortar_normal: texture2d,
+    material_sampler: sampler,
     events: []vec4f32,
     frame: frame_globals,
     sun: render_target<f32>,
@@ -577,6 +593,10 @@ entry tinyporto_frame(
      render_target<f32>, render_target<gbuffer>, render_target<vec4f32>) =
   let next_world = update_world(frame, events, { ui = uistate_in, points = points_in, items = items_in, head = head_in })
   let visible = cull_props(frame, occ_in)
+  let maps = { brick_color = brick_color, brick_normal = brick_normal,
+               stone_color = stone_color, stone_normal = stone_normal,
+               mortar_color = mortar_color, mortar_normal = mortar_normal,
+               filtering = material_sampler }
 
   -- Render sunlight visibility from all walls, independently of the camera.
   let shadow_fragments = rasterize_triangles(
@@ -592,7 +612,7 @@ entry tinyporto_frame(
     indirect_draw(visible.draw), prop_vertex(frame, visible.prop_inst, _, _, _))
   let scene_image = shade_with(
     opaque_depth, ground_image, prop_triangles,
-    |value, _, _, _, _| prop_fragment(frame, visible.prop_inst, value))
+    |value, _, _, _, _| prop_fragment(frame, maps, visible.prop_inst, value))
 
   -- Estimate ambient occlusion and save coarse depth for the next frame.
   let (ambient_occlusion, next_occlusion) = build_postprocess(scene_image, frame.resolution)
