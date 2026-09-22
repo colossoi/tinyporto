@@ -116,7 +116,7 @@ impl Camera {
     }
 
     /// World ray for a top-left cursor pixel, using the visible camera.
-    fn cursor_ray(&self, sw: f32, sh: f32, mx: f32, my: f32) -> (V3, V3) {
+    pub(crate) fn cursor_ray(&self, sw: f32, sh: f32, mx: f32, my: f32) -> (V3, V3) {
         let py = sh - my; // flip to bottom-up like the shader
         let r = rotation(self.elev, self.az);
         let rd = norm(mul(&r, ray_dir(sw, sh, mx, py)));

@@ -3,6 +3,7 @@ mod app;
 mod camera;
 mod gfx;
 mod materials;
+mod terrain;
 include!(concat!(env!("OUT_DIR"), "/module.rs"));
 
 use anyhow::Result;

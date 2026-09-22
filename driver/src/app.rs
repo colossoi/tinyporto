@@ -1,7 +1,7 @@
 //! Application inputs, retained frame results, and caller-owned render targets.
 //! All shader loading, pipeline creation, dispatches, and draws belong to Wyn.
 
-use crate::{camera::Camera, generated, gfx::Gfx, materials::Materials};
+use crate::{camera::Camera, generated, gfx::Gfx, materials::Materials, terrain};
 use anyhow::{bail, Context, Result};
 use generated::output::{OutputDescriptor, OutputResource};
 use std::time::Instant;
@@ -269,6 +269,7 @@ pub struct Renderer {
     world: World,
     targets: Targets,
     materials: Materials,
+    terrain: wgpu::Buffer,
     events: wgpu::Buffer,
     globals: wgpu::Buffer,
     start: Instant,
@@ -304,11 +305,16 @@ impl Renderer {
             mapped_at_creation: false,
         });
         gfx.queue.write_buffer(&globals, 0, &bytes);
+        let cells = terrain::demo();
+        let terrain = storage(&gfx.device, "terrain cells", (cells.len() * 16) as u64);
+        gfx.queue
+            .write_buffer(&terrain, 0, bytemuck::cast_slice(&cells));
         Ok(Self {
             host: generated::HostContext::new(&gfx.device).context("initialize Wyn host")?,
             world: World::new(&gfx.device, w, h),
             targets: Targets::new(&gfx.device, w, h),
             materials: Materials::new(&gfx.device, &gfx.queue).context("load surface textures")?,
+            terrain,
             events: storage(&gfx.device, "events", EV_CAP as u64 * 16),
             gfx,
             globals,
@@ -420,6 +426,7 @@ impl Renderer {
             &self.world.items,
             &self.world.occ,
             &self.world.gi,
+            &self.terrain,
             &self.materials.brick.color,
             &self.materials.brick.normal,
             &self.materials.stone.color,
@@ -481,13 +488,14 @@ impl Renderer {
             "events" => Some(&self.events),
             "frame" => Some(&self.globals),
             "ao_work" => Some(&self.targets.ao),
+            "terrain" => Some(&self.terrain),
             _ => None,
         })
     }
 
     pub fn dump_buffer(&self, name: &str) -> Result<()> {
         let buffer = self.buffer(name).with_context(|| format!(
-            "no exposed buffer '{name}'; available: uistate, points, items, head, occ, gi, events, frame, ao_work"
+            "no exposed buffer '{name}'; available: uistate, points, items, head, occ, gi, events, frame, terrain, ao_work"
         ))?;
         let bytes = read_buffer(&self.gfx, buffer)?;
         let words: Vec<_> = bytes
@@ -655,7 +663,7 @@ mod tests {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: gfx.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         })
     }
@@ -863,6 +871,13 @@ mod tests {
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], 0.6, -1.1, 25.0);
         let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        // Preserve the original flat-ground lighting fixture. Canal geometry has
+        // its own coverage below, including the exposed bed and raised coping.
+        renderer.gfx.queue.write_buffer(
+            &renderer.terrain,
+            0,
+            bytemuck::cast_slice(&vec![terrain::LAND; terrain::SIDE * terrain::SIDE]),
+        );
         let target = offscreen(&renderer.gfx);
         renderer.execute(&target, &cam, 0, 0.0).unwrap();
         let first_buffer = renderer.world.gi.clone();
@@ -1015,5 +1030,91 @@ mod tests {
         renderer.upload_events(&[]);
         renderer.execute(&resized, &cam, 0, 0.0).unwrap();
         assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
+    }
+
+    #[test]
+    fn canal_has_real_bed_and_ashlar_and_water_only_animates_below_land() {
+        let gfx = Gfx::new_headless(160, 120).expect("GPU device");
+        let mut cam = Camera::default();
+        cam.set([0.0, 0.0, 0.0], 0.0, -1.35, 22.0);
+        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        renderer.gi_mode = 1;
+        let target = offscreen(&renderer.gfx);
+        for _ in 0..3 {
+            renderer.execute(&target, &cam, 0, 0.0).unwrap();
+        }
+        let depth = image_bytes(&renderer.gfx, &renderer.targets.depth);
+        let before = image_bytes(&renderer.gfx, &target);
+        let eye = cam.eye();
+        let mut forward = std::array::from_fn::<_, 3, _>(|i| cam.target[i] - eye[i]);
+        let length = forward.iter().map(|x| x * x).sum::<f32>().sqrt();
+        forward.iter_mut().for_each(|x| *x /= length);
+        let positions: Vec<[f32; 3]> = depth
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(i, bytes)| {
+                let d = f32::from_le_bytes(bytes.try_into().unwrap());
+                let view_depth = 1000.0 * 0.1 / (1000.0 - d * (1000.0 - 0.1));
+                let (origin, direction) =
+                    cam.cursor_ray(160.0, 120.0, (i % 160) as f32 + 0.5, (i / 160) as f32 + 0.5);
+                let cosine = direction
+                    .iter()
+                    .zip(forward)
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>();
+                std::array::from_fn(|axis| origin[axis] + direction[axis] * view_depth / cosine)
+            })
+            .collect();
+        let bed = positions
+            .iter()
+            .filter(|p| (p[1] + 1.8).abs() < 0.02)
+            .count();
+        let coping = positions
+            .iter()
+            .filter(|p| (p[1] - 0.11).abs() < 0.012)
+            .count();
+        assert!(
+            bed > 500,
+            "the canal must expose actual geometry below water: {bed}"
+        );
+        assert!(
+            coping > 150,
+            "broad ashlar caps must have their own raised depth: {coping}"
+        );
+        for p in &positions {
+            let channel_distance = ((p[0] - 0.12 * p[2]) / 1.0f32.hypot(0.12)).abs();
+            if channel_distance < 0.7 && p[2].abs() < 3.0 {
+                assert!(
+                    p[1] < -0.65,
+                    "ground or cobbles float over the canal: {p:?}"
+                );
+            }
+        }
+        renderer.execute(&target, &cam, 0, 2.0).unwrap();
+        assert_eq!(
+            depth,
+            image_bytes(&renderer.gfx, &renderer.targets.depth),
+            "water waves must preserve opaque bed/bank depth"
+        );
+        let after = image_bytes(&renderer.gfx, &target);
+        let mut water_changes = 0;
+        for (i, (a, b)) in before
+            .chunks_exact(4)
+            .zip(after.chunks_exact(4))
+            .enumerate()
+        {
+            if a != b {
+                assert!(
+                    positions[i][1] < -0.59,
+                    "animated water covered an above-water surface: {:?}",
+                    positions[i]
+                );
+                water_changes += 1;
+            }
+        }
+        assert!(
+            water_changes > 100,
+            "the visible water surface must animate"
+        );
     }
 }

@@ -7,8 +7,10 @@ separates an explicit path-traced reference from its shipping final-gather GI.
 
 ## Pipeline
 
-1. Build a software BVH from the existing wall footprints. Ground is intersected
-   analytically. These are secondary-ray proxies for the rendered scene; they do
+1. Build a software BVH from the existing wall footprints. Land and the canal bed
+   are intersected analytically using the terrain cells; a grid walk intersects
+   bank faces, and raised coping has a separate surface test. These are
+   secondary-ray proxies for the rendered scene; they do
    not create or alter visible geometry. They remain available off screen.
 2. Produce current linear screen radiance from current materials and shadowed
    sunlight, plus reprojected previous indirect lighting. This is the feedback
@@ -60,7 +62,7 @@ compiler without repeatedly prefixing definitions inside each namespace.
 | `camera.wyn` | Camera rays, projection and depth reconstruction |
 
 The primary prop renderer shares `ray.rounded_box`; ground picking, scene
-tracing and the retained water shader share `ray.plane_y`. Rounded-box tracing
+tracing and the water surface share `ray.plane_y`. Rounded-box tracing
 keeps its exterior-only distance contract and caller-supplied step budget.
 Contact shadows retain their existing march and acceptance rules in
 `shadow.wyn`; consolidating them with the screen tracer would change behavior.
@@ -117,7 +119,8 @@ frame renders the previous world state.
 The remaining differences from Tiny Glade are explicit:
 
 - Its wide collision-mesh BVH is represented here by a binary BVH over the
-  current axis-aligned wall generators and a ground plane. Individual bricks
+  current axis-aligned wall generators, plus separate cell-terrain intersections.
+  Individual bricks
   come from screen-space visibility. No collision meshes, roofs, or dynamic
   3D building generator exist in this scene yet.
 - An off-screen proxy hit gets its material and direct sun; indirect feedback

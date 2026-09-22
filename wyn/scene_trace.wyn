@@ -7,6 +7,7 @@ import "render_types"
 import "paint"
 import "ray"
 import "screen_trace"
+import "terrain"
 
 module scene_trace = {
 
@@ -58,16 +59,11 @@ module scene_trace = {
       else if node == 0 then (NODE_COUNT, true)
       else if node % 2 == 1 then (node + 1, true)
       else ((node - 1) / 2, false) in next
-  def world(nodes: []node, ro: vec3f32, rd: vec3f32) hit =
-    let gt = if rd.y < -0.000001 then ray.plane_y(ro, rd, 0.0) else FAR
-    let gp = ro + rd * gt
-    let ground_valid = gt > 0.002 && gt < FAR
-                       && f32.abs(gp.x) < GROUND_HALF && f32.abs(gp.z) < GROUND_HALF
-    let ground_albedo = if dot(gp.xz, gp.xz) < 64.0
-                         then (COBBLE_WARM + COBBLE_COOL) * 0.35 else SAND_COLOR
+  def world(nodes: []node, cells: []vec4f32, ro: vec3f32, rd: vec3f32) hit =
+    let ground = terrain.trace(cells, ro, rd, FAR)
     let (_index, t, n, wall_hit) =
       loop (index, t, n, wall_hit) =
-        (0, if ground_valid then gt else FAR, @[0.0, 1.0, 0.0], false)
+        (0, ground.t, ground.normal, false)
       for _step < NODE_COUNT do
         if index >= length(nodes) then (index, t, n, wall_hit)
         else
@@ -83,9 +79,9 @@ module scene_trace = {
           else (next_node(index), t, n, wall_hit)
     in { t = t, normal = n,
          albedo = if wall_hit then mix((BRICK_BASE + BRICK_BASE2) * 0.5, GROUT_COLOR, 0.12)
-                  else ground_albedo }
+                   else ground.albedo }
 
-  def trace(scene: render_target<gbuffer>, nodes: []node, resolution: vec3f32,
+  def trace(scene: render_target<gbuffer>, nodes: []node, cells: []vec4f32, resolution: vec3f32,
             camera: orbit, ro: vec3f32, rd: vec3f32) intersection =
     let (xy, screen_hit) = screen_trace.trace(scene, resolution, camera, ro, rd, SCREEN) in
     if screen_hit then
@@ -93,7 +89,7 @@ module scene_trace = {
       { point = screen_trace.position(scene, resolution, camera, xy), normal = octahedral.decode(g.normal),
         albedo = g.albedo.xyz, pixel = xy, hit = true, screen = true }
     else
-      let hit = world(nodes, ro, rd)
+      let hit = world(nodes, cells, ro, rd)
       let p = ro + rd * hit.t
       let (pixel, visible) = project_pixel(p, resolution, camera)
       let px = @[clampi(i32(pixel.x), 0, i32(resolution.x) - 1),

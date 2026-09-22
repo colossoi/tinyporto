@@ -1,0 +1,112 @@
+-- A row-major grid of 1 m squares, each full land, full water, or one half-plane.
+-- Packed cell: (outward nx, outward nz, offset from cell centre, kind 0/1/2).
+-- Land lies at dot(normal, local_xz) <= offset. This is a geometric line, not
+-- a sampled distance field: a water stripe/two banks in one cell is impossible.
+import "math"
+import "ray"
+
+module terrain = {
+  def SIDE: i32 = 40
+  def CELL_SIZE: f32 = 1.0
+  def HALF: f32 = 20.0
+  def COUNT: i32 = SIDE * SIDE
+  def WATER_Y: f32 = -0.6
+  def BED_Y: f32 = -1.8
+  def CAP_TOP: f32 = 0.11
+  def STONE_COLOR: vec3f32 = @[0.59, 0.57, 0.50]
+  def BED_COLOR: vec3f32 = @[0.12, 0.13, 0.10]
+
+  def center(index: i32) vec2f32 =
+    (@[f32(index % SIDE), f32(index / SIDE)] + v2(0.5)) * CELL_SIZE - v2(HALF)
+
+  def in_bounds(p: vec2f32) bool = f32.abs(p.x) < HALF && f32.abs(p.y) < HALF
+
+  def cell_index(p: vec2f32) i32 =
+    let q = (p + v2(HALF)) / CELL_SIZE in
+    clampi(i32(f32.floor(q.y)), 0, SIDE - 1) * SIDE + clampi(i32(f32.floor(q.x)), 0, SIDE - 1)
+
+  def land(cells: []vec4f32, p: vec2f32) bool =
+    let i = cell_index(p)
+    let c = cells[i] in
+    in_bounds(p) && (c.w == 1.0 || (c.w == 2.0 && dot(c.xy, p - center(i)) <= c.z))
+
+  -- Intersect the infinite dividing line with its square. The tangent is chosen
+  -- so a prop's local +Z points into the land and local +Y points upward.
+  def segment(cells: []vec4f32, i: i32) (vec2f32, vec2f32, vec2f32, bool) =
+    let c = cells[i]
+    let tangent = @[0.0 - c.y, c.x]
+    let origin = c.xy * c.z
+    let h = CELL_SIZE * 0.5
+    let (ax, bx) = ray.slab(origin.x, tangent.x, 0.0 - h, h)
+    let (az, bz) = ray.slab(origin.y, tangent.y, 0.0 - h, h)
+    let lo = f32.max(ax, az)
+    let hi = f32.min(bx, bz)
+    let base = center(i) + origin in
+    (base + tangent * lo, base + tangent * hi, c.xy, c.w == 2.0 && hi - lo > 0.0001)
+
+  type hit = { t: f32, normal: vec3f32, albedo: vec3f32 }
+
+  -- The cap can project into neighbouring squares. Query those segments too,
+  -- so a vertical secondary ray sees the raised coping, including its overhang.
+  def cap_at(cells: []vec4f32, p: vec2f32) bool =
+    let i = cell_index(p) in
+    if !in_bounds(p) then false
+    else loop found = false for k < 9 do
+      let x = i % SIDE + k % 3 - 1
+      let z = i / SIDE + k / 3 - 1 in
+      if found || x < 0 || z < 0 || x >= SIDE || z >= SIDE then found
+      else
+        let ci = z * SIDE + x in
+        if cells[ci].w != 2.0 then false
+        else
+          let (a, b, n, valid) = segment(cells, ci)
+          let len = f32.max(distance(a, b), 0.0001)
+          let along = dot(p - a, (b - a) / len)
+          let outward = dot(p - a, n) in
+          valid && along >= 0.0 && along <= len && outward >= -0.43 && outward <= 0.19
+
+  -- Analytic land/bed plus a grid walk through bank planes. Secondary rays see
+  -- the same openings as primary visibility; no invisible y=0 canal ceiling.
+  -- Ashlar bevels and joints remain screen-space detail, like the wall bricks.
+  def trace(cells: []vec4f32, ro: vec3f32, rd: vec3f32, limit: f32) hit =
+    let tg = if rd.y < -0.000001 then ray.plane_y(ro, rd, 0.0) else limit
+    let pg = ro + rd * tg
+    let ground = tg > 0.002 && tg < limit && land(cells, pg.xz)
+    let tb = if rd.y < -0.000001 then ray.plane_y(ro, rd, BED_Y) else limit
+    let pb = ro + rd * tb
+    let bed = tb > 0.002 && tb < limit && in_bounds(pb.xz)
+    let surface_t = if ground then tg else if bed then tb else limit
+    let tc = if f32.abs(rd.y) > 0.000001 then
+               ray.plane_y(ro, rd, if rd.y < 0.0 then CAP_TOP else -0.06) else limit
+    let cap = tc > 0.002 && tc < surface_t && cap_at(cells, (ro + rd * tc).xz)
+    let initial = if cap then tc else surface_t
+    let initial_color = if cap then STONE_COLOR else if ground then
+        if dot(pg.xz, pg.xz) < 64.0 then @[0.3255, 0.3115, 0.308] else @[0.24, 0.16, 0.10]
+      else BED_COLOR
+    let (enter, leave, _normal) = ray.box(ro, rd,
+      @[0.0 - HALF, BED_Y, 0.0 - HALF], @[HALF, CAP_TOP, HALF], 0.002)
+    let finish = f32.min(leave, initial)
+    let initial_normal = @[0.0, if cap && rd.y > 0.0 then -1.0 else 1.0, 0.0]
+    let (t, normal, bank, _cursor, _steps) = loop (best, normal, bank, cursor, steps) =
+      (initial, initial_normal, false, f32.max(enter, 0.002) + 0.00001, 0)
+      while steps < SIDE * 2 + 2 && cursor <= finish && cursor < best do
+          let p = ro + rd * cursor
+          let i = cell_index(p.xz)
+          let c = cells[i]
+          let local = ro.xz - center(i)
+          let denom = dot(c.xy, rd.xz)
+          let wall_t = if f32.abs(denom) > 0.000001 then (c.z - dot(c.xy, local)) / denom else limit
+          let wall_p = ro + rd * wall_t
+          let in_cell = vec.abs(wall_p.xz - center(i))
+          let wall = c.w == 2.0 && wall_t >= cursor - 0.00002 && wall_t < best
+                     && in_cell.x <= 0.50001 && in_cell.y <= 0.50001
+                     && wall_p.y >= BED_Y && wall_p.y <= 0.0
+          let edge = center(i) + @[if rd.x >= 0.0 then 0.5 else -0.5,
+                                   if rd.z >= 0.0 then 0.5 else -0.5]
+          let tx = if f32.abs(rd.x) > 0.000001 then (edge.x - ro.x) / rd.x else limit
+          let tz = if f32.abs(rd.z) > 0.000001 then (edge.y - ro.z) / rd.z else limit in
+          (if wall then wall_t else best,
+           if wall then @[c.x, 0.0, c.y] else normal,
+           bank || wall, f32.min(tx, tz) + 0.00002, steps + 1)
+    in { t = t, normal = normal, albedo = if bank then STONE_COLOR else initial_color }
+}

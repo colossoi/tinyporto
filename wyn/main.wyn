@@ -28,6 +28,9 @@ import "gi"
 import "ray"
 import "render_types"
 import "material"
+import "terrain"
+import "banks"
+import "water"
 import "pkg:gfx"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
@@ -47,7 +50,7 @@ type frame_globals = {
   cam_az: f32,
   cam_elev: f32,
   cam_dist: f32,
-  time: f32,          -- seconds since start, reserved for animated effects
+  time: f32,          -- seconds since start, animates water normals
   previous_target: vec3f32,
   previous_az: f32,
   previous_elev: f32,
@@ -144,10 +147,10 @@ def update_world(frame: frame_globals, events: []vec4f32, previous_world: world)
 -- roundness, colour, or draw cost. Output 0 = prop_inst, output 1 = prop_args.
 ------------------------------------------------------------
 
--- The prop domain: the running-bond sett grid, then the wall-brick slots.
+-- The prop domain: cobble setts, building masonry, then bank ashlar and coping.
 def PROP_SETTS: i32 = BCOLS * BROWS
 def PROP_WALLS: i32 = BRICK_SLOTS + QUOIN_SLOTS + GROUT_SLOTS
-def PROP_SLOTS: i32 = PROP_SETTS + PROP_WALLS
+def PROP_SLOTS: i32 = PROP_SETTS + PROP_WALLS + banks.COUNT
 
 -- Wall visibility tests each live block against the camera frustum.
 def wall_visible(frame: frame_globals, wall_brick_index: i32) bool =
@@ -178,25 +181,32 @@ def wall_prop(wall_brick_index: i32) prop =
                else if brk.kind == 1u32 then material.LIMESTONE else material.BRICK }
 
 -- Filter original candidate indices before constructing their full prop records.
-def prop_index_visible(frame: frame_globals,
-                       occlusion_depth: []f32, candidate_index: i32) bool =
+def prop_index_visible(frame: frame_globals, cells: []vec4f32,
+                        occlusion_depth: []f32, candidate_index: i32) bool =
   if candidate_index < PROP_SETTS then
-    sett_visible(frame.resolution, camera_from_frame(frame), occlusion_depth, candidate_index)
-  else wall_visible(frame, candidate_index - PROP_SETTS)
+    terrain.land(cells, sett_center(candidate_index))
+      && sett_visible(frame.resolution, camera_from_frame(frame), occlusion_depth, candidate_index)
+  else if candidate_index < PROP_SETTS + PROP_WALLS then wall_visible(frame, candidate_index - PROP_SETTS)
+  else
+    let i = candidate_index - PROP_SETTS - PROP_WALLS in
+    if !banks.active(cells, i) then false
+    else let p = banks.stone(cells, i) in
+      frustum_keep(p.center, magnitude(p.half), frame.resolution, camera_from_frame(frame))
 
-def prop_from_index(candidate_index: i32) prop =
+def prop_from_index(cells: []vec4f32, candidate_index: i32) prop =
   if candidate_index < PROP_SETTS then sett_prop(candidate_index)
-  else wall_prop(candidate_index - PROP_SETTS)
+  else if candidate_index < PROP_SETTS + PROP_WALLS then wall_prop(candidate_index - PROP_SETTS)
+  else banks.stone(cells, candidate_index - PROP_SETTS - PROP_WALLS)
 
 def prop_draw(instance_count: i32) draw_command =
   { vertex_count = 36u32, instance_count = u32(instance_count),
     first_vertex = 0u32, first_instance = 0u32 }
 
-def cull_props(frame: frame_globals,
-               occlusion_depth: []f32) visibility =
+def cull_props(frame: frame_globals, cells: []vec4f32,
+                occlusion_depth: []f32) visibility =
   let live_indices =
-    filter(|i| prop_index_visible(frame, occlusion_depth, i), iota(PROP_SLOTS))
-  let live = map(prop_from_index, live_indices) in
+    filter(|i| prop_index_visible(frame, cells, occlusion_depth, i), iota(PROP_SLOTS))
+  let live = map(|i| prop_from_index(cells, i), live_indices) in
   { prop_inst = live, draw = prop_draw(length(live_indices)) }
 
 -- Minimum depth per coarse tile, saved for next frame's visibility tests.
@@ -224,7 +234,7 @@ def occ_reduce_tile(scene: render_target<gbuffer>, resolution: vec3f32,
 ------------------------------------------------------------
 
 -- Project tessellated ground vertices and write their surface data to the G-buffer.
-type scene_varying = { kind: f32, attr: f32, normal: vec3f32 }
+type scene_varying = { kind: f32, attr: f32, normal: vec3f32, world: vec3f32 }
 
 -- Derive the requested ground vertex directly from the previous painted state,
 -- then project it.  The tessellation domain has exactly one consumer with the
@@ -234,32 +244,33 @@ def scene_vertex(frame: frame_globals, painted_scene: painted,
                  _instance_index: u32, _draw_index: u32)
   vertex<scene_varying> =
   let vid = i32(vertex_index)
-  let v = ground_vertex_at(vid, painted_scene.items, painted_scene.points) in
+  let bed = vid >= TESS_CAP
+  let v = ground_vertex_at(if bed then vid - TESS_CAP else vid, painted_scene.items, painted_scene.points)
+  let p = if bed then @[v.pos.x, terrain.BED_Y, v.pos.z] else v.pos in
   vertex_output(
-    world_to_clip(v.pos, frame.resolution, camera_from_frame(frame)),
-    { kind = v.kind, attr = v.attr, normal = v.nrm })
+    world_to_clip(p, frame.resolution, camera_from_frame(frame)),
+    { kind = if bed then -1.0 else v.kind, attr = v.attr, normal = v.nrm, world = p })
 
 def item_color(kind: f32) vec3f32 =
   if kind < 0.5 then SAND_COLOR
   else if kind < 2.5 then WALL_COLOR
   else BUILDING_COLOR
 
--- Shade one ground fragment: material color from `kind`, a darker edging course
--- near a stroke boundary (|attr| -> 1), lit by the (up) normal, then tonemapped.
+-- Clip land/paint against the cell boundary and write unlit surface data.
 -- G-buffer write for the ground: albedo (material color + stroke edging, pre-light)
 -- @0, world normal @1, window depth @2 (also feeds the Hi-Z pyramid). No lighting.
-def scene_fragment(value: scene_varying, position: vec4f32,
-                   _front_facing: bool, _primitive_index: u32, _sample_index: u32) gbuffer =
+def scene_fragment(cells: []vec4f32, value: scene_varying, position: vec4f32,
+                    _front_facing: bool, _primitive_index: u32, _sample_index: u32) fragment_output<gbuffer> =
   let kind = value.kind
   let attr = value.attr
   let normal = value.normal
   let nrm = normalize(normal)
-  let base = item_color(kind)
+  let base = if kind < 0.0 then terrain.BED_COLOR else item_color(kind)
   let edge = smoothstep(0.78, 1.0, f32.abs(attr))
   let surf = mix(base, OUTLINE_COLOR, edge * 0.5) in
-  { albedo = @[surf.x, surf.y, surf.z, 1.0],
-    normal = octahedral.encode(nrm),
-    depth = position.z }
+  if kind >= 0.0 && !terrain.land(cells, value.world.xz) then #discard
+  else #depth({ albedo = @[surf.x, surf.y, surf.z, 1.0],
+                normal = octahedral.encode(nrm), depth = position.z }, position.z)
 
 ------------------------------------------------------------
 -- Props: instanced proxy boxes (Tiny-Glade "tons of tiny instances"). Cobble setts
@@ -341,24 +352,16 @@ def prop_fragment(frame: frame_globals, maps: material.textures, prop_instances:
 -- of camera visibility. Dead wall slots collapse to a degenerate vertex.
 ------------------------------------------------------------
 
-def brick_shadow_vertex(vertex_index: u32, instance_index: u32,
+def brick_shadow_vertex(cells: []vec4f32, vertex_index: u32, instance_index: u32,
                         _draw_index: u32) vertex<()> =
   let vid = i32(vertex_index)
   let iid = i32(instance_index)
-  let inst = wall_brick(iid) in
-  let position =
-    if inst.center.y <= 0.0 then @[2.0, 2.0, 2.0, 1.0]
-  else
-    let center = inst.center
-    let cw = f32.cos(inst.yaw)
-    let sw = f32.sin(inst.yaw)
-    let hf = inst.half
-    let local = box_pos[vid]
-    let lx = local.x * (hf.x * 2.0)
-    let ly = (local.y - 0.5) * (hf.y * 2.0)
-    let lz = local.z * (hf.z * 2.0)
-    let world = @[center.x + cw * lx - sw * lz, center.y + ly, center.z + sw * lx + cw * lz] in
-    world_to_light(world) in
+  let active = if iid < PROP_WALLS then wall_brick(iid).center.y > 0.0
+               else banks.active(cells, iid - PROP_WALLS)
+  let position = if active then
+    let p = if iid < PROP_WALLS then wall_prop(iid) else banks.stone(cells, iid - PROP_WALLS) in
+    world_to_light(prop_world(p, box_pos[vid]))
+    else @[2.0, 2.0, 2.0, 1.0] in
   vertex_output(position, ())
 
 -- Depth-only caster shade: store this fragment's light-space depth in the scalar
@@ -531,8 +534,20 @@ def resolve_fragment(inputs: lighting_inputs, frame: frame_globals,
                      _value: (), position: vec4f32,
                      _front_facing: bool, _primitive_index: u32, _sample_index: u32) vec4f32 =
   let xy = @[i32(position.x), i32(position.y)] in
-  shade_frame(inputs.scene, inputs.sun_depth, inputs.ao_work, inputs.indirect,
-              frame, xy.x, xy.y)
+  let (ro, rd) = get_ray(frame.resolution, @[position.x, frame.resolution.y - position.y], camera_from_frame(frame))
+  let t = ray.plane_y(ro, rd, terrain.WATER_Y)
+  let p = ro + rd * t
+  let clip = world_to_clip(p, frame.resolution, camera_from_frame(frame))
+  let scene_depth = target_load(inputs.scene, xy, 0u32).depth in
+  -- Forward shade the actual lower water plane against opaque scene depth.
+  -- Keep the bed/bank depth intact for AO, GI, and future refraction. Murky water
+  -- is opaque here, so each chosen surface is lit and tone-mapped exactly once.
+  if t > 0.0 && terrain.in_bounds(p.xz) && clip.z / clip.w < scene_depth then
+    let visibility = 1.0 - sun_shadow_pcf(inputs.sun_depth, p, frame.resolution.x, frame.resolution.y)
+    let color = tonemap_aces(water_surface(p, rd, frame.time, visibility)) in
+    @[color.x, color.y, color.z, 1.0]
+  else shade_frame(inputs.scene, inputs.sun_depth, inputs.ao_work, inputs.indirect,
+                    frame, xy.x, xy.y)
 
 -- Shared opaque-depth state for the sun and scene draws. Physical attachments,
 -- barriers, pipeline order, and indirect command dependencies are derived from
@@ -545,22 +560,22 @@ def opaque_depth: fragment_state = {
 }
 
 def build_gi(scene_image: render_target<gbuffer>, sun_depth: render_target<f32>,
-                ambient_occlusion: []vec4f32, gi_in: []gi.sample, frame: frame_globals)
+                cells: []vec4f32, ambient_occlusion: []vec4f32, gi_in: []gi.sample, frame: frame_globals)
   ([]gi.sample, []scene_trace.node, []vec4f32, []gi.sample, []gi.sample) =
   -- Tiny Glade's hybrid final gather: detailed screen tracing, BVH fallback,
   -- quarter-resolution rays, SH reconstruction, temporal reuse, recurrent blur.
   -- The reference mode traces explicit paths and bypasses SH/spatial filtering.
   let trace_nodes = map(scene_trace.build_node, iota(scene_trace.NODE_COUNT))
-  let radiance = map(|i| gi.screen_radiance(scene_image, sun_depth, trace_nodes,
+  let radiance = map(|i| gi.screen_radiance(scene_image, sun_depth, trace_nodes, cells,
     ambient_occlusion, gi_in, frame.resolution, camera_from_frame(frame),
     previous_camera_from_frame(frame), frame.history_valid != 0u32,
     frame.gi_mode != 1u32 && frame.gi_mode != 3u32 && (frame.mods & 4u32) == 0u32, i),
     iota(length(ambient_occlusion)))
-  let rays = map(|i| gi.trace_pixel(scene_image, sun_depth, trace_nodes, ambient_occlusion,
+  let rays = map(|i| gi.trace_pixel(scene_image, sun_depth, trace_nodes, cells, ambient_occlusion,
     radiance, frame.resolution, camera_from_frame(frame), frame.frame_index, i,
     frame.gi_mode != 1u32 && frame.gi_mode != 3u32 && (frame.mods & 4u32) == 0u32),
     iota(gi.trace_width(frame.resolution) * gi.trace_height(frame.resolution)))
-  let temporal = map(|i| gi.temporal_pixel(scene_image, sun_depth, trace_nodes,
+  let temporal = map(|i| gi.temporal_pixel(scene_image, sun_depth, trace_nodes, cells,
     ambient_occlusion, radiance, rays, gi_in, frame.resolution, camera_from_frame(frame),
     previous_camera_from_frame(frame), frame.frame_index, frame.history_valid != 0u32,
     frame.gi_mode != 1u32 && (frame.mods & 4u32) == 0u32, frame.gi_mode == 3u32, i),
@@ -579,6 +594,7 @@ entry tinyporto_frame(
     head_in: []f32,
     occ_in: []f32,
     gi_in: []gi.sample,
+    terrain_cells: []vec4f32,
     brick_color: texture2d, brick_normal: texture2d,
     stone_color: texture2d, stone_normal: texture2d,
     mortar_color: texture2d, mortar_normal: texture2d,
@@ -592,7 +608,7 @@ entry tinyporto_frame(
      []scene_trace.node, []vec4f32, []gi.sample, []gi.sample,
      render_target<f32>, render_target<gbuffer>, render_target<vec4f32>) =
   let next_world = update_world(frame, events, { ui = uistate_in, points = points_in, items = items_in, head = head_in })
-  let visible = cull_props(frame, occ_in)
+  let visible = cull_props(frame, terrain_cells, occ_in)
   let maps = { brick_color = brick_color, brick_normal = brick_normal,
                stone_color = stone_color, stone_normal = stone_normal,
                mortar_color = mortar_color, mortar_normal = mortar_normal,
@@ -600,14 +616,14 @@ entry tinyporto_frame(
 
   -- Render sunlight visibility from all walls, independently of the camera.
   let shadow_fragments = rasterize_triangles(
-    direct_draw(36u32, u32(PROP_WALLS)), brick_shadow_vertex)
+    direct_draw(36u32, u32(PROP_WALLS + banks.COUNT)), brick_shadow_vertex(terrain_cells, _, _, _))
   let sun_depth = shade_with(opaque_depth, sun, shadow_fragments, shadow_fragment)
 
   -- Fill the scene G-buffer with the ground, then the visible props.
   let ground_triangles = rasterize_triangles(
-    direct_draw(u32(TESS_CAP), 1u32),
+    direct_draw(u32(TESS_CAP + 6), 1u32),
     scene_vertex(frame, { points = points_in, items = items_in }, _, _, _))
-  let ground_image = shade_with(opaque_depth, scene, ground_triangles, scene_fragment)
+  let ground_image = shade_with(opaque_depth, scene, ground_triangles, scene_fragment(terrain_cells, _, _, _, _, _))
   let prop_triangles = rasterize_triangles(
     indirect_draw(visible.draw), prop_vertex(frame, visible.prop_inst, _, _, _))
   let scene_image = shade_with(
@@ -618,7 +634,7 @@ entry tinyporto_frame(
   let (ambient_occlusion, next_occlusion) = build_postprocess(scene_image, frame.resolution)
 
   let (indirect, trace_nodes, radiance, rays, temporal) =
-    build_gi(scene_image, sun_depth, ambient_occlusion, gi_in, frame)
+    build_gi(scene_image, sun_depth, terrain_cells, ambient_occlusion, gi_in, frame)
 
   -- Light every pixel of the finished image.
   let pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)

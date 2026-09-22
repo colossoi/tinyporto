@@ -1,0 +1,50 @@
+-- Large ashlar stones along the exact cell boundary. The coping sits through
+-- the cobbles and covers their partial ends; cobbles are never individually cut.
+import "terrain"
+import "bricks"
+import "math"
+
+module banks = {
+  def COURSES: i32 = 6
+  def PER_CELL: i32 = 3 + COURSES * 2
+  def COUNT: i32 = terrain.COUNT * PER_CELL
+
+  def active(cells: []vec4f32, i: i32) bool =
+    if cells[i / PER_CELL].w != 2.0 then false
+    else let (_a, _b, _n, valid) = terrain.segment(cells, i / PER_CELL) in valid
+
+  def stone(cells: []vec4f32, i: i32) prop =
+    let cell = i / PER_CELL
+    let slot = i % PER_CELL
+    let (a, b, n, _valid) = terrain.segment(cells, cell)
+    let len = f32.max(distance(a, b), 0.0001)
+    let tangent = (b - a) / len
+    -- Slot 0: continuous backing behind the face joints; slot 1: cap backing;
+    -- slot 2: a broad coping slab. Following slots: two ashlar blocks per course.
+    let cap = slot == 1 || slot == 2
+    let face = slot >= 3
+    let course = (slot - 3) / 2
+    let column = (slot - 3) % 2
+    let pitch = (0.0 - terrain.BED_Y) / f32(COURSES)
+    let split = len * (if course % 2 == 0 then 0.40 else 0.65)
+    let s0 = if face && column == 1 then split else 0.0
+    let s1 = if face && column == 0 then split else len
+    let gap = if slot == 0 || slot == 1 then 0.0 else 0.009
+    let p = a + tangent * ((s0 + s1) * 0.5) - n * (if cap then 0.12 else 0.16)
+    let y = if cap then (if slot == 1 then 0.012 else 0.025)
+            else if face then 0.0 - (f32(course) + 0.5) * pitch
+            else terrain.BED_Y * 0.5
+    let hy = if cap then (if slot == 1 then 0.07 else 0.085)
+             else if face then pitch * 0.5 - gap else 0.0 - terrain.BED_Y * 0.5
+    let hz = if cap then (if slot == 1 then 0.295 else 0.31)
+             else if face then 0.17 else 0.153
+    let tone = 0.88 + brick_hash(i + 5101) * 0.19
+    let wet = if y < terrain.WATER_Y + 0.12 then 0.65 else 1.0
+    let color = terrain.STONE_COLOR * (tone * wet)
+    let hx = f32.max((s1 - s0) * 0.5 - gap, 0.0001) in
+    { center = @[p.x, y, p.y], radius = f32.min(hx, if slot == 0 || slot == 1 then 0.001 else 0.006),
+      half = @[hx, hy, hz],
+      right = @[tangent.x, 0.0, tangent.y], up = @[0.0, 1.0, 0.0],
+      fwd = @[0.0 - n.x, 0.0, 0.0 - n.y], albedo = color,
+      material = if slot == 0 || slot == 1 then 2u32 else 3u32 }
+}

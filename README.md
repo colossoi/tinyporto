@@ -54,9 +54,11 @@ the original failure and documents the corrected launch. This fix has not been
 re-benchmarked here.
 
 Hold the left mouse button to paint fence strokes or place building footprints.
-Tab switches between those two tools; L toggles the overlay. Interactive canal
-drawing is removed for now. The water renderer is retained in `wyn/water.wyn`,
-but no water geometry is currently supplied or drawn.
+Tab switches between those two tools; L toggles the overlay. The starting scene
+has a canal through a grid of one-metre terrain cells, each containing land,
+water, or one dividing line. Ashlar coping and bank faces meet a flat water
+surface 0.6 m below the land. Interactive canal drawing is not implemented yet.
+See [cell terrain and bank geometry](docs/terrain.md).
 Right drag orbits, middle drag pans, and the wheel zooms. Resizing preserves the
 painted world and recreates screen-sized targets and lighting history.
 
@@ -89,7 +91,8 @@ The shell packs frame inputs using the generated `RESOURCE_NAMES` and
 buffers, and three outputs whose capacities are caller-provided: one `vec4f32`
 per pixel for ambient occlusion, one `f32` per 8x8 tile for coarse occlusion,
 and one 112-byte GI ray sample per 4x4 tile.
-Ground and props share their depth attachment; shadows use a separate one.
+Ground, the canal bed, and props share their depth attachment; shadows use a
+separate one. Water is forward-shaded in the final resolve against opaque depth.
 
 The G-buffer uses 12 bytes per pixel: `RGBA8Unorm` albedo/roughness, `RG16Float`
 octahedral world normals, and `R32Float` window depth. Geometry encodes normals
@@ -112,7 +115,7 @@ preserves the original failure, expected values, and passing control.
 
 `--screenshot scene.png --dump head,items,occ` reads exposed buffers for debugging.
 Available names are `uistate`, `points`, `items`, `head`, `occ`, `gi`, `events`, `frame`,
-and `ao_work`. Compiler-internal scratch and prop buffers are owned by the
+`terrain`, and `ao_work`. Compiler-internal scratch and prop buffers are owned by the
 generated function and are not exposed by the source result.
 
 ## Checks
