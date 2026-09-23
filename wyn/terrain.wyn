@@ -23,7 +23,7 @@ module terrain = {
 
   def cell_index(p: vec2f32) i32 =
     let q = (p + v2(HALF)) / CELL_SIZE in
-    clampi(i32(f32.floor(q.y)), 0, SIDE - 1) * SIDE + clampi(i32(f32.floor(q.x)), 0, SIDE - 1)
+    i32.clamp(i32(f32.floor(q.y)), 0, SIDE - 1) * SIDE + i32.clamp(i32(f32.floor(q.x)), 0, SIDE - 1)
 
   def land(cells: []vec4f32, p: vec2f32) bool =
     let i = cell_index(p)

@@ -25,11 +25,6 @@ module scene_trace = {
   def LEAVES: i32 = i32(f32.pow(2.0, f32(TREE_DEPTH)))
   def NODE_COUNT: i32 = LEAVES * 2 - 1
 
-  def min_bounds(a: vec3f32, b: vec3f32) vec3f32 =
-    @[f32.min(a.x, b.x), f32.min(a.y, b.y), f32.min(a.z, b.z)]
-  def max_bounds(a: vec3f32, b: vec3f32) vec3f32 =
-    @[f32.max(a.x, b.x), f32.max(a.y, b.y), f32.max(a.z, b.z)]
-
   def wall_bounds(i: i32) (vec3f32, vec3f32) =
     let (a, b, h, _yaw) = wall(i)
     let center = @[(a.x + b.x) * 0.5, h * 0.5, (a.y + b.y) * 0.5]
@@ -48,7 +43,7 @@ module scene_trace = {
     let (low, high) =
       loop (low, high) = (v3(FAR), v3(0.0 - FAR)) for i < N_WALL do
         if i < first || i >= first + span then (low, high)
-        else let (a, b) = wall_bounds(i) in (min_bounds(low, a), max_bounds(high, b)) in
+        else let (a, b) = wall_bounds(i) in (vec.min(low, a), vec.max(high, b)) in
     { low = @[low.x, low.y, low.z, if span == 1 then f32(first) else -1.0],
       high = @[high.x, high.y, high.z, 0.0] }
 
@@ -92,8 +87,8 @@ module scene_trace = {
       let hit = world(nodes, cells, ro, rd)
       let p = ro + rd * hit.t
       let (pixel, visible) = project_pixel(p, resolution, camera)
-      let px = @[clampi(i32(pixel.x), 0, i32(resolution.x) - 1),
-                 clampi(i32(pixel.y), 0, i32(resolution.y) - 1)]
+      let px = @[i32.clamp(i32(pixel.x), 0, i32(resolution.x) - 1),
+                 i32.clamp(i32(pixel.y), 0, i32(resolution.y) - 1)]
       let g = target_load(scene, px, 0u32)
       let normal = octahedral.decode(g.normal)
       let surface = screen_trace.position(scene, resolution, camera, px)

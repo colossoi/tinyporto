@@ -219,8 +219,8 @@ def occ_reduce_tile(scene: render_target<gbuffer>, resolution: vec3f32,
   let ty = tile.y
   let m =
     loop m = 1.0 for k < 64 do
-      let sx = clampi(tx * OCC_TILE + (k % OCC_TILE), 0, mx)
-      let sy = clampi(ty * OCC_TILE + (k / OCC_TILE), 0, my)
+      let sx = i32.clamp(tx * OCC_TILE + (k % OCC_TILE), 0, mx)
+      let sy = i32.clamp(ty * OCC_TILE + (k / OCC_TILE), 0, my)
       let v = target_load(scene, @[sx, sy], 0u32).depth in
       f32.min(m, v) in
   m
@@ -387,8 +387,8 @@ def gtao_scene_vdepth(scene: render_target<gbuffer>, constants: gtao.consts,
 
 def gtao_load_scene_vdepth(scene: render_target<gbuffer>, constants: gtao.consts,
                           pixel_x: i32, pixel_y: i32) f32 =
-  let cx = clampi(pixel_x, 0i32, i32(constants.viewport_size.x) - 1i32)
-  let cy = clampi(pixel_y, 0i32, i32(constants.viewport_size.y) - 1i32) in
+  let cx = i32.clamp(pixel_x, 0i32, i32(constants.viewport_size.x) - 1i32)
+  let cy = i32.clamp(pixel_y, 0i32, i32(constants.viewport_size.y) - 1i32) in
   gtao_scene_vdepth(scene, constants, @[cx, cy])
 
 def gtao_load_scene_vdepth_uv(scene: render_target<gbuffer>, constants: gtao.consts,
@@ -447,8 +447,8 @@ def build_postprocess(scene: render_target<gbuffer>, resolution: vec3f32)
 def load_ao_edges(occlusion_samples: []vec4f32, pixel_x: i32, pixel_y: i32,
                   constants: gtao.consts) vec2f32 =
   let w = i32(constants.viewport_size.x)
-  let cx = clampi(pixel_x, 0i32, w - 1i32)
-  let cy = clampi(pixel_y, 0i32, i32(constants.viewport_size.y) - 1i32) in
+  let cx = i32.clamp(pixel_x, 0i32, w - 1i32)
+  let cy = i32.clamp(pixel_y, 0i32, i32(constants.viewport_size.y) - 1i32) in
   occlusion_samples[cy * w + cx].xy
 
 def denoise_ao(pixel: vec2i32, occlusion_samples: []vec4f32, constants: gtao.consts)
@@ -502,7 +502,7 @@ def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
     let pg = world_from_depth(resl, fragc, o, cd)
     let base = @[alb.x, alb.y, alb.z]
     let specular = if frame.textures_enabled == 0u32 then v3(0.0)
-                   else sun_specular(n, normalize(cam_eye(o) - pg), clamp01(alb.w * 2.0 - 1.0))
+                   else sun_specular(n, normalize(cam_eye(o) - pg), f32.clamp(alb.w * 2.0 - 1.0, 0.0, 1.0))
     let ao = if ao_off then 0.0
              else let (aov, _e) = denoise_ao(@[pixel_x, pixel_y], occlusion_samples, gtao_consts(resl)) in 1.0 - aov
     let p = pg + n * SH_LIFT

@@ -7,10 +7,6 @@
 -- Globals available WITHOUT any open: normalize, dot, cross, distance, reflect,
 -- mix (scalar+vec), the `**` operator, and the `vec.*` module.
 
-def clamp01(x: f32) f32 = f32.clamp(x, 0.0, 1.0)
-
-def clampi(v: i32, lo: i32, hi: i32) i32 = if v < lo then lo else if v > hi then hi else v
-
 -- Scalar -> vector broadcasts (Wyn arithmetic does not auto-broadcast).
 def v2(s: f32) vec2f32 = @[s, s]
 def v3(s: f32) vec3f32 = @[s, s, s]

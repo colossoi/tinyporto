@@ -47,8 +47,8 @@ def occ_test(od: []f32, clip: vec4f32, resolution: vec3f32) bool =
     let oh = occ_h(resolution)
     let mo =
       loop mo = 0.0 for k < 9 do
-        let cx = clampi(tx + (k % 3 - 1), 0, ow - 1)
-        let cy = clampi(ty + (k / 3 - 1), 0, oh - 1)
+        let cx = i32.clamp(tx + (k % 3 - 1), 0, ow - 1)
+        let cy = i32.clamp(ty + (k / 3 - 1), 0, oh - 1)
         let v = od[cy * ow + cx] in
         f32.max(mo, v)
       in

@@ -65,6 +65,6 @@ module material = {
                             + (t * detail.x + b * detail.y) * strength)
     let contrast = if kind == LIMESTONE then 0.45 else 0.85
     let albedo = base * mix(v3(1.0), color.xyz * 2.0, contrast) in
-    { albedo = @[clamp01(albedo.x), clamp01(albedo.y), clamp01(albedo.z)],
+    { albedo = vec.clamp(albedo, v3(0.0), v3(1.0)),
       normal = normal, roughness = f32.clamp(color.w, 0.45, 1.0) }
 }

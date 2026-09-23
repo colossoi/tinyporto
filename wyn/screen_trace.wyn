@@ -13,8 +13,8 @@ module screen_trace = {
                      camera, target_load(scene, xy, 0u32).depth)
 
   def depth(scene: render_target<gbuffer>, resolution: vec3f32, xy: vec2i32) f32 =
-    target_load(scene, @[clampi(xy.x, 0, i32(resolution.x) - 1),
-                         clampi(xy.y, 0, i32(resolution.y) - 1)], 0u32).depth
+    target_load(scene, @[i32.clamp(xy.x, 0, i32(resolution.x) - 1),
+                         i32.clamp(xy.y, 0, i32(resolution.y) - 1)], 0u32).depth
 
   -- Point + bilinear depth, following the author's published raymarch.hlsl:
   -- https://gist.github.com/h3r2tic/9c8356bdaefbe80b1a22ae0aaee192db

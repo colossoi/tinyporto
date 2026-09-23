@@ -165,8 +165,8 @@ module gi = {
     else
       let phase = i32(frame_index % 16u32)
       let w = trace_width(resolution)
-      let pixel = @[clampi(index % w * 4 + phase % 4, 0, i32(resolution.x) - 1),
-                     clampi(index / w * 4 + phase / 4, 0, i32(resolution.y) - 1)]
+      let pixel = @[i32.clamp(index % w * 4 + phase % 4, 0, i32(resolution.x) - 1),
+                     i32.clamp(index / w * 4 + phase / 4, 0, i32(resolution.y) - 1)]
       let surface = load_surface(scene, ao, resolution, camera, pixel, false) in
       if surface.position.w < 0.5 then empty
       else gather(scene, sun_depth, nodes, cells, radiance, resolution, camera, surface,
@@ -223,8 +223,8 @@ module gi = {
     else
       let w = width(resolution, reference)
       let pixel = if reference then @[index % w, index / w]
-                   else @[clampi(index % w * 2 + 1, 0, i32(resolution.x) - 1),
-                           clampi(index / w * 2 + 1, 0, i32(resolution.y) - 1)]
+                   else @[i32.clamp(index % w * 2 + 1, 0, i32(resolution.x) - 1),
+                           i32.clamp(index / w * 2 + 1, 0, i32(resolution.y) - 1)]
       let surface = load_surface(scene, ao, resolution, camera, pixel, reference)
       let seed = u32(index) * 128u32 + frame_index * 1048576u32 in
       if surface.position.w < 0.5 then empty
