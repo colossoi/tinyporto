@@ -4,6 +4,7 @@ mod camera;
 mod gfx;
 mod materials;
 mod shadow;
+mod temporal;
 mod terrain;
 include!(concat!(env!("OUT_DIR"), "/module.rs"));
 
@@ -118,6 +119,9 @@ struct Args {
     /// Compare with the original flat surface colors and geometric normals.
     #[arg(long)]
     no_textures: bool,
+    /// Disable final-image temporal antialiasing and projection jitter.
+    #[arg(long)]
+    no_taa: bool,
     /// Direction toward the sun, as three comma-separated world coordinates.
     #[arg(long, allow_hyphen_values = true)]
     sun_direction: Option<SunDirection>,
@@ -233,6 +237,7 @@ impl ApplicationHandler for App {
         };
         let (cam, mods) = (self.cam, self.mods);
         let (gi_mode, textures_enabled) = (self.args.gi as u32, !self.args.no_textures);
+        let taa_enabled = !self.args.no_taa;
         let sun_direction = self.args.sun_direction.as_ref().map(|v| v.0);
         self.startup = Some(std::thread::spawn(move || {
             let mut renderer = Renderer::new(gfx, &cam, mods, 0.0)?;
@@ -241,6 +246,7 @@ impl ApplicationHandler for App {
             }
             renderer.gi_mode = gi_mode;
             renderer.textures_enabled = textures_enabled;
+            renderer.taa_enabled = taa_enabled;
             renderer.prepare(&cam, mods)?;
             Ok(renderer)
         }));
@@ -452,6 +458,7 @@ fn main() -> Result<()> {
         }
         renderer.gi_mode = args.gi as u32;
         renderer.textures_enabled = !args.no_textures;
+        renderer.taa_enabled = !args.no_taa;
         renderer.sky_clouds = match args.sun_demo {
             Some(SunDemo::Clear | SunDemo::Away) => [0.0, 0.0, 0.0],
             // A thin edge of the existing noise field crosses the default sun.

@@ -1,6 +1,7 @@
 //! Application inputs, retained frame results, and caller-owned render targets.
 //! All shader loading, pipeline creation, dispatches, and draws belong to Wyn.
 
+use crate::temporal::{HistoryKey, TemporalFrame, TemporalState};
 use crate::{camera::Camera, generated, gfx::Gfx, materials::Materials, shadow, terrain};
 use anyhow::{bail, Context, Result};
 use generated::output::{OutputDescriptor, OutputResource};
@@ -81,6 +82,7 @@ struct FrameHistory {
     valid: u32,
     gi_mode: u32,
     textures_enabled: u32,
+    temporal: TemporalFrame,
 }
 
 fn storage(device: &wgpu::Device, name: &str, bytes: u64) -> wgpu::Buffer {
@@ -143,6 +145,13 @@ fn frame_bytes(
         ("frame_index", bytemuck::bytes_of(&history.frame_index)),
         ("history_valid", bytemuck::bytes_of(&history.valid)),
         ("gi_mode", bytemuck::bytes_of(&history.gi_mode)),
+        ("jitter", bytemuck::cast_slice(&history.temporal.jitter)),
+        (
+            "previous_jitter",
+            bytemuck::cast_slice(&history.temporal.previous_jitter),
+        ),
+        ("taa_enabled", bytemuck::bytes_of(&history.temporal.enabled)),
+        ("taa_valid", bytemuck::bytes_of(&history.temporal.valid)),
         (
             "textures_enabled",
             bytemuck::bytes_of(&history.textures_enabled),
@@ -162,6 +171,7 @@ fn frame_bytes(
 }
 
 struct Targets {
+    hdr: wgpu::Texture,
     albedo: wgpu::Texture,
     normal: wgpu::Texture,
     depth: wgpu::Texture,
@@ -200,6 +210,12 @@ impl Targets {
         };
         let (rw, rh) = reflection_extent(width, height);
         Self {
+            hdr: image(
+                "composited HDR/depth",
+                wgpu::TextureFormat::Rgba32Float,
+                width,
+                height,
+            ),
             albedo: image(
                 "scene albedo",
                 wgpu::TextureFormat::Rgba8Unorm,
@@ -307,12 +323,14 @@ pub struct Renderer {
     pub frame: u32,
     pub gi_mode: u32,
     pub textures_enabled: bool,
+    pub taa_enabled: bool,
     /// Screenshot-only cloud controls: offset xy, coverage strength z.
     pub sky_clouds: [f32; 3],
     // Retain Wyn's pipelines and scratch buffers across frames and resizes.
     host: generated::HostContext,
     world: World,
     targets: Targets,
+    temporal: TemporalState,
     materials: Materials,
     reflection_sampler: wgpu::Sampler,
     terrain: wgpu::Buffer,
@@ -344,6 +362,7 @@ impl Renderer {
                 valid: 0,
                 gi_mode: 0,
                 textures_enabled: 1,
+                temporal: TemporalFrame::default(),
             },
         )?;
         let globals = gfx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -361,6 +380,7 @@ impl Renderer {
             host: generated::HostContext::new(&gfx.device).context("initialize Wyn host")?,
             world: World::new(&gfx.device, w, h),
             targets: Targets::new(&gfx.device, w, h),
+            temporal: TemporalState::new(&gfx.device, w, h),
             materials: Materials::new(&gfx.device, &gfx.queue).context("load surface textures")?,
             reflection_sampler: gfx.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("filtered water reflection"),
@@ -385,6 +405,7 @@ impl Renderer {
             frame: 0,
             gi_mode: 0,
             textures_enabled: true,
+            taa_enabled: true,
             sky_clouds: [0.0, 0.0, 1.0],
             start: Instant::now(),
             previous_camera: *cam,
@@ -484,6 +505,7 @@ impl Renderer {
         }
         self.gfx.resize(width, height);
         self.targets = Targets::new(&self.gfx.device, width, height);
+        self.temporal = TemporalState::new(&self.gfx.device, width, height);
         // The painting survives; screen-space occlusion history must be reset.
         self.world.occ = storage(
             &self.gfx.device,
@@ -507,6 +529,16 @@ impl Renderer {
         self.gfx
             .queue
             .write_buffer(&self.events, 0, bytemuck::cast_slice(&padded));
+    }
+
+    fn temporal_key(&self, mods: u32) -> HistoryKey {
+        HistoryKey {
+            enabled: self.taa_enabled && self.gi_mode != 3,
+            gi_mode: self.gi_mode,
+            textures: self.textures_enabled,
+            mods,
+            sky: self.sky_clouds,
+        }
     }
 
     fn encode_frame(
@@ -542,6 +574,11 @@ impl Renderer {
                 valid: u32::from(self.gi_reset_frames == 0),
                 gi_mode: self.gi_mode,
                 textures_enabled: u32::from(self.textures_enabled),
+                temporal: self.temporal.frame(
+                    cam,
+                    self.temporal_key(mods),
+                    self.gi_reset_frames != 0,
+                ),
             },
         )?;
         self.gfx.queue.write_buffer(&self.globals, 0, &bytes);
@@ -583,6 +620,9 @@ impl Renderer {
             &self.targets.next_occ,
             &self.targets.gi_rays,
             &self.targets.reflection,
+            self.temporal.input(),
+            &self.targets.hdr,
+            self.temporal.output(),
             target,
             &self.targets.reflection_z,
             &self.targets.scene_z,
@@ -632,6 +672,7 @@ impl Renderer {
         let previous = std::mem::replace(&mut self.world, next);
         // The caller-provided occlusion output cannot alias next frame's input.
         self.targets.next_occ = previous.occ;
+        self.temporal.commit(*cam, self.temporal_key(mods));
         self.frame = self.frame.wrapping_add(1);
         self.previous_camera = *cam;
         self.previous_textures_enabled = self.textures_enabled;
@@ -898,7 +939,7 @@ mod tests {
     fn generated_frames_retain_input_state_and_resize_occlusion_history() {
         let gfx = Gfx::new_headless(64, 48).expect("GPU device");
         let cam = Camera::default();
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         let target = offscreen(&renderer.gfx);
         // Tab selects building for the next frame; this frame still paints fence.
         renderer.upload_events(&[
@@ -1046,7 +1087,7 @@ mod tests {
         let (w, h) = (321u32, 201u32);
         let gfx = Gfx::new_headless(w, h).expect("GPU device");
         let cam = crate::sun_demo_camera(shadow::DEFAULT_SUN, crate::SunDemo::Clear).unwrap();
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         renderer.gi_mode = 1;
         renderer.sky_clouds = [0.0, 0.0, 0.0];
         let target = offscreen(&renderer.gfx);
@@ -1129,7 +1170,7 @@ mod tests {
         let gfx = Gfx::new_headless(160, 120).expect("GPU device");
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], 0.6, -0.7, 18.0);
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         let target = offscreen(&renderer.gfx);
         renderer.textures_enabled = false;
         for _ in 0..3 {
@@ -1196,7 +1237,7 @@ mod tests {
         let gfx = Gfx::new_headless(80, 60).expect("GPU device");
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], 0.6, -1.1, 25.0);
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         // Preserve the original flat-ground lighting fixture. Canal geometry has
         // its own coverage below, including the exposed bed and raised coping.
         renderer
@@ -1425,7 +1466,7 @@ mod tests {
         let gfx = Gfx::new_headless(160, 120).expect("GPU device");
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], 0.0, -1.35, 22.0);
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         renderer.gi_mode = 1;
         let target = offscreen(&renderer.gfx);
         for _ in 0..3 {
@@ -1519,7 +1560,7 @@ mod tests {
         let gfx = Gfx::new_headless(width, height).expect("GPU device");
         let mut cam = Camera::default();
         cam.set([2.3, 0.0, 4.5], 0.0, -1.35, 6.2);
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         renderer.gi_mode = 1;
         let target = offscreen(&renderer.gfx);
         // Disable AO to isolate sunlight. Exercise both geometric and textured
@@ -1641,7 +1682,7 @@ mod tests {
     fn geometric_shadows_rebuild_on_terrain_and_sun_edits() {
         let gfx = Gfx::new_headless(160, 120).expect("GPU device");
         let mut cam = Camera::default();
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         renderer.gi_mode = 1;
         let mut points = Vec::new();
         for z in [-18.0, -12.0, 12.0, 18.0] {
@@ -1704,7 +1745,7 @@ mod tests {
     #[test]
     fn geometric_gpu_queries_match_all_caster_reference() {
         let gfx = Gfx::new_headless(64, 48).expect("GPU device");
-        let mut renderer = Renderer::new(gfx, &Camera::default(), 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &Camera::default());
         let mut seed = 731u32;
         let mut random = || {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -1750,7 +1791,7 @@ mod tests {
         let gfx = Gfx::new_headless(240, 180).expect("GPU device");
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], 0.6, -0.4, 21.0);
-        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
         renderer.gi_mode = 1;
         let target = offscreen(&renderer.gfx);
         for _ in 0..3 {
@@ -1925,5 +1966,295 @@ mod tests {
             image_depths(&renderer.gfx, &renderer.targets.scene_z),
             image_depths(&renderer.gfx, &renderer.targets.depth)
         );
+    }
+    // Geometry/lighting tests compare exact samples. Exercise jitter separately
+    // below rather than changing their assertions to tolerate moving samples.
+    fn fixed_sample_renderer(gfx: Gfx, cam: &Camera) -> Renderer {
+        let mut renderer = Renderer::new(gfx, cam, 0, 0.0).unwrap();
+        renderer.taa_enabled = false;
+        renderer
+    }
+
+    fn hdr_pixels(gfx: &Gfx, texture: &wgpu::Texture) -> Vec<[f32; 4]> {
+        image_bytes(gfx, texture)
+            .chunks_exact(16)
+            .map(|pixel| {
+                std::array::from_fn(|i| {
+                    f32::from_le_bytes(pixel[i * 4..i * 4 + 4].try_into().unwrap())
+                })
+            })
+            .collect()
+    }
+
+    fn save_quality_frame(name: &str, gfx: &Gfx, target: &wgpu::Texture) {
+        if let Some(dir) = std::env::var_os("TINYPORTO_QA_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = std::fs::File::create(dir.join(format!("{name}.png"))).unwrap();
+            let mut png = png::Encoder::new(file, target.width(), target.height());
+            png.set_color(png::ColorType::Rgba);
+            png.set_depth(png::BitDepth::Eight);
+            png.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+            png.write_header()
+                .unwrap()
+                .write_image_data(&image_bytes(gfx, target))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn taa_quality_static_and_motion_against_supersampled_reference() {
+        let (w, h, scale) = (320usize, 224usize, 4usize);
+        let mut cam = Camera::default();
+        cam.set([0.0, 0.0, 0.0], 0.6, -0.6, 24.0);
+        let mut renderer =
+            Renderer::new(Gfx::new_headless(w as u32, h as u32).unwrap(), &cam, 0, 0.0).unwrap();
+        renderer.gi_mode = 1;
+        let target = offscreen(&renderer.gfx);
+        let mut reference = fixed_sample_renderer(
+            Gfx::new_headless((w * scale) as u32, (h * scale) as u32).unwrap(),
+            &cam,
+        );
+        reference.gi_mode = 1;
+        let reference_target = offscreen(&reference.gfx);
+        let mut fixed = fixed_sample_renderer(Gfx::new_headless(w as u32, h as u32).unwrap(), &cam);
+        fixed.gi_mode = 1;
+        let fixed_target = offscreen(&fixed.gfx);
+        let mut prior = Vec::<u8>::new();
+        let mut deltas = Vec::<u8>::new();
+        for frame in 0..96 {
+            renderer.execute(&target, &cam, 0, 1.0).unwrap();
+            if frame >= 63 {
+                let image = image_bytes(&renderer.gfx, &target);
+                if !prior.is_empty() {
+                    let depth = hdr_pixels(&renderer.gfx, renderer.temporal.input());
+                    for i in 0..w * h {
+                        if depth[i][3] > 0.0 {
+                            for c in 0..3 {
+                                deltas.push(image[i * 4 + c].abs_diff(prior[i * 4 + c]));
+                            }
+                        }
+                    }
+                }
+                prior = image;
+            }
+            if frame == 94 || frame == 95 {
+                save_quality_frame(&format!("taa-static-{frame}"), &renderer.gfx, &target);
+            }
+        }
+        deltas.sort_unstable();
+        let mean = deltas.iter().map(|x| f64::from(*x)).sum::<f64>() / deltas.len() as f64;
+        let p99 = deltas[deltas.len() * 99 / 100];
+        eprintln!("TAA settled display variation: mean {mean:.4}/255, p99 {p99}/255");
+        assert!(
+            mean < 0.35 && p99 <= 3,
+            "stationary TAA must not visibly shimmer"
+        );
+
+        for moving in [false, true] {
+            if moving {
+                for _ in 0..24 {
+                    cam.az += 0.003;
+                    renderer.execute(&target, &cam, 0, 1.0).unwrap();
+                }
+            }
+            for _ in 0..3 {
+                fixed.execute(&fixed_target, &cam, 0, 1.0).unwrap();
+                reference.execute(&reference_target, &cam, 0, 1.0).unwrap();
+            }
+            let truth = hdr_pixels(&reference.gfx, &reference.targets.hdr);
+            let taa = hdr_pixels(&renderer.gfx, renderer.temporal.input());
+            let baseline = hdr_pixels(&fixed.gfx, &fixed.targets.hdr);
+            let (mut taa_error, mut baseline_error, mut count) = (0.0f64, 0.0f64, 0usize);
+            for y in 2..h - 2 {
+                for x in 2..w - 2 {
+                    let i = y * w + x;
+                    if baseline[i][3] <= 0.0 || taa[i][3] <= 0.0 {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        let mut expected = 0.0;
+                        for dy in 0..scale {
+                            for dx in 0..scale {
+                                expected += truth[(y * scale + dy) * w * scale + x * scale + dx][c]
+                                    / (scale * scale) as f32;
+                            }
+                        }
+                        taa_error += f64::from((taa[i][c] - expected).powi(2));
+                        baseline_error += f64::from((baseline[i][c] - expected).powi(2));
+                        count += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "TAA reference moving={moving}: MSE {:.6}, disabled {:.6}, ratio {:.3}",
+                taa_error / count as f64,
+                baseline_error / count as f64,
+                taa_error / baseline_error
+            );
+            let label = if moving { "moving" } else { "static" };
+            save_quality_frame(&format!("taa-{label}"), &renderer.gfx, &target);
+            save_quality_frame(&format!("no-taa-{label}"), &fixed.gfx, &fixed_target);
+            save_quality_frame(
+                &format!("reference-{label}"),
+                &reference.gfx,
+                &reference_target,
+            );
+            assert!(
+                taa_error < baseline_error * 0.9,
+                "TAA must improve on disabled AA, not just reduce jitter"
+            );
+        }
+    }
+
+    #[test]
+    fn taa_stabilizes_jitter_keeps_picking_stable_and_invalidates_history() {
+        let gfx = Gfx::new_headless(192, 128).expect("GPU device");
+        let mut cam = Camera::default();
+        cam.set([0.0, 0.0, 0.0], 0.6, -0.6, 24.0);
+        let mut renderer = Renderer::new(gfx, &cam, 0, 0.0).unwrap();
+        renderer.gi_mode = 1;
+        let target = offscreen(&renderer.gfx);
+        let key = renderer.temporal_key(0);
+        let first = renderer.temporal.frame(&cam, key, false);
+        assert_eq!(first.valid, 0);
+        renderer.prepare(&cam, 0).unwrap();
+        assert_eq!(
+            renderer.temporal.frame(&cam, key, false).jitter,
+            first.jitter
+        );
+        assert_eq!(renderer.temporal.frame(&cam, key, false).valid, 0);
+
+        let mut previous = None;
+        let (mut raw_delta, mut resolved_delta, mut count) = (0.0f64, 0.0f64, 0usize);
+        for frame in 0..48 {
+            renderer.execute(&target, &cam, 0, 1.0).unwrap();
+            let raw = hdr_pixels(&renderer.gfx, &renderer.targets.hdr);
+            let resolved = hdr_pixels(&renderer.gfx, renderer.temporal.input());
+            assert!(resolved.iter().flatten().all(|v| v.is_finite()));
+            if let Some((old_raw, old_resolved)) = previous.as_ref() {
+                let old_raw: &Vec<[f32; 4]> = old_raw;
+                let old_resolved: &Vec<[f32; 4]> = old_resolved;
+                if frame >= 16 {
+                    for i in 0..raw.len() {
+                        if raw[i][3] <= 0.0 || old_raw[i][3] <= 0.0 {
+                            continue;
+                        }
+                        for c in 0..3 {
+                            raw_delta += f64::from((raw[i][c] - old_raw[i][c]).abs());
+                            resolved_delta +=
+                                f64::from((resolved[i][c] - old_resolved[i][c]).abs());
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            previous = Some((raw, resolved));
+        }
+        eprintln!(
+            "TAA static variation: raw {}, resolved {}, ratio {}",
+            raw_delta / count as f64,
+            resolved_delta / count as f64,
+            resolved_delta / raw_delta
+        );
+        assert!(count > 10000 && raw_delta > 1.0);
+        assert!(
+            resolved_delta < raw_delta * 0.65,
+            "history must reduce subpixel flicker"
+        );
+        assert_eq!(renderer.temporal.frame(&cam, key, false).valid, 1);
+        assert_eq!(renderer.temporal.frame(&cam, key, true).valid, 0);
+        let mut cut = cam;
+        cut.az += 0.5;
+        assert_eq!(renderer.temporal.frame(&cut, key, false).valid, 0);
+        renderer.textures_enabled = false;
+        assert_eq!(
+            renderer
+                .temporal
+                .frame(&cam, renderer.temporal_key(0), false)
+                .valid,
+            0
+        );
+        renderer.textures_enabled = true;
+
+        // Identical cursor positions must paint identical world points, despite
+        // different projection jitter on their two press frames.
+        renderer.upload_events(&[encode_event(EV_MOUSEDOWN, 0, 0.0, 96.0, 64.0)]);
+        renderer.execute(&target, &cam, 0, 1.0).unwrap();
+        renderer.upload_events(&[encode_event(crate::EV_MOUSEUP, 0, 0.0, 96.0, 64.0)]);
+        renderer.execute(&target, &cam, 0, 1.0).unwrap();
+        renderer.upload_events(&[encode_event(EV_MOUSEDOWN, 0, 0.0, 96.0, 64.0)]);
+        renderer.execute(&target, &cam, 0, 1.0).unwrap();
+        let points = read_buffer(&renderer.gfx, &renderer.world.points).unwrap();
+        assert_eq!(&points[..8], &points[8..16]);
+        renderer.upload_events(&[]);
+        renderer.resize(193, 129);
+        assert_eq!(renderer.temporal.frame(&cam, key, false).valid, 0);
+        let resized = offscreen(&renderer.gfx);
+        renderer.execute(&resized, &cam, 0, 1.0).unwrap();
+        assert_eq!(renderer.temporal.input().width(), 193);
+        renderer.gi_mode = 3;
+        let reference = renderer
+            .temporal
+            .frame(&cam, renderer.temporal_key(0), false);
+        assert_eq!(reference.enabled, 0);
+        assert_eq!(reference.jitter, [0.0; 2]);
+    }
+
+    #[test]
+    fn taa_stays_stable_with_realtime_gi_and_animated_water() {
+        let mut cam = Camera::default();
+        cam.set([0.0, 0.0, 0.0], 0.6, -0.6, 24.0);
+        let mut renderer =
+            Renderer::new(Gfx::new_headless(384, 256).unwrap(), &cam, 0, 0.0).unwrap();
+        let target = offscreen(&renderer.gfx);
+        let mut previous = Vec::<u8>::new();
+        let (mut delta, mut count) = (0u64, 0usize);
+        for i in 0..96 {
+            renderer
+                .execute(&target, &cam, 0, 1.0 + i as f32 / 60.0)
+                .unwrap();
+            if i >= 63 {
+                let frame = image_bytes(&renderer.gfx, &target);
+                if !previous.is_empty() {
+                    let hdr = hdr_pixels(&renderer.gfx, renderer.temporal.input());
+                    for (pixel, depth) in hdr.iter().enumerate() {
+                        if depth[3] > 0.0 {
+                            for c in 0..3 {
+                                delta += u64::from(
+                                    frame[pixel * 4 + c].abs_diff(previous[pixel * 4 + c]),
+                                );
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                previous = frame;
+            }
+        }
+        let mean = delta as f64 / count as f64;
+        eprintln!("TAA with GI and water animation: opaque mean step {mean:.4}/255");
+        assert!(mean < 0.5, "GI must not restore full-scene jitter");
+        let before = hdr_pixels(&renderer.gfx, renderer.temporal.input());
+        for i in 0..12 {
+            renderer
+                .execute(&target, &cam, 0, 3.0 + i as f32 / 30.0)
+                .unwrap();
+        }
+        let after = hdr_pixels(&renderer.gfx, renderer.temporal.input());
+        let changed_water = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| {
+                a[3] < 0.0
+                    && b[3] < 0.0
+                    && (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs() > 0.01
+            })
+            .count();
+        assert!(
+            changed_water > 100,
+            "stability must not freeze animated water"
+        );
+        save_quality_frame("taa-live-gi", &renderer.gfx, &target);
     }
 }

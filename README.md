@@ -23,11 +23,17 @@ cargo run -- --gi off                   # compare with the previous ambient mode
 cargo run -- --gi indirect              # indirect light only
 cargo run -- --gi reference             # slower explicit path-traced comparison
 cargo run -- --no-textures              # compare original flat materials
+cargo run -- --no-taa                   # disable final-image TAA and jitter
 cargo run -- --sun-direction=-0.5,0.52,0.35 # direction toward the sun
 cargo run --release -- --sun-demo clear --screenshot sun.png
 cargo run --release -- --sun-demo clouded --screenshot sun-clouded.png
 cargo run --release -- --sun-demo away --screenshot sky-away.png
 ```
+
+Final-image TAA is enabled by default and uses the local `pkg/taa` package,
+with history lifetime isolated in the driver. Lighting and water are
+composited in HDR before TAA and the existing ACES display transform.
+See [image finishing](docs/image-finishing.md) for controls and package boundaries.
 
 The sky uses the same sun direction as geometric shadows, contact shadows and
 surface lighting. A near-white disk (1.6 degrees across, three times natural size), limb darkening
@@ -61,8 +67,9 @@ The title displays wall-clock FPS. Screenshots report median CPU encode/submit
 time and, on adapters supporting timestamp queries, total GPU frame time after
 five warmup frames. Screenshot wall time includes a GPU wait each frame, so it
 does not represent interactive FPS, where CPU and GPU work can overlap.
-Per-pass GPU timing is unavailable because the generated passes expose no
-timestamp hooks. The driver records clears and the generated frame into one
+The normal generated passes expose no per-pass timestamp hooks. A temporary
+instrumented build produced a [frame breakdown before DoF removal](docs/frame-profile.md).
+The driver records clears and the generated frame into one
 command encoder, then submits it once. Interactive frames do no timing queries.
 A persistent generated `HostContext` creates the shader and compute
 pipelines once, caches render pipelines on first use, and reuses scratch buffers.
@@ -131,9 +138,10 @@ buffers, and outputs whose capacities are caller-provided: one `vec4f32`
 per pixel for ambient occlusion, one `f32` per 8x8 tile for coarse occlusion,
 and one 112-byte GI ray sample per 4x4 tile. The compiler owns the GI wall BVH.
 Ground, the canal bed, props and the water mesh share their depth attachment.
-Sun visibility reads the geometric index. Opaque lighting resolves directly into the final
-image, then the water mesh shades over it with opaque body colour, interpolated
-wave normals, filtered scene reflections and sun glints. Each surface is tone mapped once.
+Sun visibility reads the geometric index. Opaque lighting resolves into HDR,
+then the water mesh shades over it with opaque body colour, interpolated wave
+normals, filtered scene reflections and sun glints. TAA operates
+on the composite before a single display tone-map pass.
 
 The G-buffer uses 12 bytes per pixel: `RGBA8Unorm` albedo/roughness, `RG16Float`
 octahedral world normals, and `R32Float` window depth. Geometry encodes normals

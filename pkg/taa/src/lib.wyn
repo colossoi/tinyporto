@@ -1,0 +1,73 @@
+-- Stateless temporal reconstruction kernels. Caller owns images, motion,
+-- jitter, depth conventions and history lifetime. Colors are linear HDR RGB.
+module taa = {
+  type neighborhood = {
+    sum: vec4f32, mean: vec3f32, moment: vec3f32, low: vec3f32, high: vec3f32,
+  }
+  def empty: neighborhood = {
+    sum = @[0.0, 0.0, 0.0, 0.0], mean = @[0.0, 0.0, 0.0], moment = @[0.0, 0.0, 0.0],
+    low = @[1e30, 1e30, 1e30], high = @[-1e30, -1e30, -1e30],
+  }
+  def ycocg(c: vec3f32) vec3f32 =
+    @[dot(c, @[0.25, 0.5, 0.25]), (c.x - c.z) * 0.5, dot(c, @[-0.25, 0.5, -0.25])]
+  def rgb(c: vec3f32) vec3f32 = @[c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z]
+
+  -- Separable Mitchell-Netravali, B=C=1/3, support [-2,2].
+  def mitchell(value: f32) f32 =
+    let x = f32.abs(value) in
+    if x < 1.0 then ((7.0 * x - 12.0) * x * x + 16.0 / 3.0) / 6.0
+    else if x < 2.0 then (((-7.0 / 3.0 * x + 12.0) * x - 20.0) * x + 32.0 / 3.0) / 6.0
+    else 0.0
+
+  -- Accumulate a 3x3 neighborhood. Offset and jitter share pixel units/direction.
+  def add(n: neighborhood, color: vec3f32, offset: vec2f32, jitter: vec2f32) neighborhood =
+    let w = mitchell(offset.x - jitter.x) * mitchell(offset.y - jitter.y)
+    let c = ycocg(color) in
+    { sum = n.sum + @[color.x * w, color.y * w, color.z * w, w],
+      mean = n.mean + c, moment = n.moment + c * c,
+      low = vec.min(n.low, c), high = vec.max(n.high, c) }
+
+  def reconstruct(n: neighborhood) vec3f32 =
+    vec.max(@[0.0, 0.0, 0.0], n.sum.xyz / f32.max(n.sum.w, 0.001))
+
+  -- Catmull-Rom history reconstruction avoids cumulative bilinear blur in motion.
+  def history_filter(value: f32) f32 =
+    let x = f32.abs(value) in
+    if x < 1.0 then (1.5 * x - 2.5) * x * x + 1.0
+    else if x < 2.0 then ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0 else 0.0
+
+  -- Depths are positive linear view distances in the same coordinate frame.
+  -- Sky/validity/material tests belong to the caller, not this numeric kernel.
+  def depth_agrees(previous: f32, expected: f32, absolute: f32, relative: f32) bool =
+    previous > 0.0 && expected > 0.0 && f32.abs(previous - expected) <= absolute + expected * relative
+
+  -- Clip toward the variance box, preserving the direction of the color change.
+  def clip_history(n: neighborhood, history: vec3f32, gamma: f32) vec3f32 =
+    let mean = n.mean / 9.0
+    let variance = vec.max(@[0.0, 0.0, 0.0], n.moment / 9.0 - mean * mean)
+    let sigma = @[f32.sqrt(variance.x), f32.sqrt(variance.y), f32.sqrt(variance.z)]
+    let low = vec.max(n.low, mean - sigma * gamma)
+    let high = vec.max(low + @[0.0001, 0.0001, 0.0001], vec.min(n.high, mean + sigma * gamma))
+    let center = (low + high) * 0.5
+    let extent = (high - low) * 0.5
+    let delta = ycocg(history) - center
+    let unit = delta / extent
+    let scale = f32.max(1.0, f32.max(f32.abs(unit.x), f32.max(f32.abs(unit.y), f32.abs(unit.z)))) in
+    rgb(center + delta / scale)
+
+  -- current_weight and reactivity are in [0,1]; reactivity=1 rejects all history.
+  def resolve(n: neighborhood, history: vec3f32, history_valid: bool,
+              current_weight: f32, reactivity: f32, gamma: f32) vec3f32 =
+    let current = reconstruct(n)
+    let previous = clip_history(n, history, gamma)
+    let cy = ycocg(current).x
+    let py = ycocg(previous).x
+    -- Bright subpixel features are not evidence of motion. Explicit reactivity
+    -- handles animation; depth and clipping handle disocclusion. Compress HDR
+    -- luminance weights so isolated bright samples cannot dominate the blend.
+    let alpha = f32.max(reactivity, current_weight)
+    let cw = alpha / (1.0 + f32.max(cy, 0.0))
+    let pw = (1.0 - alpha) / (1.0 + f32.max(py, 0.0)) in
+    if !history_valid then current
+    else vec.max(@[0.0, 0.0, 0.0], (previous * pw + current * cw) / (pw + cw))
+}

@@ -15,6 +15,7 @@
 open f32
 import "math"
 import "camera"
+import "temporal"
 import "shade"
 import "paint"
 import "input"
@@ -61,16 +62,20 @@ type frame_globals = {
   gi_mode: u32,       -- 0 = GI, 1 = original ambient, 2 = indirect, 3 = reference
   textures_enabled: u32,
   sky_clouds: vec3f32, -- screenshot sky demo: cloud offset xy, coverage strength z
+  jitter: vec2f32,
+  previous_jitter: vec2f32,
+  taa_enabled: u32,
+  taa_valid: u32,
 }
 
 -- The orbit camera the host drives, unpacked from the frame block. Built locally
 -- wherever the camera is used (kept out of `map` lambdas as an outer capture).
 def camera_from_frame(frame: frame_globals) orbit =
-  { target = frame.cam_target, az = frame.cam_az, elev = frame.cam_elev, dist = frame.cam_dist }
+  { target = frame.cam_target, az = frame.cam_az, elev = frame.cam_elev, dist = frame.cam_dist, jitter = frame.jitter }
 
 def previous_camera_from_frame(frame: frame_globals) orbit =
   { target = frame.previous_target, az = frame.previous_az,
-    elev = frame.previous_elev, dist = frame.previous_dist }
+    elev = frame.previous_elev, dist = frame.previous_dist, jitter = frame.previous_jitter }
 
 -- Persistent painter state: UI, control points, paint items, and stroke capture.
 -- Input helpers decode events; update_world folds them into the next state.
@@ -126,7 +131,7 @@ def update_world(frame: frame_globals, events: []vec4f32, previous_world: world)
   -- so a tool change takes effect on the next frame.
   let next_ui = apply_ui_shortcuts(ui, events)
   let capture = capture_stroke_points(
-    head, events, frame.resolution, camera_from_frame(frame), is_building(ui.tool)) in
+    head, events, frame.resolution, unjittered(camera_from_frame(frame)), is_building(ui.tool)) in
   { ui = pack_ui_state(next_ui),
     points = append_captured_points(previous_world.points, head.point_count, capture),
     items = create_or_extend_item(previous_world.items, head, capture, ui.tool),
@@ -386,11 +391,21 @@ def reflection_vertex(frame: frame_globals, masonry: []prop, vertex_index: u32,
                    { point = world, normal = n, albedo = p.albedo })
 
 -- Perspective constants for GTAO, built from the live viewport + camera FOV (vertical
--- 20°) and clip planes. Frame 0: no temporal accumulation (we have no TAA), so the
--- per-pixel noise is static and the denoise pass cleans it up spatially.
-def gtao_consts(resolution: vec3f32) gtao.consts =
-  gtao.make_constants(@[resolution.x, resolution.y], f32.tan(f32.radians(10.0)),
-                      CLIP_NEAR, CLIP_FAR, 0u32, gtao.default_settings)
+-- 20°) and clip planes. Keep AO's sampling noise static; final-image TAA handles
+-- projection jitter. AO's view reconstruction must remove that same jitter.
+def gtao_consts(resolution: vec3f32, jitter: vec2f32) gtao.consts =
+  let c = gtao.make_constants(resolution.xy, f32.tan(f32.radians(10.0)),
+                              CLIP_NEAR, CLIP_FAR, 0u32, gtao.default_settings) in
+  { viewport_size = c.viewport_size, viewport_pixel_size = c.viewport_pixel_size,
+    depth_unpack = c.depth_unpack, camera_tan_half_fov = c.camera_tan_half_fov,
+    ndc_to_view_mul = c.ndc_to_view_mul,
+    ndc_to_view_add = c.ndc_to_view_add - jitter * c.camera_tan_half_fov,
+    ndc_to_view_mul_x_pixel_size = c.ndc_to_view_mul_x_pixel_size,
+    effect_radius = c.effect_radius, effect_falloff_range = c.effect_falloff_range,
+    radius_multiplier = c.radius_multiplier, sample_distribution_power = c.sample_distribution_power,
+    thin_occluder_compensation = c.thin_occluder_compensation, final_value_power = c.final_value_power,
+    depth_mip_sampling_offset = c.depth_mip_sampling_offset,
+    denoise_blur_beta = c.denoise_blur_beta, noise_index = c.noise_index }
 
 -- Linearize scene_depth (NDC) to viewspace depth. Sky (far plane) is pinned
 -- to CLIP_FAR so it stays finite and never reads as an occluder.
@@ -445,11 +460,11 @@ def gtao_main_pixel(scene: render_target<gbuffer>, constants: gtao.consts,
 -- Post-scene work is ordinary array computation. The compiler chooses and orders
 -- the physical compute stages because both maps read the scene render target and
 -- their values feed later work (or the next frame).
-def build_postprocess(scene: render_target<gbuffer>, resolution: vec3f32)
+def build_postprocess(scene: render_target<gbuffer>, resolution: vec3f32, jitter: vec2f32)
   ([]vec4f32, []f32) =
   let w = i32(resolution.x)
   let h = i32(resolution.y)
-  let c = gtao_consts(resolution)
+  let c = gtao_consts(resolution, jitter)
   let ao_work =
     map(|i| gtao_main_pixel(scene, c, @[i % w, i / w]), iota(w * h))
   let ow = occ_w(resolution)
@@ -521,7 +536,7 @@ def shade_frame_linear(scene: render_target<gbuffer>, sun_grid: []vec4f32,
     let specular = if frame.textures_enabled == 0u32 then v3(0.0)
                    else sun_specular(n, normalize(cam_eye(o) - pg), f32.clamp(alb.w * 2.0 - 1.0, 0.0, 1.0), sun)
     let ao = if ao_off then 0.0
-             else let (aov, _e) = denoise_ao(@[pixel_x, pixel_y], occlusion_samples, gtao_consts(resl)) in 1.0 - aov
+             else let (aov, _e) = denoise_ao(@[pixel_x, pixel_y], occlusion_samples, gtao_consts(resl, frame.jitter)) in 1.0 - aov
     let p = pg + n * SH_LIFT
     let shc = contact_shadow(scene, p, n, resl, o, sun)
     let shm_frac = sun_shadow_aa(sun_grid, pg, n, resl, o)
@@ -554,8 +569,8 @@ def opaque_fragment(inputs: lighting_inputs, frame: frame_globals,
                      _front_facing: bool, _primitive_index: u32, _sample_index: u32) vec4f32 =
   let xy = @[i32(position.x), i32(position.y)] in
   let opaque = shade_frame_linear(inputs.scene, inputs.sun_grid, inputs.ao_work, inputs.indirect, inputs.waves, frame, xy.x, xy.y)
-  let color = tonemap_aces(opaque.xyz) in
-  @[color.x, color.y, color.z, 1.0]
+  let depth = if opaque.w == 0.0 then 0.0 else linear_depth(target_load(inputs.scene, xy, 0u32).depth) in
+  @[opaque.x, opaque.y, opaque.z, depth]
 
 -- Shared opaque-depth state for scene and reflection draws. Physical attachments,
 -- barriers, pipeline order, and indirect command dependencies are derived from
@@ -622,6 +637,9 @@ entry tinyporto_frame(
     shadow_grid: []vec4f32,
     reflection: render_target<vec4f32>,
     scene: render_target<gbuffer>,
+    hdr: render_target<vec4f32>,
+    taa_previous: render_target<vec4f32>,
+    taa_next: render_target<vec4f32>,
     surface: render_target<vec4f32>)
     ([]f32, []vec2f32, []vec4f32, []f32, []f32, []gi.sample,
      []scene_trace.node, []vec4f32, []gi.sample, []gi.sample,
@@ -657,16 +675,15 @@ entry tinyporto_frame(
     |value, _, _, _, _| prop_fragment(frame, maps, visible.prop_inst, value))
 
   -- Estimate ambient occlusion and save coarse depth for the next frame.
-  let (ambient_occlusion, next_occlusion) = build_postprocess(scene_image, frame.resolution)
+  let (ambient_occlusion, next_occlusion) = build_postprocess(scene_image, frame.resolution, frame.jitter)
 
   let (indirect, trace_nodes, radiance, rays, temporal) =
     build_gi(scene_image, shadow_grid, terrain_cells, ambient_occlusion, gi_in, head_in, frame)
 
-  -- Resolve opaque lighting, then shade the visible water mesh directly into
-  -- the same image. Each surface is tone mapped once; the coarse reflection
-  -- capture remains linear until it is sampled here.
+  -- Composite lighting in linear HDR, reconstruct it temporally, then tone
+  -- map once at the display boundary.
   let pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
-  let opaque_image = shade(surface, pixels,
+  let opaque_image = shade(hdr, pixels,
     opaque_fragment({ scene = scene_image, sun_grid = shadow_grid,
                        ao_work = ambient_occlusion, indirect = indirect, waves = wave_vertices },
                      frame, _, _, _, _, _))
@@ -674,9 +691,18 @@ entry tinyporto_frame(
   let water_triangles = rasterize_triangles(
     indirect_draw(water_draw),
     water.mesh_vertex(water_cells, wave_vertices, frame.resolution, camera_from_frame(frame), _, _, _))
-  let image = shade_with(opaque_depth, opaque_image, water_triangles,
+  let composite = shade_with(opaque_depth, opaque_image, water_triangles,
     water.mesh_fragment(scene_image, shadow_grid, reflected_scene, reflection_sampler, frame.resolution,
-      camera_from_frame(frame), frame.time, _, _, _, _, _)) in
+      camera_from_frame(frame), frame.time, _, _, _, _, _))
+  let temporal_pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
+  let resolved = shade(taa_next, temporal_pixels, |_, position, _, _, _|
+    final_taa.resolve(composite, taa_previous, frame.resolution, camera_from_frame(frame),
+      previous_camera_from_frame(frame), frame.taa_enabled != 0u32, frame.taa_valid != 0u32,
+      @[i32(position.x), i32(position.y)]))
+  let display_pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
+  let image = shade(surface, display_pixels, |_, position, _, _, _|
+    let color = target_load(resolved, @[i32(position.x), i32(position.y)], 0u32).xyz
+    let mapped = tonemap_aces(color) in @[mapped.x, mapped.y, mapped.z, 1.0]) in
 
   (next_world.ui, next_world.points, next_world.items, next_world.head,
    next_occlusion, indirect, trace_nodes, radiance, rays, temporal,

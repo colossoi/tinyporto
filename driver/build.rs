@@ -57,6 +57,9 @@ fn main() {
     } else {
         println!("cargo:rerun-if-changed={}", repo.join("wyn.toml").display());
         track_sources(&repo.join("wyn"));
+        let taa = repo.join("pkg/taa");
+        println!("cargo:rerun-if-changed={}", taa.join("wyn.toml").display());
+        track_sources(&taa.join("src"));
         for package in PACKAGES {
             let path = repo.join("../wyn/pkg").join(package);
             println!("cargo:rerun-if-changed={}", path.join("wyn.toml").display());

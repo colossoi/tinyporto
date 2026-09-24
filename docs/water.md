@@ -18,7 +18,7 @@ so adjacent cells meet exactly; interpolated normals give smooth pixel shading.
 The GPU compacts wet cells touching the camera frustum into an indirect draw.
 Rasterization and depth testing produce the moving contact with masonry.
 
-The water mesh shades directly into the final image and reuses the hardware
+The water mesh shades into the composited HDR image and reuses the hardware
 scene depth attachment after opaque geometry. The original opaque depth image
 remains intact for AO and GI. It uses no surface, reflection or refraction ray marches, no world
 tracing fallback, and no temporal reflection history.
@@ -37,7 +37,9 @@ The geometric sun-shadow grid controls the body lighting and sun glints.
 Four analytic box-visibility queries estimate shadow coverage across each
 pixel's surface footprint. Direct sun glints vanish in full shadow; reflected
 sky and sunlit masonry may remain bright. Body colour, reflection, glints and
-the contact highlight are combined before tone mapping.
+the contact highlight are combined before final-image TAA and
+tone mapping. The TAA adapter marks water as reactive to limit trails from
+animated shading; there is no separate temporal reflection history.
 
 The grid covers all building and bank casters and is retained across frames.
 Terrain edits regenerate its geometry; sun changes rebuild its projection and
@@ -88,7 +90,7 @@ whole frame, including opaque geometry and GI, rather than water alone.
 The GPU water test reconstructs the rendered mesh from hardware depth and
 checks its heights against the shared height grid within a millimetre. It
 verifies moving water/wall contact while opaque depth stays unchanged, and
-byte-identical output when returning to a fixed time with GI disabled. It also
+byte-identical output when returning to a fixed time with GI and TAA disabled. It also
 checks odd-sized resizing and that all-land terrain leaves no water depth.
 Reflection checks require masonry, dark faces and sky, a stable capture while
 only waves animate, and an updated capture when the camera moves.

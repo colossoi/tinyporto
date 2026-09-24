@@ -1,0 +1,73 @@
+-- Tiny Porto's image/camera adapter. The local TAA package only sees values.
+import "camera"
+import "pkg:taa"
+
+module final_taa = {
+  def pixel_clamp(p: vec2i32, size: vec3f32) vec2i32 =
+    @[i32.min(i32.max(p.x, 0), i32(size.x) - 1), i32.min(i32.max(p.y, 0), i32(size.y) - 1)]
+
+  -- Reciprocal view depth is affine on a projected plane. Prefer the less
+  -- discontinuous one-sided derivative instead of interpolating silhouettes.
+  def depth_slope(center: f32, before: f32, after: f32) f32 =
+    let a = if before * center > 0.0 then 1.0 / center - 1.0 / before else 1e10
+    let b = if after * center > 0.0 then 1.0 / after - 1.0 / center else 1e10
+    let slope = if f32.abs(a) < f32.abs(b) then a else b in
+    if f32.abs(slope * center) < 0.1 then slope else 0.0
+
+  def stable_depth(current: render_target<vec4f32>, size: vec3f32,
+                   pixel: vec2i32, jitter: vec2f32) f32 =
+    let z = target_load(current, pixel, 0u32).w in
+    if z == 0.0 then 0.0 else
+      let left = target_load(current, pixel_clamp(pixel + @[-1, 0], size), 0u32).w
+      let right = target_load(current, pixel_clamp(pixel + @[1, 0], size), 0u32).w
+      let up = target_load(current, pixel_clamp(pixel + @[0, -1], size), 0u32).w
+      let down = target_load(current, pixel_clamp(pixel + @[0, 1], size), 0u32).w in
+      1.0 / (1.0 / z + depth_slope(z, left, right) * jitter.x + depth_slope(z, up, down) * jitter.y)
+
+  -- RGB and signed depth both live on the unjittered grid. Water has negative
+  -- depth; sky has zero. These application conventions stay outside pkg/taa.
+  def resolve(current: render_target<vec4f32>, previous: render_target<vec4f32>,
+              size: vec3f32, camera: orbit, previous_camera: orbit,
+              enabled: bool, valid: bool, pixel: vec2i32) vec4f32 =
+    let center = target_load(current, pixel, 0u32) in
+    if !enabled then center
+    else
+      let jitter = @[camera.jitter.x * size.x * 0.5, camera.jitter.y * size.y * -0.5]
+      let neighbors = loop n = taa.empty for k < 9 do
+          let offset = @[k % 3 - 1, k / 3 - 1]
+          let sample = target_load(current, pixel_clamp(pixel + offset, size), 0u32) in
+          taa.add(n, sample.xyz, @[f32(offset.x), f32(offset.y)], jitter)
+      let depth = stable_depth(current, size, pixel, jitter)
+      let sample_pixel = @[f32(pixel.x) + 0.5, f32(pixel.y) + 0.5]
+      let (eye, ray) = get_ray(size, @[sample_pixel.x, size.y - sample_pixel.y], unjittered(camera))
+      let point = if depth == 0.0 then cam_eye(previous_camera) + ray * 100.0
+                  else eye + ray * (f32.abs(depth) / f32.max(0.0001, dot(ray, normalize(camera.target - eye))))
+      let (history_pixel, visible) = project_pixel(point, size, unjittered(previous_camera))
+      let motion = magnitude(history_pixel - sample_pixel)
+      let corner = @[i32(f32.floor(history_pixel.x - 0.5)), i32(f32.floor(history_pixel.y - 0.5))]
+      let fraction = history_pixel - @[f32(corner.x) + 0.5, f32(corner.y) + 0.5]
+      let expected = dot(point - cam_eye(previous_camera), normalize(previous_camera.target - cam_eye(previous_camera)))
+      let history = loop sum = @[0.0, 0.0, 0.0, 0.0] for k < 4 do
+        let xy = corner + @[k % 2, k / 2]
+        let old = target_load(previous, pixel_clamp(xy, size), 0u32)
+        let inside = xy.x >= 0 && xy.y >= 0 && xy.x < i32(size.x) && xy.y < i32(size.y)
+        -- Stationary silhouettes alternate coverage with jitter, not occlusion.
+        -- Color clipping still responds to edits and animated lighting.
+        let same_surface = motion < 0.05 ||
+          (if depth == 0.0 then old.w == 0.0
+           else old.w * depth > 0.0 && taa.depth_agrees(f32.abs(old.w), expected, 0.04, 0.003))
+        let weight = if inside && same_surface then
+          (if k % 2 == 0 then 1.0 - fraction.x else fraction.x) *
+          (if k / 2 == 0 then 1.0 - fraction.y else fraction.y) else 0.0 in
+        sum + @[old.x * weight, old.y * weight, old.z * weight, weight]
+      let moving = f32.clamp(motion / 2.0, 0.0, 1.0)
+      let filtered_history = loop sum = @[0.0, 0.0, 0.0] for k < 16 do
+        let offset = @[k % 4 - 1, k / 4 - 1]
+        let old = target_load(previous, pixel_clamp(corner + offset, size), 0u32)
+        let w = taa.history_filter(f32(offset.x) - fraction.x) * taa.history_filter(f32(offset.y) - fraction.y) in
+        sum + old.xyz * w
+      let color = taa.resolve(neighbors, filtered_history,
+        valid && visible && history.w > 0.05, mix(0.025, 0.12, moving),
+        if center.w < 0.0 then 0.3 else 0.0, mix(2.5, 1.25, moving)) in
+      @[color.x, color.y, color.z, depth]
+}

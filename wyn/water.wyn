@@ -142,7 +142,8 @@ module water = {
     let color = mix(body, reflected, fresnel) + SUN_COLOR * sparkle in
     mix(color, @[0.38, 0.42, 0.37], foam)
 
-  -- Shade visible mesh fragments directly into the final image. The opaque
+  -- Shade visible mesh fragments into HDR. Negative linear depth marks reactive
+  -- water for temporal reconstruction. The opaque
   -- depth image remains intact for GI and the one-sample contact highlight.
   def mesh_fragment(scene: render_target<gbuffer>, sun_grid: []vec4f32,
                       reflection: render_target<vec4f32>, filtering: sampler,
@@ -154,6 +155,6 @@ module water = {
     else
       let view = value.point - cam_eye(camera)
       let hit = { point = value.point, direction = normalize(view), normal = normalize(value.normal), t = magnitude(view) }
-      let color = tonemap_aces(compose(scene, sun_grid, reflection, filtering, resolution, camera, pixel, hit, time)) in
-      #depth(@[color.x, color.y, color.z, 1.0], position.z)
+      let color = compose(scene, sun_grid, reflection, filtering, resolution, camera, pixel, hit, time) in
+      #depth(@[color.x, color.y, color.z, 0.0 - linear_depth(position.z)], position.z)
 }
