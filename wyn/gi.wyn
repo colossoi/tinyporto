@@ -54,6 +54,9 @@ module gi = {
     red: vec4f32, green: vec4f32, blue: vec4f32, guide: vec4f32,
   }
   def HISTORY: f32 = 32.0
+  -- Retained paint edit window. Reference restarts only on its first frame;
+  -- realtime history stays mature wherever surface validation succeeds.
+  def EDIT_TRACK_FRAMES: f32 = 16.0
   def width(resolution: vec3f32, reference: bool) i32 =
     if reference then i32(resolution.x) else (i32(resolution.x) + 1) / 2
   def height(resolution: vec3f32, reference: bool) i32 =
@@ -201,24 +204,26 @@ module gi = {
        else with_sh(surface, r / weight, g / weight, b / weight, 1.0)
 
   def accumulate(current: sample, history: []sample, resolution: vec3f32,
-                 previous_camera: orbit, history_valid: bool, reference: bool) sample =
+                 previous_camera: orbit, history_valid: bool, reference: bool,
+                 history_limit: f32) sample =
     let old_index = history_index(current, history, resolution, previous_camera, history_valid, reference) in
     if current.position.w < 0.5 || old_index < 0 then copy(current)
     else
       let old = history[old_index]
-      let count = f32.min(if reference then 4096.0 else HISTORY, old.light.w + 1.0)
+      let count = f32.min(history_limit, old.light.w + 1.0)
       let alpha = if current.light.w > 0.5 then 1.0 / count else 0.0
       let rgb = mix(old.light.xyz, current.light.xyz, alpha) in
       if reference then
         { light = @[rgb.x, rgb.y, rgb.z, count], position = current.position,
           normal = current.normal, red = zero, green = zero, blue = zero, guide = current.guide }
       else with_sh(current, mix(old.red, current.red, alpha), mix(old.green, current.green, alpha),
-                       mix(old.blue, current.blue, alpha), if alpha > 0.0 then count else old.light.w)
+                       mix(old.blue, current.blue, alpha),
+                       if alpha > 0.0 then count else f32.min(old.light.w, history_limit))
 
   def temporal_pixel(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node, cells: []vec4f32,
                      ao: []vec4f32, radiance: []vec4f32, rays: []sample, history: []sample,
                      resolution: vec3f32, camera: orbit, previous_camera: orbit, frame_index: u32,
-                     history_valid: bool, enabled: bool, reference: bool, index: i32) sample =
+                     history_valid: bool, edit_frames: f32, enabled: bool, reference: bool, index: i32) sample =
     if !enabled then empty
     else
       let w = width(resolution, reference)
@@ -234,10 +239,16 @@ module gi = {
                     surface.position.xyz, surface.normal.xyz, seed + u32(k) * 8u32) * 0.125
         let sample = { light = @[light.x, light.y, light.z, 1.0], position = surface.position,
                        normal = surface.normal, red = zero, green = zero, blue = zero, guide = surface.guide } in
-        accumulate(sample, history, resolution, previous_camera, history_valid, true)
+        -- Reference averages must describe one scene: reset only on the first
+        -- frame showing each committed edit, not on input or settling frames.
+        accumulate(sample, history, resolution, previous_camera,
+                   history_valid && edit_frames < EDIT_TRACK_FRAMES, true, 4096.0)
       else
         let current = reconstruct(surface, rays, resolution, camera, pixel, frame_index)
-        let temporal = accumulate(current, history, resolution, previous_camera, history_valid, false) in
+        -- A paint commit must not increase sample noise or widen the recurrent
+        -- filter across untouched surfaces. Rejected surfaces restart locally.
+        let temporal = accumulate(current, history, resolution, previous_camera,
+                                  history_valid, false, HISTORY) in
         if temporal.light.w > 0.5 then copy(temporal)
         -- Deterministic gap fill after both spatial reconstruction and reprojection
         -- fail. An extra fresh ray avoids same-dispatch read/write races.

@@ -42,16 +42,17 @@ type stroke_head = {
   dir: vec2f32,
   last: vec2f32,
   have_dir: f32,
+  edit_frames: f32, -- remaining frames in the committed-paint tracking window
 }
 
 def stroke_head_from_buffer(xs: []f32) stroke_head =
   { point_count = i32(xs[0]), item_count = i32(xs[1]), held = xs[2],
     anchor = @[xs[3], xs[4]], dir = @[xs[5], xs[6]], last = @[xs[7], xs[8]],
-    have_dir = xs[9] }
+    have_dir = xs[9], edit_frames = xs[10] }
 
 def pack_stroke_head(h: stroke_head) [12]f32 =
   [f32(h.point_count), f32(h.item_count), h.held, h.anchor.x, h.anchor.y,
-   h.dir.x, h.dir.y, h.last.x, h.last.y, h.have_dir, 0.0, 0.0]
+   h.dir.x, h.dir.y, h.last.x, h.last.y, h.have_dir, h.edit_frames, 0.0]
 
 -- Screen pixel -> ground-plane point (same ray as the rendered cursor). `py` is
 -- top-left pixel Y (as events carry it); flip to the bottom-left ray convention.
@@ -117,14 +118,22 @@ def capture_stroke_points(previous_head: stroke_head, events: []vec4f32,
         else (anchor, dir, last, hd, 0.0, press, ec, em)
       else (anchor, dir, last, hd, held, press, ec, em) in
   { head = { point_count = previous_head.point_count, item_count = previous_head.item_count,
-             anchor = anchor, dir = dir, last = last, have_dir = hd, held = held },
+             anchor = anchor, dir = dir, last = last, have_dir = hd, held = held,
+             edit_frames = previous_head.edit_frames },
     pressed = press, emitted_count = ec, emitted = em }
 
 -- Counts stop at the fixed buffer capacities, even if capture emits more points.
-def record_capture_progress(previous_head: stroke_head, capture: stroke_capture) stroke_head =
+def record_capture_progress(previous_head: stroke_head, capture: stroke_capture,
+                            edit_track_frames: f32) stroke_head =
+  -- Only committed paint starts an edit window. Hover, sub-threshold motion,
+  -- and building drags emit no points; exhausted buffers cannot accept an edit.
+  let changed = capture.emitted_count > 0 && previous_head.point_count < POINTS_CAP
+                && (if capture.pressed > 0.5 then previous_head.item_count < ITEMS_CAP
+                    else previous_head.item_count > 0) in
   { point_count = if previous_head.point_count + capture.emitted_count < POINTS_CAP
                   then previous_head.point_count + capture.emitted_count else POINTS_CAP,
     item_count = if capture.pressed > 0.5 && previous_head.item_count < ITEMS_CAP
                  then previous_head.item_count + 1i32 else previous_head.item_count,
     held = capture.head.held, anchor = capture.head.anchor, dir = capture.head.dir,
-    last = capture.head.last, have_dir = capture.head.have_dir }
+    last = capture.head.last, have_dir = capture.head.have_dir,
+    edit_frames = if changed then edit_track_frames else f32.max(0.0, previous_head.edit_frames - 1.0) }

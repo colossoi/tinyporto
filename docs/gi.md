@@ -112,9 +112,21 @@ occlusion and GI. Later outputs expose BVH nodes, linear radiance, sparse rays
 and temporal data for diagnosis. GI uses seven float4s (112 bytes) per
 half-resolution pixel; reference history is full resolution. The ray buffer
 uses the same layout at quarter resolution. Current outputs never overwrite
-history inputs. Resizing and painting invalidate history; reference-mode
-changes recreate it. Two frames are invalidated for paint edits because the
-frame renders the previous world state.
+history inputs. Resizing and material-mode changes invalidate history;
+reference-mode changes recreate it. Paint input no longer resets realtime GI.
+Committed paint points/items start a 16-frame tracking window in the retained
+stroke head (slot 10 of the existing 12-float buffer). GI reads that head with
+the rendered world, so the edit marker arrives one frame after capture, exactly
+when the edit becomes visible. No CPU readback is needed. Hover, motion that emits
+no control point, and building drags do not restart the window.
+
+Realtime GI retains its normal 32-frame cap during painting. Existing surface
+position, normal and material checks reject mismatched history locally. A
+global edit no longer increases fresh-sample weight or widens the recurrent
+filter on untouched surfaces. Indirect lighting affected by nearby paint can
+take longer to converge with the normal cap, and the revised visual result
+still needs validation. Reference mode discards history on the first frame
+rendering each edit, then resumes its normal progressive average.
 
 The remaining differences from Tiny Glade are explicit:
 
@@ -137,8 +149,11 @@ The remaining differences from Tiny Glade are explicit:
 
 The Vulkan GPU integration test checks screen hits, BVH hits and sky misses;
 warm color bounce and sky occlusion inside the brick rooms; history age and
-non-aliasing; camera reprojection; mode switches; odd-size resizing; and edit
-invalidation. It compares realtime indirect lighting after 40 frames against
+non-aliasing; camera reprojection; mode switches; and odd-size resizing. Added
+paint regressions cover mature history on untouched surfaces, edit timing,
+no-op pointer motion, and reference-mode invalidation; these additions have not
+yet been run (compilation was intentionally skipped). The existing comparison checks
+realtime indirect lighting after 40 frames against
 512-path-per-pixel reference lighting at the same primary pixels. The measured
 relative RGB RMS error in that 80x60 scene is about 0.157 with surface textures;
 this is one regression

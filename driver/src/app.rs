@@ -275,7 +275,6 @@ pub struct Renderer {
     start: Instant,
     previous_camera: Camera,
     gi_reset_frames: u32,
-    paint_held: bool,
     previous_textures_enabled: bool,
 }
 
@@ -324,7 +323,6 @@ impl Renderer {
             start: Instant::now(),
             previous_camera: *cam,
             gi_reset_frames: 1,
-            paint_held: false,
             previous_textures_enabled: true,
         })
     }
@@ -356,19 +354,8 @@ impl Renderer {
         let mut padded = [[0f32; 4]; EV_CAP];
         let count = events.len().min(EV_CAP);
         padded[..count].copy_from_slice(&events[..count]);
-        for event in &events[..count] {
-            let kind = event[0] as u32 / 256;
-            if kind == crate::EV_MOUSEDOWN && event[1] == 0.0 {
-                self.paint_held = true;
-                self.gi_reset_frames = 2;
-            } else if kind == crate::EV_MOUSEUP && event[1] == 0.0 {
-                self.paint_held = false;
-                self.gi_reset_frames = 2;
-            } else if kind == crate::EV_MOUSEMOVE && self.paint_held {
-                // The frame renders the previous world, so edits invalidate two frames.
-                self.gi_reset_frames = 2;
-            }
-        }
+        // Wyn tracks committed paint edits alongside the retained world and
+        // invalidates reference GI when they are rendered. Raw input never resets GI.
         self.gfx
             .queue
             .write_buffer(&self.events, 0, bytemuck::cast_slice(&padded));
@@ -685,6 +672,7 @@ mod tests {
         let head = read_buffer(&renderer.gfx, &renderer.world.head).unwrap();
         assert_eq!(f32::from_le_bytes(head[..4].try_into().unwrap()), 1.0);
         assert_eq!(f32::from_le_bytes(head[4..8].try_into().unwrap()), 1.0);
+        assert_eq!(paint_edit_frames(&renderer), 16.0);
         let items = read_buffer(&renderer.gfx, &renderer.world.items).unwrap();
         assert_eq!(f32::from_le_bytes(items[..4].try_into().unwrap()), 2.0);
         let points = read_buffer(&renderer.gfx, &renderer.world.points).unwrap();
@@ -697,9 +685,10 @@ mod tests {
         renderer.execute(&target, &cam, 0, 0.0).unwrap();
         assert_eq!(read_buffer(&renderer.gfx, &renderer.world.ui).unwrap(), ui);
         assert_eq!(
-            read_buffer(&renderer.gfx, &renderer.world.head).unwrap(),
-            head
+            &read_buffer(&renderer.gfx, &renderer.world.head).unwrap()[..40],
+            &head[..40]
         );
+        assert_eq!(paint_edit_frames(&renderer), 15.0);
         assert_eq!(
             read_buffer(&renderer.gfx, &renderer.world.points).unwrap(),
             points
@@ -720,9 +709,10 @@ mod tests {
         let resized = offscreen(&renderer.gfx);
         renderer.execute(&resized, &cam, 0, 0.0).unwrap();
         assert_eq!(
-            read_buffer(&renderer.gfx, &renderer.world.head).unwrap(),
-            head
+            &read_buffer(&renderer.gfx, &renderer.world.head).unwrap()[..40],
+            &head[..40]
         );
+        assert_eq!(paint_edit_frames(&renderer), 14.0);
         assert_eq!(
             read_buffer(&renderer.gfx, &renderer.world.points).unwrap(),
             points
@@ -738,6 +728,11 @@ mod tests {
         let items = read_buffer(&renderer.gfx, &renderer.world.items).unwrap();
         assert_eq!(f32::from_le_bytes(items[16..20].try_into().unwrap()), 3.0);
         assert_eq!(renderer.frame, 4);
+    }
+
+    fn paint_edit_frames(renderer: &Renderer) -> f32 {
+        let head = read_buffer(&renderer.gfx, &renderer.world.head).unwrap();
+        f32::from_le_bytes(head[40..44].try_into().unwrap())
     }
 
     fn gi_samples(renderer: &Renderer) -> Vec<[f32; 28]> {
@@ -866,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn gi_accumulates_reprojects_and_invalidates_history() {
+    fn gi_accumulates_reprojects_and_adapts_to_paint() {
         let gfx = Gfx::new_headless(80, 60).expect("GPU device");
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], 0.6, -1.1, 25.0);
@@ -1023,13 +1018,77 @@ mod tests {
         renderer.execute(&resized, &cam, 0, 0.0).unwrap();
         assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
 
+        for _ in 0..32 {
+            renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        }
+        // Hover cannot disturb mature lighting history.
+        renderer.upload_events(&[encode_event(crate::EV_MOUSEMOVE, 0, 0.0, 30.0, 27.0)]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 0.0);
+        assert!(gi_samples(&renderer).iter().any(|p| p[3] == 32.0));
+
+        // Capturing paint still renders the previous world. Once it is visible,
+        // untouched surfaces must retain mature history and the narrow filter.
+        renderer.upload_events(&[encode_event(EV_MOUSEDOWN, 0, 0.0, 30.0, 27.0)]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 16.0);
+        assert!(gi_samples(&renderer).iter().any(|p| p[3] == 32.0));
+        renderer.upload_events(&[encode_event(crate::EV_MOUSEMOVE, 0, 0.0, 30.0, 27.0)]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 15.0);
+        let edited = gi_samples(&renderer);
+        assert!(edited.iter().all(|p| p[3] <= 32.0));
+        assert!(edited.iter().any(|p| p[3] == 32.0));
+
+        // The first moved sample establishes a direction; the second commits a
+        // span. Both this extension and the final release point mark an edit.
+        renderer.upload_events(&[
+            encode_event(crate::EV_MOUSEMOVE, 0, 0.0, 44.0, 27.0),
+            encode_event(crate::EV_MOUSEMOVE, 0, 0.0, 65.0, 27.0),
+        ]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 16.0);
+        assert!(gi_samples(&renderer).iter().any(|p| p[3] > 1.0));
+        renderer.upload_events(&[encode_event(crate::EV_MOUSEUP, 0, 0.0, 65.0, 27.0)]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 16.0);
+
+        // Continued pointer motion with no new paint must let the window expire.
+        renderer.upload_events(&[encode_event(crate::EV_MOUSEMOVE, 0, 0.0, 65.0, 27.0)]);
+        for remaining in (0..16).rev() {
+            renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+            assert_eq!(paint_edit_frames(&renderer), remaining as f32);
+            let samples = gi_samples(&renderer);
+            assert!(samples.iter().all(|p| p[3] <= 32.0));
+            assert!(samples.iter().any(|p| p[3] == 32.0));
+            assert!(samples.iter().flatten().all(|v| v.is_finite()));
+        }
+        for _ in 0..32 {
+            renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        }
+        assert!(gi_samples(&renderer).iter().any(|p| p[3] == 32.0));
+
+        // Reference mode resets only when a committed edit is first rendered.
+        // Building drags and release emit no extra paint and must not reset it.
+        renderer.gi_mode = 3;
+        renderer.upload_events(&[encode_event(crate::EV_KEYDOWN, 0, 1.0, 0.0, 0.0)]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        renderer.upload_events(&[]);
         renderer.execute(&resized, &cam, 0, 0.0).unwrap();
         renderer.upload_events(&[encode_event(EV_MOUSEDOWN, 0, 0.0, 40.0, 27.0)]);
         renderer.execute(&resized, &cam, 0, 0.0).unwrap();
-        assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
-        renderer.upload_events(&[]);
+        assert!(gi_samples(&renderer).iter().any(|p| p[3] > 1.0));
+        renderer.upload_events(&[encode_event(crate::EV_MOUSEMOVE, 0, 0.0, 50.0, 27.0)]);
         renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 15.0);
         assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 14.0);
+        assert!(gi_samples(&renderer).iter().any(|p| p[3] > 1.0));
+        renderer.upload_events(&[encode_event(crate::EV_MOUSEUP, 0, 0.0, 50.0, 27.0)]);
+        renderer.execute(&resized, &cam, 0, 0.0).unwrap();
+        assert_eq!(paint_edit_frames(&renderer), 13.0);
+        assert!(gi_samples(&renderer).iter().any(|p| p[3] > 2.0));
     }
 
     #[test]

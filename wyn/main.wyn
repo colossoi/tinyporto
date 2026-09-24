@@ -127,7 +127,7 @@ def update_world(frame: frame_globals, events: []vec4f32, previous_world: world)
   { ui = pack_ui_state(next_ui),
     points = append_captured_points(previous_world.points, head.point_count, capture),
     items = create_or_extend_item(previous_world.items, head, capture, ui.tool),
-    head = pack_stroke_head(record_capture_progress(head, capture)) }
+    head = pack_stroke_head(record_capture_progress(head, capture, gi.EDIT_TRACK_FRAMES)) }
 
 ------------------------------------------------------------
 -- Coarse-depth occlusion. Each tile stores the nearest surface depth from the
@@ -560,11 +560,15 @@ def opaque_depth: fragment_state = {
 }
 
 def build_gi(scene_image: render_target<gbuffer>, sun_depth: render_target<f32>,
-                cells: []vec4f32, ambient_occlusion: []vec4f32, gi_in: []gi.sample, frame: frame_globals)
+                cells: []vec4f32, ambient_occlusion: []vec4f32, gi_in: []gi.sample,
+                head_in: []f32, frame: frame_globals)
   ([]gi.sample, []scene_trace.node, []vec4f32, []gi.sample, []gi.sample) =
   -- Tiny Glade's hybrid final gather: detailed screen tracing, BVH fallback,
   -- quarter-resolution rays, SH reconstruction, temporal reuse, recurrent blur.
   -- The reference mode traces explicit paths and bypasses SH/spatial filtering.
+  -- Read the retained head, just like the rendered paint: reference invalidation
+  -- follows visible edits one frame after capture, without a CPU readback.
+  let edit_frames = stroke_head_from_buffer(head_in).edit_frames
   let trace_nodes = map(scene_trace.build_node, iota(scene_trace.NODE_COUNT))
   let radiance = map(|i| gi.screen_radiance(scene_image, sun_depth, trace_nodes, cells,
     ambient_occlusion, gi_in, frame.resolution, camera_from_frame(frame),
@@ -577,7 +581,7 @@ def build_gi(scene_image: render_target<gbuffer>, sun_depth: render_target<f32>,
     iota(gi.trace_width(frame.resolution) * gi.trace_height(frame.resolution)))
   let temporal = map(|i| gi.temporal_pixel(scene_image, sun_depth, trace_nodes, cells,
     ambient_occlusion, radiance, rays, gi_in, frame.resolution, camera_from_frame(frame),
-    previous_camera_from_frame(frame), frame.frame_index, frame.history_valid != 0u32,
+    previous_camera_from_frame(frame), frame.frame_index, frame.history_valid != 0u32, edit_frames,
     frame.gi_mode != 1u32 && (frame.mods & 4u32) == 0u32, frame.gi_mode == 3u32, i),
     iota(length(gi_in)))
   let indirect = map(|i| gi.recurrent_pixel(temporal, frame.resolution,
@@ -634,7 +638,7 @@ entry tinyporto_frame(
   let (ambient_occlusion, next_occlusion) = build_postprocess(scene_image, frame.resolution)
 
   let (indirect, trace_nodes, radiance, rays, temporal) =
-    build_gi(scene_image, sun_depth, terrain_cells, ambient_occlusion, gi_in, frame)
+    build_gi(scene_image, sun_depth, terrain_cells, ambient_occlusion, gi_in, head_in, frame)
 
   -- Light every pixel of the finished image.
   let pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
