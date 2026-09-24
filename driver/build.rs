@@ -1,4 +1,7 @@
-//! Compile and include Wyn's Rust/WGPU host module and its sibling SPIR-V.
+//! Prepare embedded material maps and compile Wyn's Rust/WGPU host and SPIR-V.
+
+#[path = "build/materials.rs"]
+mod materials;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,6 +49,8 @@ fn main() {
         println!("cargo:rerun-if-env-changed={name}");
     }
 
+    materials::build(repo, &out).expect("prepare material textures");
+
     if let Some(directory) = std::env::var_os("WYN_PRECOMPILED_DIR") {
         let directory = PathBuf::from(directory);
         for extension in ["rs", "spv"] {
@@ -57,6 +62,7 @@ fn main() {
     } else {
         println!("cargo:rerun-if-changed={}", repo.join("wyn.toml").display());
         track_sources(&repo.join("wyn"));
+        track_sources(&repo.join("assets/vehicles/fiat-500/scene"));
         let taa = repo.join("pkg/taa");
         println!("cargo:rerun-if-changed={}", taa.join("wyn.toml").display());
         track_sources(&taa.join("src"));

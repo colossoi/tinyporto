@@ -6,6 +6,7 @@ mod materials;
 mod shadow;
 mod temporal;
 mod terrain;
+mod vehicle;
 include!(concat!(env!("OUT_DIR"), "/module.rs"));
 
 use anyhow::Result;

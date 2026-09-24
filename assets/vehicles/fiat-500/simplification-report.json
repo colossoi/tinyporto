@@ -1,0 +1,323 @@
+{
+  "source_triangles": 498649,
+  "source_bytes": 14798552,
+  "removed": [
+    {
+      "name": "Front Bumper Holders",
+      "triangles": 4608
+    },
+    {
+      "name": "Rear Bumper Holders",
+      "triangles": 4608
+    },
+    {
+      "name": "Front Rollbar",
+      "triangles": 508
+    },
+    {
+      "name": "Rear Rollbar",
+      "triangles": 508
+    },
+    {
+      "name": "Interior Black",
+      "triangles": 510
+    },
+    {
+      "name": "Driver Seat",
+      "triangles": 4784
+    },
+    {
+      "name": "Passenger Seat",
+      "triangles": 4784
+    },
+    {
+      "name": "Steering Wheel",
+      "triangles": 3712
+    }
+  ],
+  "meshes": [
+    {
+      "name": "Main Chassis_Body Color_0",
+      "before": 63520,
+      "after": 6000
+    },
+    {
+      "name": "Hood_Body Color_0",
+      "before": 8059,
+      "after": 1200
+    },
+    {
+      "name": "Roof_Body Color_0",
+      "before": 7936,
+      "after": 1200
+    },
+    {
+      "name": "Back Vent_Body Color_0",
+      "before": 32768,
+      "method": "smooth exterior shell, baked slot shadows in color texture",
+      "after": 117,
+      "texture_size": [
+        512,
+        128
+      ]
+    },
+    {
+      "name": "Trunk_Body Color_0",
+      "before": 29792,
+      "method": "smooth exterior shell, baked slot shadows in color texture",
+      "after": 253,
+      "texture_size": [
+        512,
+        512
+      ]
+    },
+    {
+      "name": "Doors_Body Color_0",
+      "before": 20416,
+      "after": 1998
+    },
+    {
+      "name": "Front Headlights_Headlight Glass_0",
+      "before": 16800,
+      "after": 672,
+      "method": "evenly spaced circular rings"
+    },
+    {
+      "name": "Front Orange Lights_Orange Glass_0",
+      "before": 14240,
+      "after": 140
+    },
+    {
+      "name": "Front Side Lights_Orange Glass_0",
+      "before": 2720,
+      "after": 80
+    },
+    {
+      "name": "Front Side Lights Chrome_Chrome_0",
+      "before": 3840,
+      "after": 100
+    },
+    {
+      "name": "Front Headlight Chrome_Chrome_0",
+      "before": 18688,
+      "after": 992,
+      "method": "evenly spaced circular rings"
+    },
+    {
+      "name": "Rear Trunk Chrome_Chrome_0",
+      "before": 896,
+      "after": 68
+    },
+    {
+      "name": "Tail Lights Chrome_Chrome_0",
+      "before": 3456,
+      "after": 120
+    },
+    {
+      "name": "Tail Lights Red_Headlight Glass Rear_0",
+      "before": 3840,
+      "after": 120
+    },
+    {
+      "name": "Tail Lights Chrome Parts_Chrome_0",
+      "before": 14976,
+      "after": 158
+    },
+    {
+      "name": "Tail Lights Hazard_Hazard Light Glass Rear_0",
+      "before": 1664,
+      "after": 100
+    },
+    {
+      "name": "Door Handles_Chrome_0",
+      "before": 6272,
+      "after": 158
+    },
+    {
+      "name": "Side Mirror Stands_Chrome_0",
+      "before": 4736,
+      "after": 100
+    },
+    {
+      "name": "Side Mirrors_Chrome_0",
+      "before": 6400,
+      "after": 160
+    },
+    {
+      "name": "Front Bumper_Chrome_0",
+      "before": 4736,
+      "after": 240
+    },
+    {
+      "name": "Front Bumper Screws_Chrome_0",
+      "before": 5120,
+      "after": 48
+    },
+    {
+      "name": "Front Logo Chrome.001_Chrome_0",
+      "before": 1792,
+      "after": 78
+    },
+    {
+      "name": "Front Logo Chrome_Logo Color_0",
+      "before": 5888,
+      "after": 120
+    },
+    {
+      "name": "Rear Trunk Bumper_Body Color_0",
+      "before": 3520,
+      "after": 160
+    },
+    {
+      "name": "Rear Bumper_Chrome_0",
+      "before": 3456,
+      "after": 220
+    },
+    {
+      "name": "Rear Bumper Screws_Chrome_0",
+      "before": 5120,
+      "after": 48
+    },
+    {
+      "name": "Rear License Plate_License Plate Border_0",
+      "before": 4416,
+      "after": 100
+    },
+    {
+      "name": "Rear License Plate_License Plate_0",
+      "before": 960,
+      "after": 30
+    },
+    {
+      "name": "Rear License Plate_License Plate Blue_0",
+      "before": 384,
+      "after": 32
+    },
+    {
+      "name": "Rear Trunk Handle_Chrome_0",
+      "before": 11040,
+      "after": 80
+    },
+    {
+      "name": "FL-Tire_Tires_0",
+      "before": 28546,
+      "after": 1536
+    },
+    {
+      "name": "FL-Rim_Rims_0",
+      "before": 8832,
+      "after": 1200
+    },
+    {
+      "name": "BL-Tire_Tires_0",
+      "before": 28546,
+      "after": 1536
+    },
+    {
+      "name": "BL-Rim_Rims_0",
+      "before": 8832,
+      "after": 1200
+    },
+    {
+      "name": "FR-Tire_Tires_0",
+      "before": 28546,
+      "after": 1536
+    },
+    {
+      "name": "FR-Rim_Rims_0",
+      "before": 8832,
+      "after": 1200
+    },
+    {
+      "name": "BR-Tire_Tires_0",
+      "before": 28546,
+      "after": 1536
+    },
+    {
+      "name": "BR-Rim_Rims_0",
+      "before": 8832,
+      "after": 1200
+    },
+    {
+      "name": "Front Screws_Body Color_0",
+      "before": 3200,
+      "after": 48
+    },
+    {
+      "name": "Rear Window Border_Black Plastic_0",
+      "before": 1536,
+      "after": 140
+    },
+    {
+      "name": "Rear Side WIndow Borders_Black Plastic_0",
+      "before": 2880,
+      "after": 240
+    },
+    {
+      "name": "Front Side Windows Chrome_Chrome_0",
+      "before": 4480,
+      "after": 280
+    },
+    {
+      "name": "Front WIndow_Glass_0",
+      "before": 2304,
+      "after": 158
+    },
+    {
+      "name": "Front Side WIndows_Glass_0",
+      "before": 1344,
+      "after": 120
+    },
+    {
+      "name": "Rear Side Windows_Glass_0",
+      "before": 1152,
+      "after": 100
+    },
+    {
+      "name": "Rear Window_Glass_0",
+      "before": 512,
+      "after": 80
+    },
+    {
+      "name": "Side Mirrors Glass_Mirror_0",
+      "before": 256,
+      "after": 48
+    },
+    {
+      "name": "Wheel Well FL_Body Paint",
+      "before": 0,
+      "after": 92,
+      "method": "painted arch return and recessed inner panel",
+      "arch_points": 32,
+      "tire_clearance_source_units": 0.08
+    },
+    {
+      "name": "Wheel Well FR_Body Paint",
+      "before": 0,
+      "after": 92,
+      "method": "painted arch return and recessed inner panel",
+      "arch_points": 32,
+      "tire_clearance_source_units": 0.08
+    },
+    {
+      "name": "Wheel Well BL_Body Paint",
+      "before": 0,
+      "after": 80,
+      "method": "painted arch return and recessed inner panel",
+      "arch_points": 28,
+      "tire_clearance_source_units": 0.08
+    },
+    {
+      "name": "Wheel Well BR_Body Paint",
+      "before": 0,
+      "after": 80,
+      "method": "painted arch return and recessed inner panel",
+      "arch_points": 28,
+      "tire_clearance_source_units": 0.08
+    }
+  ],
+  "license_plate_clearance_adjustment": 0.006973794937133789,
+  "output_triangles": 27394,
+  "output_bytes": 864048,
+  "triangle_reduction_percent": 94.51
+}

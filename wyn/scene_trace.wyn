@@ -1,4 +1,4 @@
--- Hybrid scene visibility: screen-space detail, then a BVH over wall footprints.
+-- Hybrid visibility: screen-space detail, a wall BVH, and bounded vehicle proxies.
 -- Scene geometry/material policy lives here; intersection math lives in ray.
 import "walls"
 import "math"
@@ -8,6 +8,7 @@ import "paint"
 import "ray"
 import "screen_trace"
 import "terrain"
+import "vehicle"
 
 module scene_trace = {
 
@@ -72,7 +73,9 @@ module scene_trace = {
           else if !leaf then (index * 2 + 1, t, n, wall_hit)
           else if hit_t < t then (next_node(index), hit_t, normal, true)
           else (next_node(index), t, n, wall_hit)
-    in { t = t, normal = n,
+    let (car_t, car_normal, car_color) = vehicle.trace(ro, rd, t)
+    in if car_t < t then { t = car_t, normal = car_normal, albedo = car_color }
+       else { t = t, normal = n,
          albedo = if wall_hit then mix((BRICK_BASE + BRICK_BASE2) * 0.5, GROUT_COLOR, 0.12)
                    else ground.albedo }
 

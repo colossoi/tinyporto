@@ -1,0 +1,78 @@
+{
+  "original": {
+    "triangles": 498649,
+    "meshes": 55,
+    "bytes": 14798552,
+    "degenerate_triangles": 0,
+    "rear_panels": {},
+    "images": [],
+    "bounds": [
+      [
+        -1.682150481507798,
+        0.0035592682969725065,
+        -3.6895276329371387
+      ],
+      [
+        1.6821486420282796,
+        3.4815385667551735,
+        4.042269637715954
+      ]
+    ],
+    "sha256": "19e2e531afaf92adcfbd94f48243928bff4b02320228409dc06b85aceacc4d98"
+  },
+  "simplified": {
+    "triangles": 27394,
+    "meshes": 51,
+    "bytes": 864048,
+    "degenerate_triangles": 0,
+    "rear_panels": {
+      "Back Vent_Body Color_0 smooth shell continuous surface": {
+        "triangles": 117,
+        "boundary_loops": 1,
+        "vent_holes": 0
+      },
+      "Trunk_Body Color_0 smooth shell continuous surface": {
+        "triangles": 253,
+        "boundary_loops": 1,
+        "vent_holes": 0
+      }
+    },
+    "images": [
+      {
+        "name": "rear-vent base color",
+        "size": [
+          512,
+          128
+        ],
+        "embedded": true
+      },
+      {
+        "name": "engine-cover base color",
+        "size": [
+          512,
+          512
+        ],
+        "embedded": true
+      }
+    ],
+    "bounds": [
+      [
+        -1.6820200681686401,
+        0.0028378739953041077,
+        -3.6886940002441406
+      ],
+      [
+        1.6820200681686401,
+        3.481508255004883,
+        4.041252136230469
+      ]
+    ],
+    "sha256": "f887d0054e96882b68aa027c7c8c5bd190e283be259e51c9735530111cbaed1f"
+  },
+  "max_bounds_change_source_units": 0.0010175014854851838,
+  "source_matches_download": true,
+  "windows_opaque": true,
+  "all_four_wheels_retained": true,
+  "interior_and_undercarriage_meshes_absent": true,
+  "geometry_checks_passed": true
+}

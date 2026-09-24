@@ -332,6 +332,7 @@ pub struct Renderer {
     targets: Targets,
     temporal: TemporalState,
     materials: Materials,
+    vehicle: crate::vehicle::Vehicle,
     reflection_sampler: wgpu::Sampler,
     terrain: wgpu::Buffer,
     terrain_cells: Vec<[f32; 4]>,
@@ -381,7 +382,8 @@ impl Renderer {
             world: World::new(&gfx.device, w, h),
             targets: Targets::new(&gfx.device, w, h),
             temporal: TemporalState::new(&gfx.device, w, h),
-            materials: Materials::new(&gfx.device, &gfx.queue).context("load surface textures")?,
+            materials: Materials::new(&gfx.device, &gfx.queue),
+            vehicle: crate::vehicle::Vehicle::new(&gfx.device, &gfx.queue).context("load Fiat")?,
             reflection_sampler: gfx.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("filtered water reflection"),
                 mag_filter: wgpu::FilterMode::Linear,
@@ -610,6 +612,11 @@ impl Renderer {
             &self.materials.stone.normal,
             &self.materials.mortar.color,
             &self.materials.mortar.normal,
+            &self.vehicle.vertices,
+            &self.vehicle.indices,
+            &self.vehicle.vent,
+            &self.vehicle.engine,
+            &self.vehicle.sampler,
             &self.materials.sampler,
             &self.reflection_sampler,
             self.shadows.grid.as_ref().context("sun grid is missing")?,
@@ -625,6 +632,8 @@ impl Renderer {
             self.temporal.output(),
             target,
             &self.targets.reflection_z,
+            &self.targets.reflection_z,
+            &self.targets.scene_z,
             &self.targets.scene_z,
             &self.targets.scene_z,
             &self.targets.scene_z,
@@ -1214,7 +1223,9 @@ mod tests {
                 > 100,
             "roughness must be packed into surface alpha"
         );
-        assert!(textured.chunks_exact(4).all(|p| p[3] == 0 || p[3] >= 185));
+        // Vehicle paint/glass can be smoother than masonry. The G-buffer's
+        // surface tag is 0.5 + 0.5 * roughness, including roughness near zero.
+        assert!(textured.chunks_exact(4).all(|p| p[3] == 0 || p[3] >= 128));
         assert!(
             gi_samples(&renderer).iter().all(|p| p[3] <= 1.0),
             "material changes must invalidate lighting history"
@@ -1230,6 +1241,84 @@ mod tests {
         assert_eq!(color, image_bytes(&renderer.gfx, &renderer.targets.albedo));
         assert_eq!(normal, image_bytes(&renderer.gfx, &renderer.targets.normal));
         assert!(gi_samples(&renderer).iter().all(|p| p[3] <= 1.0));
+    }
+
+    #[test]
+    fn fiat_mesh_has_opaque_windows_textured_rear_panels_and_sun_shadow() {
+        let (width, height) = (640, 480);
+        let gfx = Gfx::new_headless(width, height).expect("GPU device");
+        let mut cam = Camera::default();
+        cam.set([3.0, 0.65, 2.1], 0.6, -0.4, 9.0);
+        let mut renderer = fixed_sample_renderer(gfx, &cam);
+        renderer.gi_mode = 1;
+        let target = offscreen(&renderer.gfx);
+        for (name, azimuth) in [("fiat-front", 0.6), ("fiat-rear", -2.15)] {
+            cam.set([3.0, 0.65, 2.1], azimuth, -0.4, 9.0);
+            renderer.textures_enabled = false;
+            renderer.execute(&target, &cam, 0, 0.0).unwrap();
+            let flat = image_bytes(&renderer.gfx, &renderer.targets.albedo);
+            renderer.textures_enabled = true;
+            for _ in 0..3 {
+                renderer.execute(&target, &cam, 0, 0.0).unwrap();
+            }
+            let albedo = image_bytes(&renderer.gfx, &renderer.targets.albedo);
+            let depths = image_depths(&renderer.gfx, &renderer.targets.depth);
+            let eye = cam.eye();
+            let mut forward: [f32; 3] = std::array::from_fn(|i| cam.target[i] - eye[i]);
+            let length = forward.iter().map(|x| x * x).sum::<f32>().sqrt();
+            forward.iter_mut().for_each(|x| *x /= length);
+            let (mut paint, mut windows, mut vent_texels) = (0, 0, 0);
+            for (i, rgba) in albedo.chunks_exact(4).enumerate() {
+                let (_, ray) = cam.cursor_ray(
+                    width as f32,
+                    height as f32,
+                    (i % width as usize) as f32 + 0.5,
+                    (i / width as usize) as f32 + 0.5,
+                );
+                let cosine = ray.iter().zip(forward).map(|(a, b)| a * b).sum::<f32>();
+                let view_depth = 100.0 / (1000.0 - depths[i] * 999.9);
+                let p: [f32; 3] =
+                    std::array::from_fn(|axis| eye[axis] + ray[axis] * view_depth / cosine);
+                let dx = p[0] - 3.0;
+                let dz = p[2] - 2.1;
+                let x = dx * 0.12f32.cos() - dz * 0.12f32.sin();
+                let z = dz * 0.12f32.cos() + dx * 0.12f32.sin();
+                let on_car = x.abs() < 0.66 && z.abs() < 1.51 && p[1] > 0.25 && p[1] < 1.42;
+                if rgba[0] > 100 && rgba[1] < 15 && rgba[2] < 15 && on_car {
+                    paint += 1;
+                }
+                if rgba[..3] == [14, 19, 24] {
+                    assert!(on_car && p[1] > 0.90, "window must write opaque car depth");
+                    windows += 1;
+                }
+                if on_car
+                    && z < -1.02
+                    && x.abs() < 0.38
+                    && (0.47..1.02).contains(&p[1])
+                    && rgba[..3] != flat[i * 4..i * 4 + 3]
+                {
+                    vent_texels += 1;
+                }
+            }
+            assert!(paint > 1000, "{name}: missing red mesh ({paint})");
+            assert!(windows > 100, "{name}: missing opaque glass ({windows})");
+            if name == "fiat-rear" {
+                assert!(
+                    vent_texels > 100,
+                    "rear panel texture missing ({vent_texels})"
+                );
+            }
+            save_quality_frame(name, &renderer.gfx, &target);
+        }
+        renderer.set_sun_direction([0.0, 1.0, 0.0]).unwrap();
+        assert_eq!(
+            shadow_queries(
+                &mut renderer,
+                &[[3.0, 0.06, 2.1, 0.0], [4.4, 0.06, 2.1, 0.0]]
+            ),
+            [1.0, 0.0],
+            "car must cast a geometric shadow onto the cobbles"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ import "terrain"
 import "banks"
 import "water"
 import "water_reflection"
+import "vehicle"
 import "pkg:gfx"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
@@ -630,6 +631,8 @@ entry tinyporto_frame(
     brick_color: texture2d, brick_normal: texture2d,
     stone_color: texture2d, stone_normal: texture2d,
     mortar_color: texture2d, mortar_normal: texture2d,
+    vehicle_vertices: []vehicle.mesh_vertex, vehicle_indices: []u32,
+    vehicle_vent: texture2d, vehicle_engine: texture2d, vehicle_sampler: sampler,
     material_sampler: sampler,
     reflection_sampler: sampler,
     events: []vec4f32,
@@ -653,6 +656,7 @@ entry tinyporto_frame(
                stone_color = stone_color, stone_normal = stone_normal,
                mortar_color = mortar_color, mortar_normal = mortar_normal,
                filtering = material_sampler }
+  let car_maps = { vent = vehicle_vent, engine = vehicle_engine, filtering = vehicle_sampler }
 
 
   let reflection_pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
@@ -660,19 +664,29 @@ entry tinyporto_frame(
     |_, position, _, _, _| water_reflection.sky(frame.resolution, camera_from_frame(frame), position, shadow_sun(shadow_grid)))
   let reflection_triangles = rasterize_triangles(direct_draw(36u32, u32(PROP_WALLS + banks.COUNT)),
     reflection_vertex(frame, masonry, _, _, _))
-  let reflected_scene = shade_with(opaque_depth, reflection_sky, reflection_triangles,
+  let reflected_masonry = shade_with(opaque_depth, reflection_sky, reflection_triangles,
     |value, position, _, _, _| water_reflection.fragment(shadow_grid, frame.resolution, value, position))
+  let reflected_car = rasterize_triangles(direct_draw(vehicle.INDEX_COUNT, 1u32),
+    vehicle.vertex(vehicle_vertices, vehicle_indices, frame.resolution, camera_from_frame(frame), true, _, _, _))
+  let reflected_scene = shade_with(opaque_depth, reflected_masonry, reflected_car,
+    |value, position, _, _, _| vehicle.reflection_fragment(car_maps, shadow_grid, frame.resolution,
+      camera_from_frame(frame), value, position))
 
-  -- Fill the scene G-buffer with the ground, then the visible props.
+  -- Fill the shared G-buffer with ground, visible props and the car mesh.
   let ground_triangles = rasterize_triangles(
     direct_draw(u32(TESS_CAP + 6), 1u32),
     scene_vertex(frame, { points = points_in, items = items_in }, _, _, _))
   let ground_image = shade_with(opaque_depth, scene, ground_triangles, scene_fragment(terrain_cells, _, _, _, _, _))
   let prop_triangles = rasterize_triangles(
     indirect_draw(visible.draw), prop_vertex(frame, visible.prop_inst, _, _, _))
-  let scene_image = shade_with(
+  let props_image = shade_with(
     opaque_depth, ground_image, prop_triangles,
     |value, _, _, _, _| prop_fragment(frame, maps, visible.prop_inst, value))
+  let car_triangles = rasterize_triangles(direct_draw(vehicle.INDEX_COUNT, 1u32),
+    vehicle.vertex(vehicle_vertices, vehicle_indices, frame.resolution, camera_from_frame(frame), false, _, _, _))
+  let scene_image = shade_with(opaque_depth, props_image, car_triangles,
+    |value, position, _, _, _| vehicle.fragment(car_maps, frame.resolution,
+      camera_from_frame(frame), frame.textures_enabled != 0u32, value, position))
 
   -- Estimate ambient occlusion and save coarse depth for the next frame.
   let (ambient_occlusion, next_occlusion) = build_postprocess(scene_image, frame.resolution, frame.jitter)
@@ -708,15 +722,17 @@ entry tinyporto_frame(
    next_occlusion, indirect, trace_nodes, radiance, rays, temporal,
    shadow_grid, scene_image, image, wave_vertices, wave_heights, reflected_scene)
 
--- Export the same caster boxes as the visible masonry, only when it changes.
+-- Export masonry boxes and the car's interior shadow proxies on geometry changes.
 -- Four records per slot: center/radius, then basis axis/half extent.
 entry shadow_geometry(terrain_cells: []vec4f32) []vec4f32 =
   map(|i|
-    let p = masonry_prop(terrain_cells, i / 4) in
+    let slot = i / 4
+    let p = if slot < PROP_WALLS + banks.COUNT then masonry_prop(terrain_cells, slot)
+            else vehicle.proxy(slot - PROP_WALLS - banks.COUNT) in
     if i % 4 == 0 then @[p.center.x, p.center.y, p.center.z, p.radius]
     else if i % 4 == 1 then @[p.right.x, p.right.y, p.right.z, p.half.x]
     else if i % 4 == 2 then @[p.up.x, p.up.y, p.up.z, p.half.y]
-    else @[p.fwd.x, p.fwd.y, p.fwd.z, p.half.z], iota((PROP_WALLS + banks.COUNT) * 4))
+    else @[p.fwd.x, p.fwd.y, p.fwd.z, p.half.z], iota((PROP_WALLS + banks.COUNT + vehicle.PROXIES) * 4))
 
 -- Diagnostic queries use precisely the same visibility function as rendering.
 entry shadow_visibility(shadow_grid: []vec4f32, points: []vec4f32) []f32 =

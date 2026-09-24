@@ -1,0 +1,30 @@
+[
+  {
+    "wheel": "FL",
+    "triangles": 92,
+    "body_paint_shared": true,
+    "tire_intersections": 0,
+    "backing_ray_checks": 9
+  },
+  {
+    "wheel": "FR",
+    "triangles": 92,
+    "body_paint_shared": true,
+    "tire_intersections": 0,
+    "backing_ray_checks": 9
+  },
+  {
+    "wheel": "BL",
+    "triangles": 80,
+    "body_paint_shared": true,
+    "tire_intersections": 0,
+    "backing_ray_checks": 9
+  },
+  {
+    "wheel": "BR",
+    "triangles": 80,
+    "body_paint_shared": true,
+    "tire_intersections": 0,
+    "backing_ray_checks": 9
+  }
+]

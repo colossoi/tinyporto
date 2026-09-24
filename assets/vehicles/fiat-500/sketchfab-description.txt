@@ -1,0 +1,21 @@
+Fiat 500 (1970) - Simplified Exterior v3
+
+27,394 triangles. Simplified exterior with opaque windows and four wheels.
+Both rear vent areas are smooth panels with embedded color/shadow textures.
+The headlights have round lenses, circular chrome rims and simple reflectors.
+Four shallow inner fender wells use the existing body paint and close the
+openings behind the wheels, with clearance around the tires.
+Cabin details, the floor and undercarriage components have been removed.
+
+Based on "Fiat 500 - 1970 Model" by Parsa Farvadian:
+https://sketchfab.com/parsafarvadian
+
+Original model:
+https://sketchfab.com/3d-models/fiat-500-1970-model-213cd126fcd744809fb7996eb88366f5
+
+Original licensed under Creative Commons Attribution 4.0 International (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/
+
+Modified for Tiny Porto: reduced geometry, simplified wheels, removed interior
+and undercarriage, made cabin windows opaque, replaced geometric vents with
+textures, rebuilt round headlights, and added painted wheel-well liners. Original modeling credit: Parsa Farvadian.

@@ -1,0 +1,101 @@
+-- The Fiat is rasterized as an indexed mesh. Secondary rays use small interior
+-- boxes behind one enclosing bound, shared with the geometric sun-shadow export.
+import "camera"
+import "render_types"
+import "bricks"
+import "ray"
+import "water_reflection"
+import "../assets/vehicles/fiat-500/scene/mesh"
+
+module vehicle = {
+  def INDEX_COUNT: u32 = FIAT_INDEX_COUNT
+  -- prepare_scene.py converts the source asset to metres and grounds its tires.
+  def POSITION: vec3f32 = @[3.0, 0.06, 2.1]
+  def YAW: f32 = 0.12
+  def BODY: vec3f32 = @[0.476987, 0.027548, 0.022691]
+  def PROXIES: i32 = 6
+
+  def orient(p: vec3f32) vec3f32 =
+    @[p.x * f32.cos(YAW) + p.z * f32.sin(YAW), p.y,
+      p.z * f32.cos(YAW) - p.x * f32.sin(YAW)]
+  def unorient(p: vec3f32) vec3f32 =
+    @[p.x * f32.cos(YAW) - p.z * f32.sin(YAW), p.y,
+      p.z * f32.cos(YAW) + p.x * f32.sin(YAW)]
+  def world(p: vec3f32) vec3f32 = POSITION + orient(p)
+
+  -- Four aligned vec4s match scene/vertices.bin (64 bytes per vertex).
+  type mesh_vertex = {
+    position: vec4f32, -- xyz position; w roughness
+    normal: vec4f32,   -- xyz normal; w texture (0 solid, 1 vent, 2 engine cover)
+    color: vec4f32,
+    uv: vec4f32,
+  }
+  type varying = {
+    world: vec3f32, normal: vec3f32, color: vec3f32,
+    uv: vec2f32, roughness: f32, texture: f32,
+  }
+  type maps = { vent: texture2d, engine: texture2d, filtering: sampler }
+
+  def vertex(vertices: []mesh_vertex, indices: []u32, resolution: vec3f32,
+               camera: orbit, reflected: bool, vertex_index: u32,
+               _instance_index: u32, _draw_index: u32) vertex<varying> =
+    let v = vertices[i32(indices[i32(vertex_index)])]
+    let p = world(v.position.xyz)
+    let clip = if reflected then water_reflection.project(p, resolution, camera)
+               else world_to_clip(p, resolution, camera) in
+    vertex_output(clip, { world = p, normal = orient(v.normal.xyz), color = v.color.xyz,
+                         uv = v.uv.xy, roughness = v.position.w, texture = v.normal.w })
+
+  def albedo(maps: maps, value: varying, resolution: vec3f32,
+               camera: orbit, textured: bool) vec3f32 =
+    if value.texture < 0.5 then value.color
+    else if !textured then BODY
+    else
+      -- Explicit LOD, matching the other scene materials. Both maps are 512 wide.
+      let footprint = 2.0 * f32.tan(f32.radians(FOV * 0.5))
+                      * distance(value.world, cam_eye(camera)) / resolution.y
+      let lod = f32.max(0.0, f32.log2(f32.max(1.0, footprint * 650.0)))
+      let texel = if value.texture < 1.5 then texture_sample(maps.vent, maps.filtering, value.uv, lod)
+                  else texture_sample(maps.engine, maps.filtering, value.uv, lod) in
+      value.color * texel.xyz
+
+  def fragment(maps: maps, resolution: vec3f32, camera: orbit, textured: bool,
+                 value: varying, position: vec4f32) fragment_output<gbuffer> =
+    let color = albedo(maps, value, resolution, camera, textured) in
+    #depth({ albedo = @[color.x, color.y, color.z, 0.5 + 0.5 * value.roughness],
+             normal = octahedral.encode(normalize(value.normal)), depth = position.z }, position.z)
+
+  def reflection_fragment(maps: maps, grid: []vec4f32, resolution: vec3f32,
+                            camera: orbit, value: varying, position: vec4f32) fragment_output<vec4f32> =
+    water_reflection.fragment(grid, resolution,
+      { point = value.world, normal = value.normal,
+        albedo = albedo(maps, value, water_reflection.resolution(resolution), camera, true) }, position)
+
+  def local_proxy(i: i32) (vec3f32, vec3f32) =
+    if i == 0 then (@[0.0, 0.56, -0.05], @[0.49, 0.23, 1.23])
+    else if i == 1 then (@[0.0, 1.01, -0.18], @[0.36, 0.23, 0.63])
+    else (@[if i % 2 == 0 then -0.571 else 0.571, 0.263,
+            if i < 4 then 0.990 else -0.900], @[0.045, 0.185, 0.185])
+
+  def proxy(i: i32) prop =
+    let (center, half) = local_proxy(i) in
+    { center = world(center), half = half, radius = 0.0,
+      right = orient(@[1.0, 0.0, 0.0]), up = @[0.0, 1.0, 0.0],
+      fwd = orient(@[0.0, 0.0, 1.0]),
+      albedo = if i < 2 then BODY else @[0.02, 0.02, 0.02], material = 0u32 }
+
+  -- The enclosing box is only a rejection test, never a visible surface.
+  def trace(origin: vec3f32, direction: vec3f32, limit: f32) (f32, vec3f32, vec3f32) =
+    let ro = unorient(origin - POSITION)
+    let rd = unorient(direction)
+    let (near, far, _) = ray.box(ro, rd, @[-0.654, 0.0, -1.5], @[0.654, 1.351, 1.5], 0.002) in
+    if far < f32.max(near, 0.002) || near >= limit then (limit, v3(0.0), v3(0.0))
+    else
+      loop (t, normal, color) = (limit, v3(0.0), v3(0.0)) for i < PROXIES do
+        let (center, half) = local_proxy(i)
+        let (a, b, n) = ray.box(ro, rd, center - half, center + half, 0.002)
+        let hit_t = if a < 0.002 then b else a in
+        if b >= f32.max(a, 0.002) && hit_t < t then
+          (hit_t, orient(n), if i < 2 then BODY else @[0.02, 0.02, 0.02])
+        else (t, normal, color)
+}

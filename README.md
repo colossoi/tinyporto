@@ -7,6 +7,10 @@ The simulation and rendering live in `wyn/main.wyn` and its imported modules.
 Wyn generates the Rust/WGPU host that executes the complete frame. `driver/`
 provides the window, input events, orbit camera, initial state, and render targets.
 
+The default scene includes a simplified Fiat 500 parked beside the right-hand
+building. Its mesh, textures, rebuild steps and CC BY 4.0 creator attribution are
+in [assets/vehicles/fiat-500](assets/vehicles/fiat-500/README.md).
+
 ## Build & run
 
 Requires a current `wyn` compiler on `PATH` and a sibling `../wyn` checkout for
@@ -18,7 +22,7 @@ cargo run                              # opens a window
 cargo run -- --frames 5                # render five window frames, then exit
 cargo run -- --fps 144                 # override the default 60 Hz cap
 cargo run -- --fps -                   # run uncapped
-cargo run -- --screenshot scene.png    # headless demo scene
+cargo run -- --screenshot scene.png    # headless demo scene, including the Fiat
 cargo run -- --gi off                   # compare with the previous ambient model
 cargo run -- --gi indirect              # indirect light only
 cargo run -- --gi reference             # slower explicit path-traced comparison
@@ -110,8 +114,9 @@ See [GI design, comparison modes, and limitations](docs/gi.md).
 
 Brick, cobble, quoin, and mortar surfaces use CC0 color, normal, and roughness
 maps by default. [`assets/textures`](assets/textures/README.md) documents sources,
-checksums, mipmaps, and mapping. `driver/src/materials.rs` embeds and uploads the
-maps once; `wyn/material.wyn` evaluates them at each rounded-box surface hit.
+checksums, mipmaps, and mapping. Cargo prepares the maps and mipmaps at build
+time; `driver/src/materials.rs` embeds and uploads the prepared bytes once.
+`wyn/material.wyn` evaluates them at each rounded-box surface hit.
 `--no-textures` restores flat colors/geometric normals for comparison.
 
 Rounded-box props use a six-triangle proxy (18 vertices per instance). The vertex

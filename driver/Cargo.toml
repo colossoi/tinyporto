@@ -16,5 +16,16 @@ pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-# Decode material source maps and encode offscreen screenshots.
+# Encode offscreen screenshots.
 png = "0.17"
+
+[build-dependencies]
+anyhow = "1"
+png = "0.17"
+
+# The build script processes the source images; keep that work fast in both profiles.
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3

@@ -25,13 +25,20 @@ dimensions, bit depths, source MD5 checksums, and local SHA-256 checksums.
 All downloads matched the source MD5 checksums and successfully decoded at
 their expected dimensions. Color-map previews were visually inspected.
 
-## Runtime preparation
+## Build-time preparation
 
-[`driver/src/materials.rs`](../../driver/src/materials.rs) embeds the original
-PNGs so execution does not depend on the working directory. At initialization
-it decodes both 8-bit and 16-bit sources to 8-bit channels and builds GPU maps.
-No image library beyond the existing `png` dependency is needed. The source
-files on disk remain unchanged.
+[`driver/build/materials.rs`](../../driver/build/materials.rs) decodes the
+original 8-bit and 16-bit PNGs and prepares the final GPU bytes during the Cargo
+build. It writes the six maps, their mip chains, and Rust metadata into
+`OUT_DIR`. Cargo tracks the source PNGs and preparation code for rebuilding.
+The source files on disk remain unchanged.
+
+[`driver/src/materials.rs`](../../driver/src/materials.rs) embeds those prepared
+bytes. Startup only creates the textures and uploads each mip: it performs no
+PNG decoding, resampling, palette conversion, or mip generation. There is no
+runtime asset directory or writable cache to locate. The two vehicle color
+textures use the same build-time preparation and upload path. This preparation
+also runs when `WYN_PRECOMPILED_DIR` supplies the shader and generated host.
 
 - Eight brick-face interiors are resampled into 256x64 tiles in a 4x2 atlas.
   Color, normal, and roughness use exactly the same source rectangles. Every
