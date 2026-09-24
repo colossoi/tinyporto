@@ -76,8 +76,9 @@ def sett_basis(cx: f32, cz: f32) (vec3f32, vec3f32, vec3f32) =
   let fwd = cross(right, up) in
   (right, up, fwd)
 
--- Unit proxy box: x,z in [-0.5,0.5], y in [0,1]. Six faces, two triangles
--- per face, CCW from outside; the draw path scales and orients it per prop.
+-- Unit box: x,z in [-0.5,0.5], y in [0,1]. Opposite faces are paired,
+-- two triangles per face, CCW from outside. Reflections use the full box;
+-- rounded props select three camera-side faces with box_front_pos below.
 def box_pos: [36]vec3f32 =
   [-- +Y
    @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.5], @[0.5, 1.0, 0.5],
@@ -97,6 +98,18 @@ def box_pos: [36]vec3f32 =
    -- -Z
    @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.0 - 0.5, 1.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5],
    @[0.0 - 0.5, 0.0, 0.0 - 0.5], @[0.5, 1.0, 0.0 - 0.5], @[0.5, 0.0, 0.0 - 0.5]]
+
+def BOX_FRONT_VERTICES: u32 = 18u32
+
+-- Six-triangle proxy: one face from each local Y/X/Z pair. `eye` is the
+-- camera relative to the box centre in its local basis, so yaw and tilt do
+-- not affect face selection. Reuse the original vertices and outward winding.
+-- For an exterior camera these faces contain every possible ray-entry point.
+def box_front_pos(vertex_index: i32, eye: vec3f32) vec3f32 =
+  let pair = vertex_index / 6
+  let side = if pair == 0 then eye.y else if pair == 1 then eye.x else eye.z
+  let face = pair * 2 + (if side < 0.0 then 1 else 0) in
+  box_pos[face * 6 + vertex_index % 6]
 
 -- One rounded-box prop, shared by cobbles, wall bricks, quoins, and grout.
 -- Culling constructs these records only for surviving candidates; both vertex

@@ -107,6 +107,12 @@ checksums, mipmaps, and mapping. `driver/src/materials.rs` embeds and uploads th
 maps once; `wyn/material.wyn` evaluates them at each rounded-box surface hit.
 `--no-textures` restores flat colors/geometric normals for comparison.
 
+Rounded-box props use a six-triangle proxy (18 vertices per instance). The vertex
+shader selects one face from each opposing pair using the camera in the prop's
+local basis, including cobble tilt. Those three faces contain the ray entry points
+for an exterior camera; the fragment shader still traces the rounded surface and
+writes its true depth. The coarse reflection capture retains its full box meshes.
+
 ## Host integration
 
 `driver/src/app.rs` creates `generated::HostContext` once per renderer and passes

@@ -202,7 +202,7 @@ def prop_from_index(cells: []vec4f32, candidate_index: i32) prop =
   else banks.stone(cells, candidate_index - PROP_SETTS - PROP_WALLS)
 
 def prop_draw(instance_count: i32) draw_command =
-  { vertex_count = 36u32, instance_count = u32(instance_count),
+  { vertex_count = BOX_FRONT_VERTICES, instance_count = u32(instance_count),
     first_vertex = 0u32, first_instance = 0u32 }
 
 def cull_props(frame: frame_globals, cells: []vec4f32,
@@ -290,7 +290,7 @@ def scene_fragment(cells: []vec4f32, value: scene_varying, position: vec4f32,
 -- and wall bricks/quoins/grout are one stream of `prop` records, so ONE vertex +
 -- fragment pair draws them all. `cull_props` first compacts visible candidate indices,
 -- then resolves placement, orientation, roundness, and colour only for survivors.
--- The vertex places the proxy box; the fragment
+-- The vertex selects the three camera-side box faces (six triangles); the fragment
 -- sphere-traces the rounded box inside it, so the silhouette rounds per instance.
 -- The proxy's outer extent IS the rounded box's, so the trace starts on its front
 -- face. The wall blocks are real occluders for the cobbles.
@@ -312,7 +312,9 @@ def prop_vertex(frame: frame_globals, prop_instances: []prop,
   let vid = i32(vertex_index)
   let iid = i32(instance_index)
   let p = prop_instances[iid]
-  let world = prop_world(p, box_pos[vid]) in
+  let eye = gfx.transform.unorient(cam_eye(camera_from_frame(frame)) - p.center,
+                                  p.right, p.up, p.fwd)
+  let world = prop_world(p, box_front_pos(vid, eye)) in
   -- `iid` rides through as a varying: it is constant across the primitive, so any
   -- interpolation returns it unchanged, and the fragment re-reads the instance
   -- instead of carrying its whole record through the rasterizer. The compacted
