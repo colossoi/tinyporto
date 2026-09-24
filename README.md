@@ -75,8 +75,8 @@ A persistent generated `HostContext` creates the shader and compute
 pipelines once, caches render pipelines on first use, and reuses scratch buffers.
 Windowed startup prepares these pipelines on a worker while the loading window
 keeps processing events. Preparation records and discards a frame without
-advancing the world or consuming input. Backend selection follows WGPU and
-`WGPU_BACKEND`; there is no platform-specific override.
+advancing the world or consuming input. The driver builds and uses only Vulkan;
+DirectX support is excluded, and `WGPU_BACKEND` cannot override this selection.
 Returned world buffers remain separate allocations so the previous frame's
 inputs survive while the next frame is produced. Frame time includes generated
 command setup.
@@ -181,8 +181,8 @@ cargo run -- --width 320 --height 200 --screenshot scene.png
 
 The GPU integration tests exercise generated frame execution, retained state,
 event clearing, odd viewport dimensions, GI transport, temporal invalidation,
-and agreement with the explicit path reference. WGPU's `WGPU_BACKEND`
-environment variable can select a backend, for example `vulkan`.
+and agreement with the explicit path reference. Both windowed rendering and
+headless GPU tests use Vulkan.
 
 ## Wyn module idiom
 

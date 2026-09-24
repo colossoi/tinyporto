@@ -12,6 +12,13 @@ pub struct Gfx {
     pub config: wgpu::SurfaceConfiguration,
 }
 
+fn instance() -> wgpu::Instance {
+    let mut descriptor = wgpu::InstanceDescriptor::from_env_or_default();
+    // Keep validation/debug environment options, but always use Vulkan.
+    descriptor.backends = wgpu::Backends::VULKAN;
+    wgpu::Instance::new(&descriptor)
+}
+
 /// Request the storage limits needed by the generated frame function.
 async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
     let mut limits = wgpu::Limits::default();
@@ -76,7 +83,7 @@ impl Gfx {
 
     async fn new_async(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+        let instance = instance();
         let surface = instance
             .create_surface(window.clone())
             .context("create_surface")?;
@@ -88,7 +95,7 @@ impl Gfx {
                 force_fallback_adapter: false,
             })
             .await
-            .context("no suitable GPU adapter")?;
+            .context("no suitable Vulkan GPU adapter")?;
         let (device, queue) = request_device(&adapter).await?;
 
         let mut config = surface
@@ -114,7 +121,7 @@ impl Gfx {
     /// carries the offscreen format + size; sRGB so readback bytes are display-ready.
     pub fn new_headless(width: u32, height: u32) -> Result<Self> {
         pollster::block_on(async {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+            let instance = instance();
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -122,7 +129,7 @@ impl Gfx {
                     force_fallback_adapter: false,
                 })
                 .await
-                .context("no suitable GPU adapter")?;
+                .context("no suitable Vulkan GPU adapter")?;
             let (device, queue) = request_device(&adapter).await?;
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

@@ -9,8 +9,8 @@ name = "tinyporto"
 path = "src/main.rs"
 
 [dependencies]
-# `spirv` enables ShaderSource::SpirV (naga-validated SPIR-V ingest, cross-backend).
-wgpu = { version = "27", features = ["spirv"] }
+# Compile only Vulkan, with Naga-validated SPIR-V ingestion.
+wgpu = { version = "27", default-features = false, features = ["std", "parking_lot", "vulkan", "spirv"] }
 winit = "0.30"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
