@@ -31,14 +31,16 @@ separates an explicit path-traced reference from its shipping final-gather GI.
    **filtered** result, so this is a recurrent denoiser, not a final RGB blur.
 6. Cross-bilaterally reconstruct at full resolution and evaluate using
    hallucinated ZH3. Apply subtle additional AO (0.2), add direct light, then
-   tone map. Tonemapped pixels never enter the feedback path.
+   compose water and tone map. Tonemapped pixels never enter the feedback path.
 
 The source of the depth test is the talk author's
 [published marcher](https://gist.github.com/h3r2tic/9c8356bdaefbe80b1a22ae0aaee192db).
 It tests against the farther of point/bilinear depths and measures penetration
 against the nearer depth. That conservative test differs from the average-depth
 wording in the local notes. The implementation here uses metric view depth and
-our existing forward-Z projection.
+our existing forward-Z projection. Rays are transformed to homogeneous clip
+coordinates once and interpolated during marching and refinement. Point depth
+reuses the nearest of the four samples already loaded for bilinear depth.
 
 Directional reconstruction uses the shared-luminance-axis, curve-fit model from
 [ZH3: Quadratic Zonal Harmonics](https://www.ppsloan.org/publications/ZH3.pdf),
@@ -61,8 +63,8 @@ compiler without repeatedly prefixing definitions inside each namespace.
 | `sh.wyn` / `sh` | SH projection weights and ZH3 evaluation |
 | `camera.wyn` | Camera rays, projection and depth reconstruction |
 
-The primary prop renderer shares `ray.rounded_box`; ground picking, scene
-tracing and the water surface share `ray.plane_y`. Rounded-box tracing
+The primary prop renderer shares `ray.rounded_box`; ground picking and scene
+tracing share `ray.plane_y`. Rounded-box tracing
 keeps its exterior-only distance contract and caller-supplied step budget.
 Contact shadows retain their existing march and acceptance rules in
 `shadow.wyn`; consolidating them with the screen tracer would change behavior.
@@ -101,6 +103,10 @@ validity threshold. Direct GGX highlights are added only in final lighting;
 they do not enter diffuse radiance feedback. Off-screen proxies keep their
 coarse palette colors and geometric normals. `--no-textures` restores the
 original material evaluation and invalidates GI history when toggled.
+Opaque lighting resolves to the final image before the water mesh is drawn.
+Water shading and the animated wet band remain outside diffuse radiance
+feedback; see [water rendering](water.md). The screen tracer and world BVH remain
+part of GI; water no longer uses them.
 `build_gi` groups the array dependencies into one generated compute graph;
 separate top-level maps currently cause Wyn to expose disconnected producer
 outputs as new inputs. Reconstructing loaded records at branch joins also
@@ -161,7 +167,7 @@ scene, not a general accuracy estimate.
 
 The generated SPIR-V is validated with `spirv-val`. Realtime, indirect-only and
 reference screenshots were inspected at 640x480. Validation used Vulkan; the
-default Windows backend already exited abnormally before this GI change.
+water integration also checks responsive window startup and screenshot rendering.
 
 The installed release compiler on `PATH` now provides `encode_tinyporto_frame`.
 The combined changes pass with `WYN` and `WYN_PRECOMPILED_DIR` unset, using these

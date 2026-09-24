@@ -15,20 +15,21 @@ module gi = {
   def LIFT: f32 = 0.02
   def SKY: f32 = 0.4
 
-  def direct_light(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node, cells: []vec4f32,
+  def direct_light(scene: render_target<gbuffer>, sun_grid: []vec4f32, nodes: []scene_trace.node, cells: []vec4f32,
                    resolution: vec3f32, camera: orbit, p: vec3f32, n: vec3f32,
                    on_screen: bool) vec3f32 =
+    let sun = shadow_sun(sun_grid)
     let ndl = f32.max(0.0, dot(n, sun))
     let origin = p + n * LIFT
     let shadow = if ndl <= 0.0 then 1.0
-                 else if on_screen then f32.max(sun_shadow_pcf(sun_depth, origin, resolution.x, resolution.y),
-                                                 contact_shadow(scene, origin, n, resolution, camera))
+                 else if on_screen then f32.max(sun_shadow(sun_grid, p, n),
+                                                 contact_shadow(scene, origin, n, resolution, camera, sun))
                  else if scene_trace.world(nodes, cells, origin, sun).t < scene_trace.FAR then 1.0 else 0.0 in
     SUN_COLOR * (ndl * (1.0 - shadow))
 
   -- Independent three-segment reference integrator: cosine sampling, explicit
   -- bounces, no radiance feedback, SH projection or spatial denoising.
-  def reference_path(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
+  def reference_path(scene: render_target<gbuffer>, sun_grid: []vec4f32,
                      nodes: []scene_trace.node, cells: []vec4f32, resolution: vec3f32, camera: orbit,
                      p: vec3f32, normal: vec3f32, seed: u32) vec3f32 =
     let result = loop (ro, rd, throughput, light, active) =
@@ -37,10 +38,10 @@ module gi = {
       if !active then (ro, rd, throughput, light, false)
       else
         let hit = scene_trace.trace(scene, nodes, cells, resolution, camera, ro, rd) in
-        if !hit.hit then (ro, rd, throughput, light + throughput * clouds.sky(rd) * SKY, false)
+        if !hit.hit then (ro, rd, throughput, light + throughput * clouds.sky(rd, shadow_sun(sun_grid)) * SKY, false)
         else
           let weight = throughput * hit.albedo
-          let direct = direct_light(scene, sun_depth, nodes, cells, resolution, camera,
+          let direct = direct_light(scene, sun_grid, nodes, cells, resolution, camera,
                                   hit.point, hit.normal, hit.screen) in
           (hit.point + hit.normal * LIFT, hemisphere.direction(hit.normal, hemisphere.uniform2(seed + u32(bounce + 1) * 2u32), true),
            weight, light + weight * direct, true)
@@ -124,7 +125,7 @@ module gi = {
 
   -- Current linear screen radiance. Reproject only the indirect light; direct
   -- lighting and materials are current. Gather hits feed this back across frames.
-  def screen_radiance(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
+  def screen_radiance(scene: render_target<gbuffer>, sun_grid: []vec4f32,
                       nodes: []scene_trace.node, cells: []vec4f32, ao: []vec4f32, history: []sample,
                       resolution: vec3f32, camera: orbit, previous_camera: orbit,
                       history_valid: bool, enabled: bool, index: i32) vec4f32 =
@@ -137,20 +138,20 @@ module gi = {
         let old_index = history_index(surface, history, resolution, previous_camera, history_valid, false)
         let indirect = if old_index < 0 then v3(0.0)
                         else let old = history[old_index] in sh.evaluate(old.red, old.green, old.blue, surface.normal.xyz)
-        let direct = direct_light(scene, sun_depth, nodes, cells, resolution, camera,
+        let direct = direct_light(scene, sun_grid, nodes, cells, resolution, camera,
                                 surface.position.xyz, surface.normal.xyz, true)
         let albedo = target_load(scene, xy, 0u32).albedo.xyz
         let light = albedo * (direct + indirect * (0.8 + 0.2 * surface.guide.x)) in
         @[light.x, light.y, light.z, 1.0]
 
-  def gather(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node, cells: []vec4f32,
+  def gather(scene: render_target<gbuffer>, sun_grid: []vec4f32, nodes: []scene_trace.node, cells: []vec4f32,
              radiance: []vec4f32, resolution: vec3f32, camera: orbit,
              surface: sample, seed: u32) sample =
     let rd = hemisphere.direction(surface.normal.xyz, hemisphere.uniform2(seed), false)
     let hit = scene_trace.trace(scene, nodes, cells, resolution, camera, surface.position.xyz + surface.normal.xyz * LIFT, rd)
-    let incoming = if !hit.hit then clouds.sky(rd) * SKY
+    let incoming = if !hit.hit then clouds.sky(rd, shadow_sun(sun_grid)) * SKY
                     else if hit.screen then radiance[hit.pixel.y * i32(resolution.x) + hit.pixel.x].xyz
-                    else hit.albedo * direct_light(scene, sun_depth, nodes, cells, resolution, camera,
+                    else hit.albedo * direct_light(scene, sun_grid, nodes, cells, resolution, camera,
                                                  hit.point, hit.normal, false)
     -- Uniform hemisphere PDF = 1/(2*pi). Project radiance, not cosine-weighted
     -- irradiance, so normal-dependent evaluation remains possible after filtering.
@@ -161,7 +162,7 @@ module gi = {
       guide = @[surface.guide.x, 0.0, if hit.screen then 1.0 else 0.0, if hit.hit then 0.0 else 1.0] }
 
   -- One ray per 4x4 tile. Cycle primary locations to cover thin details over time.
-  def trace_pixel(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node, cells: []vec4f32,
+  def trace_pixel(scene: render_target<gbuffer>, sun_grid: []vec4f32, nodes: []scene_trace.node, cells: []vec4f32,
                   ao: []vec4f32, radiance: []vec4f32, resolution: vec3f32, camera: orbit,
                   frame_index: u32, index: i32, enabled: bool) sample =
     if !enabled then empty
@@ -172,7 +173,7 @@ module gi = {
                      i32.clamp(index / w * 4 + phase / 4, 0, i32(resolution.y) - 1)]
       let surface = load_surface(scene, ao, resolution, camera, pixel, false) in
       if surface.position.w < 0.5 then empty
-      else gather(scene, sun_depth, nodes, cells, radiance, resolution, camera, surface,
+      else gather(scene, sun_grid, nodes, cells, radiance, resolution, camera, surface,
                        u32(index) * 128u32 + frame_index * 1048576u32)
 
   def filter_weight(center: sample, sample: sample, reach: f32) f32 =
@@ -220,7 +221,7 @@ module gi = {
                        mix(old.blue, current.blue, alpha),
                        if alpha > 0.0 then count else f32.min(old.light.w, history_limit))
 
-  def temporal_pixel(scene: render_target<gbuffer>, sun_depth: render_target<f32>, nodes: []scene_trace.node, cells: []vec4f32,
+  def temporal_pixel(scene: render_target<gbuffer>, sun_grid: []vec4f32, nodes: []scene_trace.node, cells: []vec4f32,
                      ao: []vec4f32, radiance: []vec4f32, rays: []sample, history: []sample,
                      resolution: vec3f32, camera: orbit, previous_camera: orbit, frame_index: u32,
                      history_valid: bool, edit_frames: f32, enabled: bool, reference: bool, index: i32) sample =
@@ -235,7 +236,7 @@ module gi = {
       if surface.position.w < 0.5 then empty
       else if reference then
         let light = loop light = v3(0.0) for k < 8 do
-          light + reference_path(scene, sun_depth, nodes, cells, resolution, camera,
+          light + reference_path(scene, sun_grid, nodes, cells, resolution, camera,
                     surface.position.xyz, surface.normal.xyz, seed + u32(k) * 8u32) * 0.125
         let sample = { light = @[light.x, light.y, light.z, 1.0], position = surface.position,
                        normal = surface.normal, red = zero, green = zero, blue = zero, guide = surface.guide } in
@@ -252,7 +253,7 @@ module gi = {
         if temporal.light.w > 0.5 then copy(temporal)
         -- Deterministic gap fill after both spatial reconstruction and reprojection
         -- fail. An extra fresh ray avoids same-dispatch read/write races.
-        else gather(scene, sun_depth, nodes, cells, radiance, resolution, camera, surface, seed)
+        else gather(scene, sun_grid, nodes, cells, radiance, resolution, camera, surface, seed)
 
   -- Feed the filtered SH back into history. The kernel shrinks as history matures.
   def recurrent_pixel(temporal: []sample, resolution: vec3f32, camera: orbit,

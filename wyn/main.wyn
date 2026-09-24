@@ -31,6 +31,7 @@ import "material"
 import "terrain"
 import "banks"
 import "water"
+import "water_reflection"
 import "pkg:gfx"
 
 -- Per-frame globals: one std140 #[uniform] block the host fills once and every
@@ -50,7 +51,7 @@ type frame_globals = {
   cam_az: f32,
   cam_elev: f32,
   cam_dist: f32,
-  time: f32,          -- seconds since start, animates water normals
+  time: f32,          -- seconds since start, animates waves and water lighting
   previous_target: vec3f32,
   previous_az: f32,
   previous_elev: f32,
@@ -59,6 +60,7 @@ type frame_globals = {
   history_valid: u32,
   gi_mode: u32,       -- 0 = GI, 1 = original ambient, 2 = indirect, 3 = reference
   textures_enabled: u32,
+  sky_clouds: vec3f32, -- screenshot sky demo: cloud offset xy, coverage strength z
 }
 
 -- The orbit camera the host drives, unpacked from the frame block. Built locally
@@ -94,9 +96,10 @@ type visibility = {
 
 type lighting_inputs = {
   scene: render_target<gbuffer>,
-  sun_depth: render_target<f32>,
+  sun_grid: []vec4f32,
   ao_work: []vec4f32,
   indirect: []gi.sample,
+  waves: []vec4f32,
 }
 
 def append_captured_points(previous_points: []vec2f32, existing_point_count: i32,
@@ -135,7 +138,7 @@ def update_world(frame: frame_globals, events: []vec4f32, previous_world: world)
 -- OCC_TILE and the coarse-grid dimensions live in hiz.wyn.
 ------------------------------------------------------------
 
--- In the unified pipeline model the scene and sun maps arrive as typed
+-- In the unified pipeline model the scene targets arrive as typed
 -- `render_target` values on the root entry.  Coarse occlusion history and GTAO
 -- working values are ordinary arrays; the compiler owns their physical storage
 -- and schedules the graphics/compute dependencies implied by value flow.
@@ -209,6 +212,16 @@ def cull_props(frame: frame_globals, cells: []vec4f32,
   let live = map(|i| prop_from_index(cells, i), live_indices) in
   { prop_inst = live, draw = prop_draw(length(live_indices)) }
 
+-- Submit mesh tiles only for wet cells touching the view. The sphere includes
+-- the entire cell and the maximum wave displacement, so culling cannot open seams.
+def cull_water(frame: frame_globals, cells: []vec4f32) ([]i32, draw_command) =
+  let live = filter(|i|
+    let p = terrain.center(i) in cells[i].w != 1.0
+      && frustum_keep(@[p.x, terrain.WATER_Y, p.y], 0.72,
+                      frame.resolution, camera_from_frame(frame)), iota(terrain.COUNT)) in
+  (live, { vertex_count = u32(water.VERTICES_PER_CELL), instance_count = u32(length(live)),
+           first_vertex = 0u32, first_instance = 0u32 })
+
 -- Minimum depth per coarse tile, saved for next frame's visibility tests.
 -- Clamp reads at partial edge tiles so out-of-bounds depth cannot fake an occluder.
 def occ_reduce_tile(scene: render_target<gbuffer>, resolution: vec3f32,
@@ -228,9 +241,9 @@ def occ_reduce_tile(scene: render_target<gbuffer>, resolution: vec3f32,
 ------------------------------------------------------------
 -- Deferred G-buffer. The scene fragments
 -- write a thin G-buffer (albedo, world normal,
--- window depth) as MRT targets, and a fullscreen `resolve_fragment` reads it back
--- and does the lighting + tonemap once, over the whole image. This unifies shading
--- and is where AO / contact shadows belong. g_albedo.w packs roughness (0 = sky).
+-- window depth) as MRT targets. Deferred lighting resolves opaque geometry;
+-- the water mesh shades directly over it.
+-- g_albedo.w packs roughness (0 = sky).
 ------------------------------------------------------------
 
 -- Project tessellated ground vertices and write their surface data to the G-buffer.
@@ -342,33 +355,33 @@ def prop_fragment(frame: frame_globals, maps: material.textures, prop_instances:
     #discard
 
 ------------------------------------------------------------
--- Sun shadow map — caster pass. The wall-brick proxy boxes projected through the
--- sun's orthographic light camera (world_to_light) into the sun_depth map. The
--- fragment writes its light-space depth (frag_coord.z); the depth test keeps the
--- nearest caster per texel. `resolve_fragment` reads this back to cast long
--- directional shadows.
---
--- Regenerate wall instances from their indices so shadow casters are independent
--- of camera visibility. Dead wall slots collapse to a degenerate vertex.
+-- Shared masonry for reflections and the on-change shadow geometry export.
+-- Empty slots have a negative radius and emit degenerate triangles.
 ------------------------------------------------------------
 
-def brick_shadow_vertex(cells: []vec4f32, vertex_index: u32, instance_index: u32,
-                        _draw_index: u32) vertex<()> =
-  let vid = i32(vertex_index)
-  let iid = i32(instance_index)
-  let active = if iid < PROP_WALLS then wall_brick(iid).center.y > 0.0
-               else banks.active(cells, iid - PROP_WALLS)
-  let position = if active then
-    let p = if iid < PROP_WALLS then wall_prop(iid) else banks.stone(cells, iid - PROP_WALLS) in
-    world_to_light(prop_world(p, box_pos[vid]))
-    else @[2.0, 2.0, 2.0, 1.0] in
-  vertex_output(position, ())
+def masonry_prop(cells: []vec4f32, i: i32) prop =
+  let active = if i < PROP_WALLS then wall_brick(i).center.y > 0.0
+               else banks.active(cells, i - PROP_WALLS) in
+  if active then prop_from_index(cells, i + PROP_SETTS)
+  else { center = v3(0.0), radius = -1.0, half = v3(0.0),
+         right = v3(0.0), up = v3(0.0), fwd = v3(0.0), albedo = v3(0.0), material = 0u32 }
 
--- Depth-only caster shade: store this fragment's light-space depth in the scalar
--- sun target; the target's depth attachment keeps the nearest caster.
-def shadow_fragment(_value: (), position: vec4f32,
-                    _front_facing: bool, _primitive_index: u32, _sample_index: u32) f32 =
-  position.z
+-- Dead masonry slots collapse to empty triangles. A
+-- separate serial compaction costs more than drawing these coarse boxes.
+-- All face orientations participate, including those in shade.
+def reflection_vertex(frame: frame_globals, masonry: []prop, vertex_index: u32,
+                        instance_index: u32, _draw_index: u32) vertex<water_reflection.varying> =
+  let p = masonry[i32(instance_index)] in
+  if p.radius < 0.0 || p.center.y + p.half.y < terrain.WATER_Y then vertex_output(@[2.0, 2.0, 2.0, 1.0],
+    { point = v3(0.0), normal = @[0.0, 1.0, 0.0], albedo = v3(0.0) })
+  else
+    let world = prop_world(p, box_pos[i32(vertex_index)])
+    let face = i32(vertex_index) / 6
+    let n = if face == 0 then p.up else if face == 1 then p.up * -1.0
+            else if face == 2 then p.right else if face == 3 then p.right * -1.0
+            else if face == 4 then p.fwd else p.fwd * -1.0 in
+    vertex_output(water_reflection.project(world, frame.resolution, camera_from_frame(frame)),
+                   { point = world, normal = n, albedo = p.albedo })
 
 -- Perspective constants for GTAO, built from the live viewport + camera FOV (vertical
 -- 20°) and clip planes. Frame 0: no temporal accumulation (we have no TAA), so the
@@ -465,28 +478,30 @@ def denoise_ao(pixel: vec2i32, occlusion_samples: []vec4f32, constants: gtao.con
   gtao.denoise_kernel(center, l, r, t, b, tl, tr, bl, br, constants, true)
 
 -- The GTAO edge-aware denoise (final blur of occlusion_samples) is NOT a separate pass — it
--- reads only gtao_main's output, so `shade_frame` folds it in inline (see its `ao`).
+-- reads only gtao_main's output, so `shade_frame_linear` folds it in inline.
 ------------------------------------------------------------
 -- Deferred lighting combines surface colour and normal with ambient occlusion,
--- contact shadows, and the sun shadow map, then applies tonemapping.
+-- contact shadows, and geometric sun shadows. Water composition precedes tonemapping.
 ------------------------------------------------------------
 
 -- Sky shade for a G-buffer miss (alb.w < 0.5), sampled along the pixel's view ray.
 -- pixel_center uses bottom-up coordinates.
-def shade_sky(resolution: vec3f32, pixel_center: vec2f32, camera: orbit) vec4f32 =
+def shade_sky(resolution: vec3f32, pixel_center: vec2f32, camera: orbit,
+              sun: vec3f32, cloud_settings: vec3f32) vec4f32 =
   let (_ro, rd) = get_ray(resolution, pixel_center, camera)
-  let sc = clouds.sky(rd) in
-  @[sc.x, sc.y, sc.z, 1.0]
+  let pixel_angle = 2.0 * f32.tan(f32.radians(FOV * 0.5)) / resolution.y
+  let sc = clouds.visible_sky(rd, sun, pixel_angle, cloud_settings) in
+  @[sc.x, sc.y, sc.z, 0.0]
 
--- Deferred shade for one pixel: read the thin G-buffer at (x,y) and return its final
+-- Deferred shade for one pixel: read the thin G-buffer at (x,y) and return linear
 -- colour. Sky pixels get the cloud sky; lit pixels get GTAO (the edge-aware denoise
--- folded in — it only reads gtao_main's ao_work), the sun contact march + sun-shadow-
--- map PCF (shadow.wyn owns both marches, which take the depth images directly), and
+-- folded in — it only reads gtao_main's ao_work), the contact march and geometric sun visibility (shadow.wyn), and
 -- the AO/shadow-attenuated shade. The image-touching helpers are ordinary defs — the
 -- compiler specializes each to its resource global.
-def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
-                occlusion_samples: []vec4f32, indirect: []gi.sample, frame: frame_globals,
+def shade_frame_linear(scene: render_target<gbuffer>, sun_grid: []vec4f32,
+                occlusion_samples: []vec4f32, indirect: []gi.sample, waves: []vec4f32, frame: frame_globals,
                 pixel_x: i32, pixel_y: i32) vec4f32 =
+  let sun = shadow_sun(sun_grid)
   let rx = frame.resolution.x
   let ry = frame.resolution.y
   let resl = @[rx, ry, 0.0]
@@ -495,26 +510,28 @@ def shade_frame(scene: render_target<gbuffer>, sun_depth: render_target<f32>,
   let g = target_load(scene, @[pixel_x, pixel_y], 0u32)
   let alb = g.albedo
   let fragc = @[f32(pixel_x) + 0.5, ry - (f32(pixel_y) + 0.5)] in    -- pixel centre, bottom-up
-  if alb.w < 0.5 then shade_sky(resl, fragc, o)
+  if alb.w < 0.5 then shade_sky(resl, fragc, o, sun, frame.sky_clouds)
   else
     let n = octahedral.decode(g.normal)
     let cd = g.depth
     let pg = world_from_depth(resl, fragc, o, cd)
     let base = @[alb.x, alb.y, alb.z]
     let specular = if frame.textures_enabled == 0u32 then v3(0.0)
-                   else sun_specular(n, normalize(cam_eye(o) - pg), f32.clamp(alb.w * 2.0 - 1.0, 0.0, 1.0))
+                   else sun_specular(n, normalize(cam_eye(o) - pg), f32.clamp(alb.w * 2.0 - 1.0, 0.0, 1.0), sun)
     let ao = if ao_off then 0.0
              else let (aov, _e) = denoise_ao(@[pixel_x, pixel_y], occlusion_samples, gtao_consts(resl)) in 1.0 - aov
     let p = pg + n * SH_LIFT
-    let shc = contact_shadow(scene, p, n, resl, o)
-    let shm_frac = sun_shadow_pcf(sun_depth, p, rx, ry) in
-    if frame.gi_mode == 1u32 || (frame.mods & 4u32) != 0u32 then
-      shade_surface(base, n, ao, shc, shm_frac, specular)
+    let shc = contact_shadow(scene, p, n, resl, o, sun)
+    let shm_frac = sun_shadow_aa(sun_grid, pg, n, resl, o)
+    let light = if frame.gi_mode == 1u32 || (frame.mods & 4u32) != 0u32 then
+      shade_surface_linear(base, n, ao, shc, shm_frac, specular, sun)
     else
       let bounce = gi.resolve(indirect, resl, o, @[pixel_x, pixel_y], pg, n,
                               1.0 - ao, frame.gi_mode == 3u32) in
-      shade_surface_gi(base, n, if frame.gi_mode == 3u32 then 0.0 else ao,
-                        f32.max(shc, shm_frac), bounce, frame.gi_mode == 2u32, specular)
+      shade_surface_gi_linear(base, n, if frame.gi_mode == 3u32 then 0.0 else ao,
+                        f32.max(shc, shm_frac), bounce, frame.gi_mode == 2u32, specular, sun)
+    let color = water.wet_color(waves, light, pg) in
+    @[color.x, color.y, color.z, 1.0]
 
 ------------------------------------------------------------
 -- Deferred resolve. One fullscreen triangle covers every pixel and its fragment
@@ -530,26 +547,15 @@ def blit_vertex(vertex_index: u32, _instance_index: u32,
   let y = if vid == 2 then 3.0 else 0.0 - 1.0 in
   vertex_output(@[x, y, 0.0, 1.0], ())
 
-def resolve_fragment(inputs: lighting_inputs, frame: frame_globals,
+def opaque_fragment(inputs: lighting_inputs, frame: frame_globals,
                      _value: (), position: vec4f32,
                      _front_facing: bool, _primitive_index: u32, _sample_index: u32) vec4f32 =
   let xy = @[i32(position.x), i32(position.y)] in
-  let (ro, rd) = get_ray(frame.resolution, @[position.x, frame.resolution.y - position.y], camera_from_frame(frame))
-  let t = ray.plane_y(ro, rd, terrain.WATER_Y)
-  let p = ro + rd * t
-  let clip = world_to_clip(p, frame.resolution, camera_from_frame(frame))
-  let scene_depth = target_load(inputs.scene, xy, 0u32).depth in
-  -- Forward shade the actual lower water plane against opaque scene depth.
-  -- Keep the bed/bank depth intact for AO, GI, and future refraction. Murky water
-  -- is opaque here, so each chosen surface is lit and tone-mapped exactly once.
-  if t > 0.0 && terrain.in_bounds(p.xz) && clip.z / clip.w < scene_depth then
-    let visibility = 1.0 - sun_shadow_pcf(inputs.sun_depth, p, frame.resolution.x, frame.resolution.y)
-    let color = tonemap_aces(water_surface(p, rd, frame.time, visibility)) in
-    @[color.x, color.y, color.z, 1.0]
-  else shade_frame(inputs.scene, inputs.sun_depth, inputs.ao_work, inputs.indirect,
-                    frame, xy.x, xy.y)
+  let opaque = shade_frame_linear(inputs.scene, inputs.sun_grid, inputs.ao_work, inputs.indirect, inputs.waves, frame, xy.x, xy.y)
+  let color = tonemap_aces(opaque.xyz) in
+  @[color.x, color.y, color.z, 1.0]
 
--- Shared opaque-depth state for the sun and scene draws. Physical attachments,
+-- Shared opaque-depth state for scene and reflection draws. Physical attachments,
 -- barriers, pipeline order, and indirect command dependencies are derived from
 -- this root operation by the compiler.
 def opaque_depth: fragment_state = {
@@ -559,7 +565,7 @@ def opaque_depth: fragment_state = {
   color_write = true,
 }
 
-def build_gi(scene_image: render_target<gbuffer>, sun_depth: render_target<f32>,
+def build_gi(scene_image: render_target<gbuffer>, sun_grid: []vec4f32,
                 cells: []vec4f32, ambient_occlusion: []vec4f32, gi_in: []gi.sample,
                 head_in: []f32, frame: frame_globals)
   ([]gi.sample, []scene_trace.node, []vec4f32, []gi.sample, []gi.sample) =
@@ -570,16 +576,16 @@ def build_gi(scene_image: render_target<gbuffer>, sun_depth: render_target<f32>,
   -- follows visible edits one frame after capture, without a CPU readback.
   let edit_frames = stroke_head_from_buffer(head_in).edit_frames
   let trace_nodes = map(scene_trace.build_node, iota(scene_trace.NODE_COUNT))
-  let radiance = map(|i| gi.screen_radiance(scene_image, sun_depth, trace_nodes, cells,
+  let radiance = map(|i| gi.screen_radiance(scene_image, sun_grid, trace_nodes, cells,
     ambient_occlusion, gi_in, frame.resolution, camera_from_frame(frame),
     previous_camera_from_frame(frame), frame.history_valid != 0u32,
     frame.gi_mode != 1u32 && frame.gi_mode != 3u32 && (frame.mods & 4u32) == 0u32, i),
     iota(length(ambient_occlusion)))
-  let rays = map(|i| gi.trace_pixel(scene_image, sun_depth, trace_nodes, cells, ambient_occlusion,
+  let rays = map(|i| gi.trace_pixel(scene_image, sun_grid, trace_nodes, cells, ambient_occlusion,
     radiance, frame.resolution, camera_from_frame(frame), frame.frame_index, i,
     frame.gi_mode != 1u32 && frame.gi_mode != 3u32 && (frame.mods & 4u32) == 0u32),
     iota(gi.trace_width(frame.resolution) * gi.trace_height(frame.resolution)))
-  let temporal = map(|i| gi.temporal_pixel(scene_image, sun_depth, trace_nodes, cells,
+  let temporal = map(|i| gi.temporal_pixel(scene_image, sun_grid, trace_nodes, cells,
     ambient_occlusion, radiance, rays, gi_in, frame.resolution, camera_from_frame(frame),
     previous_camera_from_frame(frame), frame.frame_index, frame.history_valid != 0u32, edit_frames,
     frame.gi_mode != 1u32 && (frame.mods & 4u32) == 0u32, frame.gi_mode == 3u32, i),
@@ -591,6 +597,11 @@ def build_gi(scene_image: render_target<gbuffer>, sun_depth: render_target<f32>,
 -- Render the previous world while producing the next one. Visibility also reads
 -- the previous frame's coarse depth; this frame's depth becomes next frame's history.
 -- The flat input/output tuple is the host ABI; the algorithm uses named records.
+def build_water(cells: []vec4f32, time: f32) ([]f32, []vec4f32) =
+  let heights = map(|i| water.grid_height(cells, time, i), iota(water.PADDED_SIDE * water.PADDED_SIDE))
+  let vertices = map(|i| water.grid_vertex(heights, i), iota(water.SIDE * water.SIDE)) in
+  (heights, vertices)
+
 entry tinyporto_frame(
     uistate_in: []f32,
     points_in: []vec2f32,
@@ -603,25 +614,34 @@ entry tinyporto_frame(
     stone_color: texture2d, stone_normal: texture2d,
     mortar_color: texture2d, mortar_normal: texture2d,
     material_sampler: sampler,
+    reflection_sampler: sampler,
     events: []vec4f32,
     frame: frame_globals,
-    sun: render_target<f32>,
+    shadow_grid: []vec4f32,
+    reflection: render_target<vec4f32>,
     scene: render_target<gbuffer>,
     surface: render_target<vec4f32>)
     ([]f32, []vec2f32, []vec4f32, []f32, []f32, []gi.sample,
      []scene_trace.node, []vec4f32, []gi.sample, []gi.sample,
-     render_target<f32>, render_target<gbuffer>, render_target<vec4f32>) =
+     []vec4f32, render_target<gbuffer>, render_target<vec4f32>, []vec4f32, []f32,
+     render_target<vec4f32>) =
   let next_world = update_world(frame, events, { ui = uistate_in, points = points_in, items = items_in, head = head_in })
   let visible = cull_props(frame, terrain_cells, occ_in)
+  let masonry = map(|i| masonry_prop(terrain_cells, i), iota(PROP_WALLS + banks.COUNT))
+  let (wave_heights, wave_vertices) = build_water(terrain_cells, frame.time)
   let maps = { brick_color = brick_color, brick_normal = brick_normal,
                stone_color = stone_color, stone_normal = stone_normal,
                mortar_color = mortar_color, mortar_normal = mortar_normal,
                filtering = material_sampler }
 
-  -- Render sunlight visibility from all walls, independently of the camera.
-  let shadow_fragments = rasterize_triangles(
-    direct_draw(36u32, u32(PROP_WALLS + banks.COUNT)), brick_shadow_vertex(terrain_cells, _, _, _))
-  let sun_depth = shade_with(opaque_depth, sun, shadow_fragments, shadow_fragment)
+
+  let reflection_pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
+  let reflection_sky = shade(reflection, reflection_pixels,
+    |_, position, _, _, _| water_reflection.sky(frame.resolution, camera_from_frame(frame), position, shadow_sun(shadow_grid)))
+  let reflection_triangles = rasterize_triangles(direct_draw(36u32, u32(PROP_WALLS + banks.COUNT)),
+    reflection_vertex(frame, masonry, _, _, _))
+  let reflected_scene = shade_with(opaque_depth, reflection_sky, reflection_triangles,
+    |value, position, _, _, _| water_reflection.fragment(shadow_grid, frame.resolution, value, position))
 
   -- Fill the scene G-buffer with the ground, then the visible props.
   let ground_triangles = rasterize_triangles(
@@ -638,15 +658,38 @@ entry tinyporto_frame(
   let (ambient_occlusion, next_occlusion) = build_postprocess(scene_image, frame.resolution)
 
   let (indirect, trace_nodes, radiance, rays, temporal) =
-    build_gi(scene_image, sun_depth, terrain_cells, ambient_occlusion, gi_in, head_in, frame)
+    build_gi(scene_image, shadow_grid, terrain_cells, ambient_occlusion, gi_in, head_in, frame)
 
-  -- Light every pixel of the finished image.
+  -- Resolve opaque lighting, then shade the visible water mesh directly into
+  -- the same image. Each surface is tone mapped once; the coarse reflection
+  -- capture remains linear until it is sampled here.
   let pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
-  let image = shade(surface, pixels,
-    resolve_fragment({ scene = scene_image, sun_depth = sun_depth,
-                       ao_work = ambient_occlusion, indirect = indirect },
-                     frame, _, _, _, _, _)) in
+  let opaque_image = shade(surface, pixels,
+    opaque_fragment({ scene = scene_image, sun_grid = shadow_grid,
+                       ao_work = ambient_occlusion, indirect = indirect, waves = wave_vertices },
+                     frame, _, _, _, _, _))
+  let (water_cells, water_draw) = cull_water(frame, terrain_cells)
+  let water_triangles = rasterize_triangles(
+    indirect_draw(water_draw),
+    water.mesh_vertex(water_cells, wave_vertices, frame.resolution, camera_from_frame(frame), _, _, _))
+  let image = shade_with(opaque_depth, opaque_image, water_triangles,
+    water.mesh_fragment(scene_image, shadow_grid, reflected_scene, reflection_sampler, frame.resolution,
+      camera_from_frame(frame), frame.time, _, _, _, _, _)) in
 
   (next_world.ui, next_world.points, next_world.items, next_world.head,
    next_occlusion, indirect, trace_nodes, radiance, rays, temporal,
-   sun_depth, scene_image, image)
+   shadow_grid, scene_image, image, wave_vertices, wave_heights, reflected_scene)
+
+-- Export the same caster boxes as the visible masonry, only when it changes.
+-- Four records per slot: center/radius, then basis axis/half extent.
+entry shadow_geometry(terrain_cells: []vec4f32) []vec4f32 =
+  map(|i|
+    let p = masonry_prop(terrain_cells, i / 4) in
+    if i % 4 == 0 then @[p.center.x, p.center.y, p.center.z, p.radius]
+    else if i % 4 == 1 then @[p.right.x, p.right.y, p.right.z, p.half.x]
+    else if i % 4 == 2 then @[p.up.x, p.up.y, p.up.z, p.half.y]
+    else @[p.fwd.x, p.fwd.y, p.fwd.z, p.half.z], iota((PROP_WALLS + banks.COUNT) * 4))
+
+-- Diagnostic queries use precisely the same visibility function as rendering.
+entry shadow_visibility(shadow_grid: []vec4f32, points: []vec4f32) []f32 =
+  map(|p| sun_shadow(shadow_grid, p.xyz, @[0.0, 1.0, 0.0]), points)

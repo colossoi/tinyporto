@@ -17,10 +17,16 @@ async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::
     let mut limits = wgpu::Limits::default();
     limits.max_storage_buffers_per_shader_stage =
         adapter.limits().max_storage_buffers_per_shader_stage;
+    let timestamps =
+        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("tinyporto-device"),
-            required_features: wgpu::Features::empty(),
+            required_features: if adapter.features().contains(timestamps) {
+                timestamps
+            } else {
+                wgpu::Features::empty()
+            },
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -33,6 +39,39 @@ async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::
 impl Gfx {
     pub fn new(window: Arc<Window>) -> Result<Self> {
         pollster::block_on(Self::new_async(window))
+    }
+
+    pub fn present_loading_frame(&self) -> Result<()> {
+        let surface = self
+            .surface
+            .as_ref()
+            .context("loading frame needs a window")?;
+        let frame = surface.get_current_texture()?;
+        let view = frame.texture.create_view(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("loading background"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.12,
+                            g: 0.15,
+                            b: 0.18,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        }
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        Ok(())
     }
 
     async fn new_async(window: Arc<Window>) -> Result<Self> {

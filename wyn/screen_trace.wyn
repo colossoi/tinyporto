@@ -20,9 +20,9 @@ module screen_trace = {
   -- https://gist.github.com/h3r2tic/9c8356bdaefbe80b1a22ae0aaee192db
   -- Its conservative test uses the farther depth; thickness uses the nearer one.
   -- This is stricter than the average-depth description in the local talk notes.
-  def depth_delta(scene: render_target<gbuffer>, resolution: vec3f32, camera: orbit,
-                  p: vec3f32) (f32, f32, bool) =
-    let (pixel, valid) = project_pixel(p, resolution, camera) in
+  def depth_delta(scene: render_target<gbuffer>, resolution: vec3f32,
+                  clip: vec4f32) (f32, f32, bool) =
+    let (pixel, valid) = project_clip(clip, resolution) in
     if !valid then (0.0, 0.0, false)
     else
       let cell = @[i32(f32.floor(pixel.x - 0.5)), i32(f32.floor(pixel.y - 0.5))]
@@ -33,9 +33,9 @@ module screen_trace = {
       let d11 = depth(scene, resolution, cell + @[1, 1])
       let smooth = linear_depth((d00 * (1.0 - f.x) + d10 * f.x) * (1.0 - f.y)
                               + (d01 * (1.0 - f.x) + d11 * f.x) * f.y)
-      let point = linear_depth(depth(scene, resolution, @[i32(pixel.x), i32(pixel.y)]))
-      let c = world_to_clip(p, resolution, camera)
-      let ray = linear_depth(c.z / c.w) in
+      let point = linear_depth(if f.y < 0.5 then (if f.x < 0.5 then d00 else d10)
+                               else (if f.x < 0.5 then d01 else d11))
+      let ray = linear_depth(clip.z / clip.w) in
       (f32.max(point, smooth) + 0.002 - ray, ray - f32.min(point, smooth), true)
 
   -- March short detail densely, then wider intervals. On a crossing refine before
@@ -43,13 +43,15 @@ module screen_trace = {
   -- On failure the caller chooses the fallback representation.
   def trace(scene: render_target<gbuffer>, resolution: vec3f32, camera: orbit,
             ro: vec3f32, rd: vec3f32, options: settings) (vec2i32, bool) =
+    let origin = world_to_clip(ro, resolution, camera)
+    let step = (world_to_clip(ro + rd * options.distance, resolution, camera) - origin) / options.distance
     let (low, high, found, _active) =
       loop (low, high, found, active) = (0.0, 0.0, false, true) for k < options.steps do
         if !active then (low, high, found, false)
         else
           let u = f32(k + 1) / f32(options.steps)
           let t = options.start + options.distance * u * u
-          let (delta, _penetration, valid) = depth_delta(scene, resolution, camera, ro + rd * t) in
+          let (delta, _penetration, valid) = depth_delta(scene, resolution, origin + step * t) in
           if !valid then (low, t, false, false)
           else if delta < 0.0 then (low, t, true, false)
           else (t, t, false, true)
@@ -57,11 +59,11 @@ module screen_trace = {
     else
       let (_a, b) = loop (a, b) = (low, high) for _k < options.refinements do
         let t = (a + b) * 0.5
-        let (delta, _penetration, valid) = depth_delta(scene, resolution, camera, ro + rd * t) in
+        let (delta, _penetration, valid) = depth_delta(scene, resolution, origin + step * t) in
         if valid && delta < 0.0 then (a, t) else (t, b)
-      let p = ro + rd * b
-      let (_delta, penetration, valid) = depth_delta(scene, resolution, camera, p)
-      let (pixel, _visible) = project_pixel(p, resolution, camera)
+      let clip = origin + step * b
+      let (_delta, penetration, valid) = depth_delta(scene, resolution, clip)
+      let (pixel, _visible) = project_clip(clip, resolution)
       let xy = @[i32(pixel.x), i32(pixel.y)]
       let g = target_load(scene, xy, 0u32) in
       (xy, valid && penetration < options.thickness && g.albedo.w > 0.5

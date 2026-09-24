@@ -3,7 +3,6 @@
 
 import "math"
 
-def SUN_DIR: vec3f32 = @[0.0 - 0.5, 0.52, 0.35]
 def SUN_COLOR: vec3f32 = @[2.0, 1.95, 1.85]
 def AMBIENT: vec3f32 = @[0.22, 0.26, 0.32]
 
@@ -15,11 +14,9 @@ def WALL_COLOR: vec3f32 = @[0.34, 0.48, 0.30]
 -- Subtle darker outline drawn at an item's boundary (the edging course).
 def OUTLINE_COLOR: vec3f32 = @[0.12, 0.11, 0.10]
 
-def sun: vec3f32 = normalize(SUN_DIR)
-
 -- Ambient occlusion attenuates sky fill; directional shadow attenuates sunlight.
 -- Keep a little sunlight even in full shadow to approximate bounced light.
-def lit_ao_sh(albedo: vec3f32, n: vec3f32, ao: f32, sh: f32) vec3f32 =
+def lit_ao_sh(albedo: vec3f32, n: vec3f32, ao: f32, sh: f32, sun: vec3f32) vec3f32 =
   let ndl = f32.clamp(dot(n, sun), 0.0, 1.0)
   let occ = 1.0 - 0.75 * f32.clamp(ao, 0.0, 1.0)
   let sunvis = 1.0 - 0.85 * f32.clamp(sh, 0.0, 1.0) in
@@ -35,11 +32,11 @@ def tonemap_aces(x: vec3f32) vec3f32 =
 
 -- Final shade for a lit G-buffer pixel: sky-ambient (AO-attenuated) + direct sun
 -- (shadow-attenuated), tonemapped to an opaque colour. `ao` is the occlusion amount
--- (1 = fully occluded); `shc`/`shm_frac` are the contact-march and sun-shadow-map
+-- (1 = fully occluded); `shc`/`shm_frac` are the contact-march and geometric sun-shadow
 -- occlusion, combined by `max` (either one blocks the sun).
 -- Dielectric GGX sunlight, with Schlick Fresnel and Smith masking. GI remains
 -- diffuse: do not feed this view-dependent highlight back into its radiance.
-def sun_specular(n: vec3f32, view: vec3f32, roughness: f32) vec3f32 =
+def sun_specular(n: vec3f32, view: vec3f32, roughness: f32, sun: vec3f32) vec3f32 =
   let nl = f32.clamp(dot(n, sun), 0.0, 1.0)
   let nv = f32.max(0.001, f32.clamp(dot(n, view), 0.0, 1.0))
   let h = normalize(sun + view)
@@ -55,20 +52,16 @@ def sun_specular(n: vec3f32, view: vec3f32, roughness: f32) vec3f32 =
   let fresnel = 0.04 + 0.96 * f32.pow(1.0 - vh, 5.0) in
   SUN_COLOR * (distribution * visibility * fresnel * nl)
 
-def shade_surface(albedo: vec3f32, n: vec3f32, ao: f32, shc: f32, shm_frac: f32,
-                   specular: vec3f32) vec4f32 =
+def shade_surface_linear(albedo: vec3f32, n: vec3f32, ao: f32, shc: f32, shm_frac: f32,
+                          specular: vec3f32, sun: vec3f32) vec3f32 =
   let sh = f32.max(shc, shm_frac)
-  let col = lit_ao_sh(albedo, n, ao, sh) + specular * (1.0 - f32.clamp(sh, 0.0, 1.0))
-  let m = tonemap_aces(col) in
-  @[m.x, m.y, m.z, 1.0]
+  in lit_ao_sh(albedo, n, ao, sh, sun) + specular * (1.0 - f32.clamp(sh, 0.0, 1.0))
 
 -- GI supplies the indirect illumination: no constant ambient or artificial sun
 -- floor in this path. GTAO adds only the fine detail absent from the trace proxies.
-def shade_surface_gi(albedo: vec3f32, n: vec3f32, ao: f32, shadow: f32,
-                      indirect: vec3f32, indirect_only: bool, specular: vec3f32) vec4f32 =
+def shade_surface_gi_linear(albedo: vec3f32, n: vec3f32, ao: f32, shadow: f32,
+                             indirect: vec3f32, indirect_only: bool, specular: vec3f32, sun: vec3f32) vec3f32 =
   let direct = if indirect_only then v3(0.0)
                else SUN_COLOR * (f32.clamp(dot(n, sun), 0.0, 1.0) * (1.0 - f32.clamp(shadow, 0.0, 1.0)))
-  let light = albedo * (direct + indirect * (1.0 - 0.2 * f32.clamp(ao, 0.0, 1.0)))
-                + (if indirect_only then v3(0.0) else specular * (1.0 - f32.clamp(shadow, 0.0, 1.0)))
-  let mapped = tonemap_aces(light) in
-  @[mapped.x, mapped.y, mapped.z, 1.0]
+  in albedo * (direct + indirect * (1.0 - 0.2 * f32.clamp(ao, 0.0, 1.0)))
+       + (if indirect_only then v3(0.0) else specular * (1.0 - f32.clamp(shadow, 0.0, 1.0)))

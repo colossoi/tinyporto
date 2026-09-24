@@ -7,7 +7,6 @@ import "pkg:gfx"
 -- View tuning. The telephoto FOV gives the "tiny diorama" compression; the orbit
 -- target / distance / angles are per-frame state the host drives (see `orbit`).
 def FOV: f32 = 20.0
-def LOOKAT: vec3f32 = @[0.0, 0.0, 0.0]   -- sun-shadow map centre (shadow.wyn's sun camera aims here)
 
 -- The orbit camera state the host drives: a focal `target` on/near the ground, an
 -- `az` (azimuth, horizontal orbit), an `elev` (pitch; negative keeps the eye above
@@ -82,7 +81,11 @@ def frustum_keep(p: vec3f32, r: f32, resolution: vec3f32, o: orbit) bool =
 -- World position -> top-left floating pixel coordinates and clip visibility.
 -- Validate before converting to integer pixels, so negative fractions stay out.
 def project_pixel(p: vec3f32, resolution: vec3f32, camera: orbit) (vec2f32, bool) =
-  let c = world_to_clip(p, resolution, camera)
+  project_clip(world_to_clip(p, resolution, camera), resolution)
+
+-- Project an already transformed position. Ray marchers interpolate homogeneous
+-- clip coordinates so camera transforms stay outside their sampling loops.
+def project_clip(c: vec4f32, resolution: vec3f32) (vec2f32, bool) =
   let w = f32.max(c.w, 0.00001)
   let pixel = @[(c.x / w * 0.5 + 0.5) * resolution.x,
                (0.5 - c.y / w * 0.5) * resolution.y] in

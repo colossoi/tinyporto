@@ -1,21 +1,7 @@
--- shadow.wyn — ray-marched contact shadows (screen-space) for the deferred light
--- pass: the cheap, high-impact Tiny Glade trick. From a shaded pixel's world
--- position we march toward the sun in world space, re-projecting each step to
--- screen and reading back the recorded scene depth; a step that lands behind a
--- nearer surface (within a thickness window) means the sun is blocked.
---
--- Owns the shadow tunables, the pure projection/compare helpers, AND the two
--- complete marches (contact_shadow, sun_shadow_pcf) — which take the depth
--- `storage_image` directly: the compiler specializes such a def to the concrete
--- resource global (the image never travels as a value parameter), so an
--- image-touching helper is an ordinary def. `light` just reconstructs the pixel's
--- world position and calls these.
---
--- Library module: no `open` (see math.wyn for the idiom); f32.* qualified.
+-- Screen-space contact shadows and geometric directional shadows.
 
-import "camera"   -- world_to_clip / world_from_depth / linear_depth / LOOKAT
+import "camera"   -- world_to_clip / world_from_depth / linear_depth
 import "pkg:gfx"
-import "shade"    -- SUN_DIR / sun
 import "render_types"
 
 -- March tunables (world metres). Short range, so shadows ground bricks / cobbles /
@@ -60,7 +46,7 @@ def shadow_occluded(sp: vec3f32, wp: vec3f32, cq: vec4f32, surfd: f32) bool =
 -- face sees the sun (a back-to-sun face is already unlit by ndl, so a shadow there is
 -- a no-op that only adds noise). Returns occlusion in {0,1} (early-outs once blocked).
 def contact_shadow(sd: render_target<gbuffer>, p: vec3f32, n: vec3f32,
-                   resl: vec3f32, o: orbit) f32 =
+                   resl: vec3f32, o: orbit, sun: vec3f32) f32 =
   let ry = resl.y
   let ndl = f32.max(dot(n, sun), 0.0) in
   if ndl <= 0.0 then 0.0
@@ -75,77 +61,72 @@ def contact_shadow(sd: render_target<gbuffer>, p: vec3f32, n: vec3f32,
         let wp = world_from_depth(resl, @[f32(sx) + 0.5, ry - (f32(sy) + 0.5)], o, surfd) in
         if shadow_occluded(sp, wp, cq, surfd) then 1.0 else shc
 
-------------------------------------------------------------
--- Sun shadow map (directional cast shadows). An orthographic camera looks down the
--- sun ray (-sun) over a box covering the built area; the caster pass rasterizes the
--- wall bricks through world_to_light and stores the nearest light-space depth per
--- texel. The deferred light pass reconstructs each pixel's world position, projects
--- it the same way, and PCF-compares to that stored depth: farther than the nearest
--- caster => the sun is blocked. These are the long, robust cast shadows; the
--- contact march above stays for fine local grounding. The projection/compare helpers
--- are pure; the full PCF read (sun_shadow_pcf) is at the bottom and takes the map.
-------------------------------------------------------------
 
-def SUN_DIST: f32 = 20.0    -- light-camera distance from the origin, along +sun
-def SUN_HALF: f32 = 10.0    -- ortho half-extent (m); covers the cobble disc + throw
-def SUN_NEAR: f32 = 1.0
-def SUN_FAR:  f32 = 40.0
-def SUN_BIAS: f32 = 0.0015  -- depth-compare bias (ortho z units) against acne
+-- Packed grid from driver/src/shadow.rs, retained until geometry or sun changes.
+-- Cells contain all intersecting caster IDs, not sampled visibility/depth.
+-- Their size affects lookup cost only; analytic box intersections set the edge.
+def shadow_sun(grid: []vec4f32) vec3f32 = grid[3].xyz
 
--- Light-camera eye: back off the origin toward the sun so it looks down -sun.
-def sun_eye: vec3f32 = LOOKAT + sun * SUN_DIST
+def grid_box_hit(boxes: []vec4f32, index: i32, p: vec3f32) bool =
+  let c = boxes[index * 4]
+  let a = boxes[index * 4 + 1]
+  let b = boxes[index * 4 + 2]
+  let d = boxes[index * 4 + 3]
+  let delta = c.xyz - p
+  let mid = @[dot(delta, a.xyz), dot(delta, b.xyz), dot(delta, d.xyz)]
+  let extent = @[a.w, b.w, d.w]
+  -- Negative extents mark slabs parallel to the sun: their unscaled dual
+  -- basis tests containment, while the other slabs bound the ray interval.
+  let outside = (extent.x < 0.0 && f32.abs(mid.x) > 0.0 - extent.x)
+             || (extent.y < 0.0 && f32.abs(mid.y) > 0.0 - extent.y)
+             || (extent.z < 0.0 && f32.abs(mid.z) > 0.0 - extent.z)
+  let lo = @[if extent.x < 0.0 then -1.0e30 else mid.x - extent.x,
+             if extent.y < 0.0 then -1.0e30 else mid.y - extent.y,
+             if extent.z < 0.0 then -1.0e30 else mid.z - extent.z]
+  let hi = @[if extent.x < 0.0 then 1.0e30 else mid.x + extent.x,
+             if extent.y < 0.0 then 1.0e30 else mid.y + extent.y,
+             if extent.z < 0.0 then 1.0e30 else mid.z + extent.z]
+  let enter = f32.max(lo.x, f32.max(lo.y, lo.z))
+  let leave = f32.min(hi.x, f32.min(hi.y, hi.z)) in
+  !outside && leave >= f32.max(enter, 0.006)
 
--- Orthographic projection (symmetric, RH, z in [0,1] for wgpu). Column-major
--- (outer arrays = columns), matching camera.wyn's perspective/look_at convention.
--- The box is square in world space; mapping it into the (rectangular) window-sized
--- map just makes texel density anisotropic, which is self-consistent between the
--- caster write and the receiver read, so it introduces no error.
-def sun_ortho: mat4f32 =
-  let h = SUN_HALF
-  let n = SUN_NEAR
-  let f = SUN_FAR in
-  @[[1.0 / h, 0.0,     0.0,               0.0],
-    [0.0,     1.0 / h, 0.0,               0.0],
-    [0.0,     0.0,     0.0 - 1.0 / (f - n), 0.0],
-    [0.0,     0.0,     0.0 - n / (f - n),   1.0]]
-
-def sun_view: mat4f32 =
-  gfx.camera.look_at(sun_eye, LOOKAT, @[0.0, 1.0, 0.0])
-
--- World point -> light clip space (ortho, so w = 1 and xyz are already NDC).
-def world_to_light(p: vec3f32) vec4f32 =
-  sun_ortho * (sun_view * @[p.x, p.y, p.z, 1.0])
-
--- Light-clip -> shadow-map (u, v) in [0,1] (v flipped to texture space, matching
--- rasterization) plus whether the point is inside the map's covered volume.
-def sun_shadow_uv(lc: vec4f32) (f32, f32, bool) =
-  let u = lc.x * 0.5 + 0.5
-  let v = 1.0 - (lc.y * 0.5 + 0.5)
-  let inr = u > 0.0 && u < 1.0 && v > 0.0 && v < 1.0 && lc.z > 0.0 && lc.z < 1.0 in
-  (u, v, inr)
-
--- Is a receiver at light-space depth `refz` lit, given the nearest caster depth
--- `stored` in that texel? Lit when it's at or nearer than the caster (plus bias).
-def sun_lit(refz: f32, stored: f32) bool = refz - SUN_BIAS <= stored
-
--- Full sun-shadow-map PCF for a world point `p`, reading the caster map `shm`.
--- Projects `p` into the light camera and compares its light-space depth to the
--- nearest recorded caster over a softened 3x3 tap. Returns the occluded fraction in
--- [0,1] (0 = fully lit, outside the map's covered volume => lit).
-def sun_shadow_pcf(shm: render_target<f32>, p: vec3f32, rx: f32, ry: f32) f32 =
-  let w = i32(rx)
-  let h = i32(ry)
-  let lc = world_to_light(p)
-  let (su, sv, inr) = sun_shadow_uv(lc)
-  let tx = i32(su * rx)
-  let ty = i32(sv * ry) in
-  if !inr then 0.0
+def sun_shadow(grid: []vec4f32, p: vec3f32, _n: vec3f32) f32 =
+  let right = grid[1]
+  let up = grid[2]
+  let side = i32(grid[0].z)
+  let ij = @[dot(p, right.xyz) - right.w, dot(p, up.xyz) - up.w] * grid[0].w
+  let x = i32(f32.floor(ij.x))
+  let y = i32(f32.floor(ij.y)) in
+  if x < 0 || x >= side || y < 0 || y >= side then 0.0
   else
-    let occ =
-      loop occ = 0.0 for kk < 9 do
-        let stx = tx + (kk % 3 - 1)
-        let sty = ty + (kk / 3 - 1)
-        let inb = stx >= 0 && stx < w && sty >= 0 && sty < h
-        let stored = if inb then target_load(shm, @[stx, sty], 0u32) else 1.0 in
-        if sun_lit(lc.z, stored) then occ else occ + 1.0
-      in occ / 9.0
+    let header = grid[4 + y * side + x]
+    let start = i32(header.x)
+    let end = start + i32(header.y)
+    let id_base = i32(grid[0].x)
+    let box_base = i32(grid[0].y)
+    let (_, blocked) = loop (i, blocked) = (start, false) while i < end && !blocked do
+      let packed = grid[id_base + i / 4]
+      let id = i32(if i % 4 == 0 then packed.x else if i % 4 == 1 then packed.y
+                   else if i % 4 == 2 then packed.z else packed.w) in
+      (i + 1, grid_box_hit(grid, box_base / 4 + id, p)) in
+    if blocked then 1.0 else 0.0
+
+-- Four fixed subpixel samples cover the receiving surface's local plane.
+-- Each sample selects its own grid cell, so coverage remains correct at cell
+-- boundaries and overlapping casters combine by visibility, not by max alpha.
+def sun_shadow_aa(grid: []vec4f32, p: vec3f32, n: vec3f32,
+                  resolution: vec3f32, camera: orbit) f32 =
+  let eye = cam_eye(camera)
+  let forward = normalize(camera.target - eye)
+  let right = normalize(cross(forward, @[0.0, 1.0, 0.0]))
+  let up = cross(right, forward)
+  let q = p - eye
+  let raw = dot(n, q)
+  let minimum = magnitude(q) * 0.02
+  let denominator = if f32.abs(raw) > minimum then raw
+                    else if raw < 0.0 then 0.0 - minimum else minimum
+  let quarter_pixel = f32.max(dot(q, forward), 0.0) * (0.5 * f32.tan(f32.radians(FOV * 0.5))) / resolution.y
+  let dx = (right - q * (dot(n, right) / denominator)) * quarter_pixel
+  let dy = (up - q * (dot(n, up) / denominator)) * quarter_pixel in
+  (sun_shadow(grid, p - dx - dy, n) + sun_shadow(grid, p + dx - dy, n)
+   + sun_shadow(grid, p - dx + dy, n) + sun_shadow(grid, p + dx + dy, n)) * 0.25

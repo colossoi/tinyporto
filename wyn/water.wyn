@@ -1,25 +1,27 @@
--- Flat harbour water below the land. Primary visibility uses the actual plane
--- in main.wyn; banks and coping are real ashlar props, generated in banks.wyn.
+-- Opaque harbour water: shared wave grid and a filtered, coarse scene reflection.
 import "math"
-import "clouds"
 import "shade"
 import "pkg:noise"
+import "terrain"
+import "camera"
+import "shadow"
+import "render_types"
+import "water_reflection"
 
 -- Wave field ported from Alexander Alekseev's "Seascape" (Shadertoy Ms2SD1). Its
 -- `sea_octave` — a domain-warped, ridged abs(sin) crest raised to a choppiness power —
 -- gives sharp, organic waves that plain value-noise fbm cannot. A few octaves with
--- amplitude falling FAST (0.22x) as frequency rises (1.9x) let the low-frequency swell
+-- amplitude falling fast (0.22x) as spatial frequency rises (3.8x) let the low-frequency swell
 -- dominate the slope, with two counter-drifting copies per octave (animated by `t`) for
--- flow and a per-octave rotation to decorrelate. We use only the NORMAL of this height
--- field (the water is a flat plane at terrain.WATER_Y), so no ray tracing — just its
--- finite-difference gradient. Tunables are harbour-scaled (smaller, calmer than open sea).
+-- flow and a per-octave transform to decorrelate (rotation AND 2x scale, so the
+-- spatial frequency grows 3.8x). Only grid-resolvable octaves displace the mesh.
+-- Tunables are harbour-scaled (smaller, calmer than open sea).
 def SEA_CHOPPY: f32 = 3.0
 def SEA_FREQ:   f32 = 0.85
 def SEA_SPEED:  f32 = 0.45
-def SEA_HEIGHT: f32 = 0.11
-def SEA_ITER:   i32 = 4
+def SEA_HEIGHT: f32 = 0.035
+def SEA_ITER:   i32 = 2
 def WAVE_SCALE: f32 = 1.4       -- world metres -> wave uv
-def NORMAL_STR: f32 = 1.15      -- horizontal slope -> normal tilt
 
 -- 2-D value noise in [-1, 1] (Seascape's `noise` contract), backed by
 -- wyn/noise's graphics-grade PCG value noise.
@@ -42,28 +44,116 @@ def sea_height(px: vec2f32, t: f32) f32 =
   let r = loop (i, uv, h, freq, amp, choppy) = (0, uv0, 0.0, SEA_FREQ, SEA_HEIGHT, SEA_CHOPPY) while i < SEA_ITER do
     let d1 = sea_octave((uv + v2(seat)) * v2(freq), choppy)
     let d2 = sea_octave((uv - v2(seat)) * v2(freq), choppy)
-    let h2 = h + (d1 + d2) * amp
+    let h2 = h + (d1 + d2 - 1.0) * amp
     let uvr = @[1.6 * uv.x + 1.2 * uv.y, 0.0 - 1.2 * uv.x + 1.6 * uv.y] in   -- octave_m rotate
     (i + 1, uvr, h2, freq * 1.9, amp * 0.22, mix(choppy, 1.0, 0.2))
   in r.2
 
--- Ripple normal from the height-field gradient (finite difference), tilted off `up`.
-def water_normal(p: vec2f32, t: f32) vec3f32 =
-  let e = 0.06
-  let q  = @[p.x * WAVE_SCALE, p.y * WAVE_SCALE]
-  let h0 = sea_height(q, t)
-  let hx = sea_height(@[q.x + e, q.y], t)
-  let hz = sea_height(@[q.x, q.y + e], t) in
-  normalize(@[(h0 - hx) * NORMAL_STR, e, (h0 - hz) * NORMAL_STR])
+module water = {
+  def BODY: vec3f32 = @[0.035, 0.075, 0.068]
+  def SUBDIVISIONS: i32 = 8
+  def STEP: f32 = terrain.CELL_SIZE / f32(SUBDIVISIONS)
+  def SIDE: i32 = terrain.SIDE * SUBDIVISIONS + 1
+  def PADDED_SIDE: i32 = SIDE + 2
+  def VERTICES_PER_CELL: i32 = SUBDIVISIONS * SUBDIVISIONS * 6
+  type surface = { point: vec3f32, direction: vec3f32, normal: vec3f32, t: f32 }
+  type varying = { point: vec3f32, normal: vec3f32 }
 
--- Linear radiance for opaque, murky harbour water. Animated normals affect
--- reflection and sunlight only; they never lift the surface above the quay.
-def water_surface(p: vec3f32, rd: vec3f32, time: f32, sun_visibility: f32) vec3f32 =
-  let n = water_normal(p.xz, time)
-  let ndv = f32.max(0.0, 0.0 - dot(rd, n))
-  let fresnel = 0.02 + 0.98 * f32.pow(1.0 - ndv, 5.0)
-  let reflected = reflect(rd, n)
-  let sky = clouds.sky(reflected)
-  let sparkle = f32.pow(f32.max(0.0, dot(reflected, sun)), 100.0) * 1.2 * sun_visibility
-  let body = @[0.045, 0.085, 0.075] * (0.5 + 0.5 * sun_visibility) in
-  mix(body, sky * 0.65, fresnel) + SUN_COLOR * sparkle
+  -- One height per world-grid point, including an apron for central differences.
+  -- The same field drives geometry, shading normals and the masonry wet band.
+  def grid_height(cells: []vec4f32, time: f32, i: i32) f32 =
+    let p = @[f32(i % PADDED_SIDE - 1), f32(i / PADDED_SIDE - 1)] * STEP - v2(terrain.HALF)
+    let apron = STEP * 2.0
+    let wet = cells[terrain.cell_index(p + @[apron, apron])].w != 1.0
+           || cells[terrain.cell_index(p + @[0.0 - apron, apron])].w != 1.0
+           || cells[terrain.cell_index(p + @[apron, 0.0 - apron])].w != 1.0
+           || cells[terrain.cell_index(p - @[apron, apron])].w != 1.0 in
+    if wet then terrain.WATER_Y + sea_height(p * WAVE_SCALE, time)
+    else terrain.WATER_Y
+
+  -- xyz = smooth normal, w = height. Neighbour samples reuse the height pass.
+  def grid_vertex(h: []f32, i: i32) vec4f32 =
+    let j = (i / SIDE + 1) * PADDED_SIDE + i % SIDE + 1
+    let n = normalize(@[h[j - 1] - h[j + 1], 2.0 * STEP,
+                        h[j - PADDED_SIDE] - h[j + PADDED_SIDE]]) in
+    @[n.x, n.y, n.z, h[j]]
+
+  def index(i: i32) u32 =
+    let tile = i / 6
+    let corner = i % 6
+    let x = tile % SUBDIVISIONS + (if corner == 2 || corner == 3 || corner == 5 then 1 else 0)
+    let z = tile / SUBDIVISIONS + (if corner == 1 || corner == 4 || corner == 5 then 1 else 0) in
+    u32(z * (SUBDIVISIONS + 1) + x)
+
+  -- Match the rasterized triangles exactly, including their shared diagonal.
+  def height_at(vertices: []vec4f32, p: vec2f32) f32 =
+    let q = vec.clamp((p + v2(terrain.HALF)) / STEP, v2(0.0), v2(f32(SIDE - 1) - 0.001))
+    let x = i32(q.x)
+    let z = i32(q.y)
+    let u = q.x - f32(x)
+    let v = q.y - f32(z)
+    let a = vertices[z * SIDE + x].w
+    let b = vertices[(z + 1) * SIDE + x].w
+    let c = vertices[z * SIDE + x + 1].w
+    let d = vertices[(z + 1) * SIDE + x + 1].w in
+    if u + v <= 1.0 then a + (c - a) * u + (b - a) * v
+    else d + (b - d) * (1.0 - u) + (c - d) * (1.0 - v)
+
+  def mesh_vertex(visible_cells: []i32, vertices: []vec4f32, resolution: vec3f32, camera: orbit,
+                    vertex_index: u32, instance_index: u32, _draw_index: u32) vertex<varying> =
+    let cell = visible_cells[i32(instance_index)]
+    let grid_index = i32(index(i32(vertex_index)))
+    let x = cell % terrain.SIDE * SUBDIVISIONS + grid_index % (SUBDIVISIONS + 1)
+    let z = cell / terrain.SIDE * SUBDIVISIONS + grid_index / (SUBDIVISIONS + 1)
+    let xz = @[f32(x), f32(z)] * STEP - v2(terrain.HALF)
+    let sample = vertices[z * SIDE + x]
+    let p = @[xz.x, sample.w, xz.y] in
+    vertex_output(world_to_clip(p, resolution, camera), { point = p, normal = sample.xyz })
+
+  def reflected_direction(rd: vec3f32, n: vec3f32) vec3f32 =
+    let r = reflect(rd, n) in normalize(@[r.x, f32.max(r.y, 0.015), r.z])
+
+  def wet_color(vertices: []vec4f32, color: vec3f32, p: vec3f32) vec3f32 =
+    if p.y > terrain.WATER_Y + 0.14 then color
+    else let gap = p.y - height_at(vertices, p.xz)
+         let wet = 1.0 - smoothstep(0.005, 0.09, gap) in color * (1.0 - wet * 0.18)
+
+  def compose(scene: render_target<gbuffer>, sun_grid: []vec4f32,
+                reflection: render_target<vec4f32>, filtering: sampler,
+                resolution: vec3f32, camera: orbit,
+                pixel: vec2i32, hit: surface, time: f32) vec3f32 =
+    let p = hit.point
+    let n = hit.normal
+    let rr = reflected_direction(hit.direction, n)
+    let sun = shadow_sun(sun_grid)
+    let reflected = water_reflection.sample(reflection, filtering, resolution, camera, p, rr, sun) * 0.65
+    let ndv = f32.clamp(0.0 - dot(hit.direction, n), 0.0, 1.0)
+    let fresnel = 0.02 + 0.98 * f32.pow(1.0 - ndv, 5.0)
+    let visibility = 1.0 - sun_shadow_aa(sun_grid, p, n, resolution, camera)
+    let body = BODY * (0.6 + 0.4 * visibility)
+    let sparkle = f32.pow(f32.max(0.0, dot(rr, sun)), 120.0) * 0.9 * visibility
+    -- One existing depth sample keeps the thin bank-contact highlight. No
+    -- submerged colour is sampled: the seawater body is opaque.
+    let cosine = dot(hit.direction, normalize(camera.target - cam_eye(camera)))
+    let thickness = f32.max(0.0, linear_depth(target_load(scene, pixel, 0u32).depth)
+                                  / f32.max(cosine, 0.0001) - hit.t)
+    let foam = (1.0 - smoothstep(0.015, 0.14, thickness))
+                 * (0.10 + 0.16 * f32.clamp(wnoise(p.xz * 8.0 + v2(time * 0.4)) + 0.3, 0.0, 1.0))
+    let color = mix(body, reflected, fresnel) + SUN_COLOR * sparkle in
+    mix(color, @[0.38, 0.42, 0.37], foam)
+
+  -- Shade visible mesh fragments directly into the final image. The opaque
+  -- depth image remains intact for GI and the one-sample contact highlight.
+  def mesh_fragment(scene: render_target<gbuffer>, sun_grid: []vec4f32,
+                      reflection: render_target<vec4f32>, filtering: sampler,
+                      resolution: vec3f32, camera: orbit, time: f32,
+                      value: varying, position: vec4f32, _front_facing: bool,
+                      _primitive_index: u32, _sample_index: u32) fragment_output<vec4f32> =
+    let pixel = @[i32(position.x), i32(position.y)] in
+    if position.z >= target_load(scene, pixel, 0u32).depth then #discard
+    else
+      let view = value.point - cam_eye(camera)
+      let hit = { point = value.point, direction = normalize(view), normal = normalize(value.normal), t = magnitude(view) }
+      let color = tonemap_aces(compose(scene, sun_grid, reflection, filtering, resolution, camera, pixel, hit, time)) in
+      #depth(@[color.x, color.y, color.z, 1.0], position.z)
+}

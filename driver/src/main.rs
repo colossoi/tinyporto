@@ -3,6 +3,7 @@ mod app;
 mod camera;
 mod gfx;
 mod materials;
+mod shadow;
 mod terrain;
 include!(concat!(env!("OUT_DIR"), "/module.rs"));
 
@@ -55,6 +56,49 @@ enum GiMode {
     Reference = 3,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum SunDemo {
+    Clear,
+    Clouded,
+    Away,
+}
+
+fn sun_demo_camera(direction: [f32; 3], demo: SunDemo) -> Result<Camera> {
+    let sun = shadow::sun_direction(direction)?;
+    let az = (-sun[0]).atan2(-sun[2])
+        + if demo == SunDemo::Away {
+            std::f32::consts::PI
+        } else {
+            0.0
+        };
+    let elev = sun[1].atan2(sun[0].hypot(sun[2]));
+    let mut camera = Camera::default();
+    // Looking upward in the orbit convention puts the eye below its target.
+    // Raise both far above the scene; leave interactive orbit limits untouched.
+    camera.set([0.0, 50.0, 0.0], az, elev, 6.0);
+    Ok(camera)
+}
+
+#[derive(Clone, Debug)]
+struct SunDirection([f32; 3]);
+
+impl FromStr for SunDirection {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let components = value
+            .split(',')
+            .map(str::parse::<f32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "sun direction must contain three comma-separated numbers".to_string())?;
+        let direction = components
+            .try_into()
+            .map_err(|_| "sun direction must contain exactly three components".to_string())?;
+        shadow::sun_direction(direction).map_err(|e| e.to_string())?;
+        Ok(Self(direction))
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Tiny Porto — Wyn-generated Rust/WGPU application.")]
 struct Args {
@@ -74,9 +118,15 @@ struct Args {
     /// Compare with the original flat surface colors and geometric normals.
     #[arg(long)]
     no_textures: bool,
+    /// Direction toward the sun, as three comma-separated world coordinates.
+    #[arg(long, allow_hyphen_values = true)]
+    sun_direction: Option<SunDirection>,
     /// Render the demo scene offscreen to this PNG and exit (no window).
     #[arg(long)]
     screenshot: Option<std::path::PathBuf>,
+    /// Screenshot-only sky inspection, aimed using the actual lighting direction.
+    #[arg(long, value_enum, requires = "screenshot")]
+    sun_demo: Option<SunDemo>,
     /// Screenshot orbit camera: eye distance from the target.
     #[arg(long, default_value_t = 45.0)]
     cam_dist: f32,
@@ -141,6 +191,7 @@ struct App {
     mouse: (f32, f32),
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    startup: Option<std::thread::JoinHandle<Result<Renderer>>>,
     /// Wall-clock presentation rate, including event-loop and vsync waits.
     fps_start: Instant,
     fps_frames: u32,
@@ -151,12 +202,12 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.renderer.is_some() {
+        if self.window.is_some() {
             return;
         }
         // Use physical pixels so the initial target size is independent of DPI.
         let attrs = WindowAttributes::default()
-            .with_title("tiny porto")
+            .with_title("tiny porto — loading…")
             .with_inner_size(PhysicalSize::new(self.args.width, self.args.height))
             .with_resizable(true);
         let window = match event_loop.create_window(attrs) {
@@ -167,27 +218,39 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let renderer =
-            Gfx::new(window.clone()).and_then(|gfx| Renderer::new(gfx, &self.cam, self.mods, 0.0));
-        match renderer {
-            Ok(mut r) => {
-                r.gi_mode = self.args.gi as u32;
-                r.textures_enabled = !self.args.no_textures;
-                self.window = Some(window);
-                self.renderer = Some(r);
-                let now = Instant::now();
-                self.fps_start = now;
-                self.fps_frames = 0;
-                self.next_frame = now;
-            }
+        self.window = Some(window.clone());
+        // Winit exposes native surface handles on the event-loop thread.
+        let gfx = match Gfx::new(window).and_then(|gfx| {
+            gfx.present_loading_frame()?;
+            Ok(gfx)
+        }) {
+            Ok(gfx) => gfx,
             Err(e) => {
                 eprintln!("gpu init: {e:?}");
                 event_loop.exit();
+                return;
             }
-        }
+        };
+        let (cam, mods) = (self.cam, self.mods);
+        let (gi_mode, textures_enabled) = (self.args.gi as u32, !self.args.no_textures);
+        let sun_direction = self.args.sun_direction.as_ref().map(|v| v.0);
+        self.startup = Some(std::thread::spawn(move || {
+            let mut renderer = Renderer::new(gfx, &cam, mods, 0.0)?;
+            if let Some(direction) = sun_direction {
+                renderer.set_sun_direction(direction)?;
+            }
+            renderer.gi_mode = gi_mode;
+            renderer.textures_enabled = textures_enabled;
+            renderer.prepare(&cam, mods)?;
+            Ok(renderer)
+        }));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if matches!(event, WindowEvent::CloseRequested) {
+            event_loop.exit();
+            return;
+        }
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -196,7 +259,6 @@ impl ApplicationHandler for App {
             renderer.gfx.config.height as f32,
         );
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(sz) => renderer.resize(sz.width, sz.height),
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
@@ -314,6 +376,37 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(startup) = self.startup.as_ref() {
+            if !startup.is_finished() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(50),
+                ));
+                return;
+            }
+            let result = self
+                .startup
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("renderer initialization panicked")));
+            match result {
+                Ok(mut renderer) => {
+                    if let Some(window) = &self.window {
+                        let size = window.inner_size();
+                        renderer.resize(size.width, size.height);
+                        window.set_title("tiny porto");
+                    }
+                    self.renderer = Some(renderer);
+                    self.fps_start = Instant::now();
+                    self.next_frame = self.fps_start;
+                }
+                Err(e) => {
+                    eprintln!("gpu init: {e:?}");
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
         let Some(window) = &self.window else {
             return;
         };
@@ -345,9 +438,26 @@ fn main() -> Result<()> {
         let gfx = Gfx::new_headless(args.width, args.height)?;
         let mut cam = Camera::default();
         cam.set([0.0, 0.0, 0.0], args.cam_az, args.cam_elev, args.cam_dist);
+        if let Some(demo) = args.sun_demo {
+            cam = sun_demo_camera(
+                args.sun_direction
+                    .as_ref()
+                    .map_or(shadow::DEFAULT_SUN, |v| v.0),
+                demo,
+            )?;
+        }
         let mut renderer = Renderer::new(gfx, &cam, args.mods, args.time)?;
+        if let Some(v) = &args.sun_direction {
+            renderer.set_sun_direction(v.0)?;
+        }
         renderer.gi_mode = args.gi as u32;
         renderer.textures_enabled = !args.no_textures;
+        renderer.sky_clouds = match args.sun_demo {
+            Some(SunDemo::Clear | SunDemo::Away) => [0.0, 0.0, 0.0],
+            // A thin edge of the existing noise field crosses the default sun.
+            Some(SunDemo::Clouded) => [-8.6, -8.1, 1.0],
+            None => [0.0, 0.0, 1.0],
+        };
         renderer.screenshot(&path, &cam, args.mods, args.time)?;
         for name in &args.dump {
             renderer.dump_buffer(name)?;
@@ -372,6 +482,7 @@ fn main() -> Result<()> {
         mouse: (0.0, 0.0),
         window: None,
         renderer: None,
+        startup: None,
         fps_start: Instant::now(),
         fps_frames: 0,
         frame_interval,
@@ -400,5 +511,14 @@ mod tests {
     #[test]
     fn zero_frame_rate_is_rejected() {
         assert!(Args::try_parse_from(["tinyporto", "--fps", "0"]).is_err());
+    }
+
+    #[test]
+    fn sun_direction_accepts_a_comma_separated_vector() {
+        let args = Args::try_parse_from(["tinyporto", "--sun-direction=-0.5,0.52,0.35"]).unwrap();
+        assert_eq!(args.sun_direction.unwrap().0, shadow::DEFAULT_SUN);
+        for invalid in ["0,0,0", "1,2", "0,NaN,0"] {
+            assert!(Args::try_parse_from(["tinyporto", "--sun-direction", invalid]).is_err());
+        }
     }
 }

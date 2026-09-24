@@ -1,0 +1,55 @@
+-- Coarse planar radiance capture. Uses the existing masonry boxes, with no
+-- rounded-box tracing, material textures, GI, or reflection history.
+import "camera"
+import "terrain"
+import "clouds"
+import "shadow"
+import "shade"
+import "math"
+
+module water_reflection = {
+  def OVERSCAN: f32 = 0.82
+  type varying = { point: vec3f32, normal: vec3f32, albedo: vec3f32 }
+
+  -- Match reflection_extent in the host: at most 128 pixels on the longest edge.
+  def resolution(full: vec3f32) vec3f32 =
+    let divisor = i32.max(1, (i32(f32.max(full.x, full.y)) + 127) / 128) in
+    @[f32((i32(full.x) + divisor - 1) / divisor),
+      f32((i32(full.y) + divisor - 1) / divisor), 0.0]
+
+  def mirror(p: vec3f32) vec3f32 = @[p.x, 2.0 * terrain.WATER_Y - p.y, p.z]
+
+  def project(p: vec3f32, full: vec3f32, camera: orbit) vec4f32 =
+    let c = world_to_clip(mirror(p), full, camera) in
+    @[c.x * OVERSCAN, c.y * OVERSCAN, c.z, c.w]
+
+  def sky(full: vec3f32, camera: orbit, position: vec4f32, sun: vec3f32) vec4f32 =
+    let res = resolution(full)
+    let xy = @[position.x / res.x, 1.0 - position.y / res.y]
+    let uv = (xy - v2(0.5)) / OVERSCAN + v2(0.5)
+    let (_, rd) = get_ray(full, uv * full.xy, camera)
+    let color = clouds.sky(normalize(@[rd.x, f32.max(0.015, 0.0 - rd.y), rd.z]), sun) in
+    @[color.x, color.y, color.z, 0.0]
+
+  def fragment(sun_grid: []vec4f32, full: vec3f32,
+                value: varying, position: vec4f32) fragment_output<vec4f32> =
+    if value.point.y < terrain.WATER_Y then #discard
+    else
+      let n = normalize(value.normal)
+      let visibility = 1.0 - sun_shadow(sun_grid, value.point, n)
+      let color = value.albedo * (AMBIENT + SUN_COLOR * (f32.max(0.0, dot(n, shadow_sun(sun_grid))) * visibility)) in
+      #depth(@[color.x, color.y, color.z, 1.0], position.z)
+
+  def sample(capture: render_target<vec4f32>, filtering: sampler,
+               full: vec3f32, camera: orbit, point: vec3f32, direction: vec3f32, sun: vec3f32) vec3f32 =
+    -- A fixed-height lookup proxy bends the planar image with the actual wave
+    -- normal. This is deliberately approximate; it performs no scene search.
+    let anchor = point + direction * (2.0 / f32.max(direction.y, 0.15))
+    let c = project(anchor, full, camera)
+    let w = f32.max(c.w, 0.0001)
+    let uv = @[c.x / w * 0.5 + 0.5, 0.5 - c.y / w * 0.5]
+    let edge = f32.min(f32.min(uv.x, uv.y), f32.min(1.0 - uv.x, 1.0 - uv.y))
+    let coverage = if c.w <= 0.0 then 0.0 else smoothstep(0.0, 0.04, edge)
+    let sky = clouds.clear_sky(direction, sun) in
+    mix(sky, target_sample(capture, filtering, uv).xyz, coverage)
+}
