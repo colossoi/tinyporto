@@ -94,6 +94,12 @@ module gi = {
         red = zero, green = zero, blue = zero,
         guide = @[visibility, if reference then 1.0 else 0.0, 0.0, 0.0] }
 
+  -- Compare samples in the local projected footprint. Along a grazing surface,
+  -- adjacent pixels are far apart in world space but close in the image plane.
+  -- Bound the stretch to 20x; callers separately enforce surface-plane agreement.
+  def footprint_distance(delta: vec3f32, view: vec3f32) f32 =
+    f32.max(magnitude(delta) * 0.05, magnitude(delta - view * dot(delta, view)))
+
   def history_index(surface: sample, history: []sample, resolution: vec3f32,
                     previous_camera: orbit, history_valid: bool, reference: bool) i32 =
     if !history_valid || surface.position.w < 0.5 then -1
@@ -106,6 +112,7 @@ module gi = {
                    i32(f32.floor((projected.y - center) / scale))]
       let w = width(resolution, reference)
       let h = height(resolution, reference)
+      let view = normalize(cam_eye(previous_camera) - p)
       let tolerance = 0.04 + distance(p, cam_eye(previous_camera)) * 1.0 / resolution.y
       let (best, _distance) = loop (best, best_distance) = (-1, tolerance) for k < 4 do
         let x = base.x + k % 2
@@ -114,7 +121,7 @@ module gi = {
         else
           let candidate = history[y * w + x]
           let delta = candidate.position.xyz - p
-          let d = magnitude(delta) in
+          let d = if reference then magnitude(delta) else footprint_distance(delta, view) in
           if candidate.light.w > 0.5 && d < best_distance
              && f32.abs(dot(delta, surface.normal.xyz)) < 0.04
              && dot(candidate.normal.xyz, surface.normal.xyz) > 0.85
@@ -176,11 +183,11 @@ module gi = {
       else gather(scene, sun_grid, nodes, cells, radiance, resolution, camera, surface,
                        u32(index) * 128u32 + frame_index * 1048576u32)
 
-  def filter_weight(center: sample, sample: sample, reach: f32) f32 =
+  def filter_weight(center: sample, sample: sample, reach: f32, view: vec3f32) f32 =
     let delta = sample.position.xyz - center.position.xyz
     let agreement = f32.max(0.0, dot(center.normal.xyz, sample.normal.xyz))
     let plane = f32.abs(dot(delta, center.normal.xyz)) in
-    if sample.light.w < 0.5 || magnitude(delta) > reach || agreement < 0.6 then 0.0
+    if sample.light.w < 0.5 || footprint_distance(delta, view) > reach || agreement < 0.6 then 0.0
     else f32.pow(agreement, 8.0) * f32.exp(-plane / 0.035)
          * f32.exp(-f32.abs(center.guide.x - sample.guide.x) * 6.0)
 
@@ -188,6 +195,7 @@ module gi = {
                   camera: orbit, pixel: vec2i32, frame_index: u32) sample =
     let w = trace_width(resolution)
     let h = trace_height(resolution)
+    let view = normalize(cam_eye(camera) - surface.position.xyz)
     let reach = 0.18 + distance(surface.position.xyz, cam_eye(camera)) * 5.0 / resolution.y
     let (r, g, b, weight) = loop (r, g, b, weight) = (zero, zero, zero, 0.0) for k < 8 do
       -- Eight nearby trace outputs; rotate the omitted corner each frame.
@@ -199,7 +207,7 @@ module gi = {
       if x < 0 || y < 0 || x >= w || y >= h then (r, g, b, weight)
       else
         let sample = rays[y * w + x]
-        let sw = filter_weight(surface, sample, reach) in
+        let sw = filter_weight(surface, sample, reach, view) in
         (r + sample.red * sw, g + sample.green * sw, b + sample.blue * sw, weight + sw)
     in if weight < 0.001 then copy(surface)
        else with_sh(surface, r / weight, g / weight, b / weight, 1.0)
@@ -263,6 +271,7 @@ module gi = {
     else
       let w = width(resolution, false)
       let h = height(resolution, false)
+      let view = normalize(cam_eye(camera) - center.position.xyz)
       let stride = if center.light.w < 4.0 then 3 else if center.light.w < 12.0 then 2 else 1
       let reach = 0.12 + distance(center.position.xyz, cam_eye(camera)) * f32(stride) * 2.5 / resolution.y
       let (r, g, b, weight) = loop (r, g, b, weight) = (zero, zero, zero, 0.0) for k < 9 do
@@ -273,7 +282,7 @@ module gi = {
         if x < 0 || y < 0 || x >= w || y >= h then (r, g, b, weight)
         else
           let sample = temporal[y * w + x]
-          let sw = filter_weight(center, sample, reach) * (if k == 4 then 4.0 else 1.0) in
+          let sw = filter_weight(center, sample, reach, view) * (if k == 4 then 4.0 else 1.0) in
           (r + sample.red * sw, g + sample.green * sw, b + sample.blue * sw, weight + sw)
       in if weight < 0.001 then copy(center)
          else with_sh(center, r / weight, g / weight, b / weight, center.light.w)
@@ -286,6 +295,7 @@ module gi = {
       let h = height(resolution, false)
       let surface = { light = zero, position = @[p.x, p.y, p.z, 1.0], normal = @[n.x, n.y, n.z, 0.0],
                       red = zero, green = zero, blue = zero, guide = @[ao_visibility, 0.0, 0.0, 0.0] }
+      let view = normalize(cam_eye(camera) - p)
       let reach = 0.12 + distance(p, cam_eye(camera)) * 2.5 / resolution.y
       let (r, g, b, weight) = loop (r, g, b, weight) = (zero, zero, zero, 0.0) for k < 9 do
         let x = pixel.x / 2 + k % 3 - 1
@@ -293,7 +303,7 @@ module gi = {
         if x < 0 || y < 0 || x >= w || y >= h then (r, g, b, weight)
         else
           let sample = samples[y * w + x]
-          let sw = filter_weight(surface, sample, reach) in
+          let sw = filter_weight(surface, sample, reach, view) in
           (r + sample.red * sw, g + sample.green * sw, b + sample.blue * sw, weight + sw)
       in if weight < 0.001 then v3(0.0)
          else sh.evaluate(r / weight, g / weight, b / weight, n)

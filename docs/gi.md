@@ -29,6 +29,8 @@ separates an explicit path-traced reference from its shipping final-gather GI.
    Accumulate up to 32 frames, then apply a small recurrent SH blur. Young
    histories use a wider kernel; stable histories use a tighter one. Retain the
    **filtered** result, so this is a recurrent denoiser, not a final RGB blur.
+   Realtime history and spatial filters measure separation in the local projected
+   footprint, with stretch capped at 20x and separate surface checks retained.
 6. Cross-bilaterally reconstruct at full resolution and evaluate using
    hallucinated ZH3. Apply subtle additional AO (0.2), add direct light, then
    compose water and tone map. Tonemapped pixels never enter the feedback path.
@@ -157,11 +159,11 @@ The Vulkan GPU integration test checks screen hits, BVH hits and sky misses;
 warm color bounce and sky occlusion inside the brick rooms; history age and
 non-aliasing; camera reprojection; mode switches; and odd-size resizing. Added
 paint regressions cover mature history on untouched surfaces, edit timing,
-no-op pointer motion, and reference-mode invalidation; these additions have not
-yet been run (compilation was intentionally skipped). The existing comparison checks
+no-op pointer motion, and reference-mode invalidation. These pass in the release
+test suite. The existing comparison checks
 realtime indirect lighting after 40 frames against
 512-path-per-pixel reference lighting at the same primary pixels. The measured
-relative RGB RMS error in that 80x60 scene is about 0.157 with surface textures;
+relative RGB RMS error in that 80x60 scene is about 0.159 with surface textures;
 this is one regression
 scene, not a general accuracy estimate.
 
