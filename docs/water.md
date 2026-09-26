@@ -30,8 +30,40 @@ depth at the same screen pixel. This needs one depth sample and no march.
 
 ## Shading
 
-Each visible water fragment normalizes its interpolated vertex normal and
-samples a filtered planar reflection. No wave octaves are evaluated per pixel.
+The current experiment ports the two shortest bands of Tidewater's
+[OceanFFT.js](https://github.com/dgreenheck/tidewater/blob/4811ba48d795197de5621985f404e765c0b7c0ef/src/ocean/OceanFFT.js):
+33.3 m and 7.1 m tiles, each 256x256. The CPU initializes the reference's
+JONSWAP/TMA spectrum, directional spreading and seeded Gaussian coefficients
+once. `wyn/water_spectrum.wyn` evolves each frequency at its own dispersion
+rate and computes the inverse FFT each frame. These are evolving derivative
+fields, not translated noise maps. The upstream MIT notice is retained in
+`licenses/tidewater-MIT.txt`.
+
+The fragment combines the derivatives, applies the reference's choppy-surface
+slope correction, and reorients the result over our interpolated mesh normal.
+The closest detail re-samples the finest evolving band with Tidewater's 7.3x
+and 3.1x scales, rotations and footprint fade. A stated 0.35 amplitude factor
+attenuates both the retained bands and this extra detail for the sheltered
+canal. The two longest ocean bands and upstream displacement are omitted.
+
+Wyn currently emits global-buffer butterfly stages rather than Tidewater's
+two workgroup-memory FFT dispatches. Nine box-filtered mip levels occupy a
+packed 2.67 MiB buffer; intermediate FFT buffers cost additional memory and
+bandwidth. Fragment sampling implements repeat/bilinear/trilinear filtering
+over that buffer, with approximate projected water-plane footprint LOD.
+Upstream uses texture arrays and hardware anisotropic filtering for its main
+bands. These implementation differences require measurement, not an assumed
+performance match.
+
+The direct sun lobe uses GGX, water's 0.02 normal-incidence reflectance, the
+reference's 0.035 minimum roughness, and its analytic wind/footprint unresolved
+slope variance (scaled by 0.35 squared). Tiny Porto retains its conservative
+highlight clamp and existing reflection/body lighting. Fine normals
+affect reflections and sunlight; the original interpolated normal still drives
+sun-shadow filtering. These ripples affect shading only, leaving the shared
+height grid and geometric waterline intact. This candidate remains subject to
+the [appearance and performance gates](rendering-experiment-gates.md).
+
 Fresnel blends the reflection with the opaque green-blue body colour.
 The geometric sun-shadow grid controls the body lighting and sun glints.
 Four analytic box-visibility queries estimate shadow coverage across each

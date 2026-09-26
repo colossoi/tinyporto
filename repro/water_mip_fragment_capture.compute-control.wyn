@@ -1,0 +1,20 @@
+-- Control: call the identical sampling helpers from compute.
+type levels = { fine: []f32, coarse: []f32 }
+
+def make_levels(values: []f32) levels =
+  let fine = map(|x| x * 2.0, values)
+  let coarse = map(|i| (fine[i * 2] + fine[i * 2 + 1]) * 0.5, (0..<8)) in
+  { fine = fine, coarse = coarse }
+
+def sample_level(f: levels, coarse: bool, i: i32) f32 =
+  if coarse then f.coarse[i] else f.fine[i]
+
+def sample(f: levels, p: vec2f32, scale: f32) f32 =
+  sample_level(f, p.x > scale, i32(p.y) % 8)
+
+def slopes(f: levels, p: vec2f32) f32 =
+  let base = sample(f, p, 1.0) in
+  if p.y > 1.0 then base else base + sample(f, p, 2.0)
+
+entry reproduce(values: []f32, positions: []vec2f32) []f32 =
+  let f = make_levels(values) in map(|p| slopes(f, p), positions)

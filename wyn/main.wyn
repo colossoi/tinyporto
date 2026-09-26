@@ -32,6 +32,7 @@ import "material"
 import "terrain"
 import "banks"
 import "water"
+import "water_spectrum"
 import "water_reflection"
 import "vehicle"
 import "pkg:gfx"
@@ -631,6 +632,7 @@ entry tinyporto_frame(
     brick_color: texture2d, brick_normal: texture2d,
     stone_color: texture2d, stone_normal: texture2d,
     mortar_color: texture2d, mortar_normal: texture2d,
+    water_h0: []vec4f32, water_waves: []vec4f32,
     vehicle_vertices: []vehicle.mesh_vertex, vehicle_indices: []u32,
     vehicle_vent: texture2d, vehicle_engine: texture2d, vehicle_sampler: sampler,
     material_sampler: sampler,
@@ -652,6 +654,7 @@ entry tinyporto_frame(
   let visible = cull_props(frame, terrain_cells, occ_in)
   let masonry = map(|i| masonry_prop(terrain_cells, i), iota(PROP_WALLS + banks.COUNT))
   let (wave_heights, wave_vertices) = build_water(terrain_cells, frame.time)
+  let ripples = water_spectrum.build(water_h0, water_waves, frame.time)
   let maps = { brick_color = brick_color, brick_normal = brick_normal,
                stone_color = stone_color, stone_normal = stone_normal,
                mortar_color = mortar_color, mortar_normal = mortar_normal,
@@ -706,8 +709,10 @@ entry tinyporto_frame(
     indirect_draw(water_draw),
     water.mesh_vertex(water_cells, wave_vertices, frame.resolution, camera_from_frame(frame), _, _, _))
   let composite = shade_with(opaque_depth, opaque_image, water_triangles,
-    water.mesh_fragment(scene_image, shadow_grid, reflected_scene, reflection_sampler, frame.resolution,
-      camera_from_frame(frame), frame.time, _, _, _, _, _))
+    |value, position, front, primitive, sample|
+    water.mesh_fragment(scene_image, shadow_grid, reflected_scene, reflection_sampler,
+      ripples, frame.resolution,
+      camera_from_frame(frame), frame.time, value, position, front, primitive, sample))
   let temporal_pixels = rasterize_triangles(direct_draw(3u32, 1u32), blit_vertex)
   let resolved = shade(taa_next, temporal_pixels, |_, position, _, _, _|
     final_taa.resolve(composite, taa_previous, frame.resolution, camera_from_frame(frame),

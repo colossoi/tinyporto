@@ -1,0 +1,133 @@
+-- Tidewater OceanFFT.js (4811ba48d795197de5621985f404e765c0b7c0ef), derivative fields.
+-- Copyright (c) 2026 DRG Software Solutions LLC; licenses/tidewater-MIT.txt.
+-- The two shortest upstream cascades, 33.3 m and 7.1 m, at the original 256^2.
+-- Radix-2 IFFT arithmetic matches upstream. Wyn owns the dispatch boundaries;
+-- global butterfly stages replace upstream's two shared-memory dispatches.
+import "math"
+module water_spectrum = {
+  def SIDE: i32 = 256
+  def COUNT: i32 = 131072
+  def STRENGTH: f32 = 0.35
+  -- Both bands at each mip, packed largest-first. One buffer avoids a Wyn
+  -- fragment-capture error for records containing several computed arrays.
+  type field = []vec4f32
+
+  def reverse8(x: i32) i32 =
+    let a = u32(x)
+    let b = ((a & 0x55u32) << 1u32) | ((a >> 1u32) & 0x55u32)
+    let c = ((b & 0x33u32) << 2u32) | ((b >> 2u32) & 0x33u32) in
+    i32(((c & 0x0fu32) << 4u32) | ((c >> 4u32) & 0x0fu32))
+
+  def evolve(h0: []vec4f32, waves: []vec4f32, time: f32, i: i32) vec4f32 =
+    let w = waves[i]
+    let h = h0[i]
+    let cs = f32.cos(w.w * time)
+    let sn = f32.sin(w.w * time)
+    let hr = h.x * cs - h.y * sn + h.z * cs + h.w * sn
+    let hi = h.x * sn + h.y * cs - h.z * sn + h.w * cs
+    let a = 0.0 - w.x * w.x * w.z
+    let b = 0.0 - w.y * w.y * w.z in
+    @[0.0 - (w.x * hi + w.y * hr), w.x * hr - w.y * hi,
+      a * hr - b * hi, a * hi + b * hr]
+
+  def multiply(v: vec4f32, w: vec2f32) vec4f32 =
+    @[v.x * w.x - v.y * w.y, v.x * w.y + v.y * w.x,
+      v.z * w.x - v.w * w.y, v.z * w.y + v.w * w.x]
+
+  def butterfly(values: []vec4f32, waves: []vec4f32, half: i32,
+                vertical: bool, i: i32) vec4f32 =
+    let stride = if vertical then SIDE else 1
+    let p = if vertical then (i / SIDE) % SIDE else i % SIDE
+    let local = p % (half * 2)
+    let k = local % half
+    let first = i - local * stride + k * stride
+    let a = values[first]
+    let b = multiply(values[first + half * stride], waves[COUNT + k * SIDE / (2 * half)].xy) in
+    if local < half then a + b else a - b
+
+  def downsample(values: []vec4f32, side: i32, i: i32) vec4f32 =
+    let x = (i % side) * 2
+    let y = ((i / side) % side) * 2
+    let c = i / (side * side)
+    let base = c * side * side * 4 + y * side * 2 + x in
+    (values[base] + values[base + 1] + values[base + side * 2] + values[base + side * 2 + 1]) * 0.25
+
+  def build(h0: []vec4f32, waves: []vec4f32, time: f32) field =
+    let rows0 = map(|i| evolve(h0, waves, time, i - i % SIDE + reverse8(i % SIDE)), (0..<COUNT))
+    let rows1 = map(|i| butterfly(rows0, waves, 1, false, i), (0..<COUNT))
+    let rows2 = map(|i| butterfly(rows1, waves, 2, false, i), (0..<COUNT))
+    let rows3 = map(|i| butterfly(rows2, waves, 4, false, i), (0..<COUNT))
+    let rows4 = map(|i| butterfly(rows3, waves, 8, false, i), (0..<COUNT))
+    let rows5 = map(|i| butterfly(rows4, waves, 16, false, i), (0..<COUNT))
+    let rows6 = map(|i| butterfly(rows5, waves, 32, false, i), (0..<COUNT))
+    let rows7 = map(|i| butterfly(rows6, waves, 64, false, i), (0..<COUNT))
+    let rows8 = map(|i| butterfly(rows7, waves, 128, false, i), (0..<COUNT))
+    let cols0 = map(|i| rows8[i - ((i / SIDE) % SIDE) * SIDE + reverse8((i / SIDE) % SIDE) * SIDE], (0..<COUNT))
+    let cols1 = map(|i| butterfly(cols0, waves, 1, true, i), (0..<COUNT))
+    let cols2 = map(|i| butterfly(cols1, waves, 2, true, i), (0..<COUNT))
+    let cols3 = map(|i| butterfly(cols2, waves, 4, true, i), (0..<COUNT))
+    let cols4 = map(|i| butterfly(cols3, waves, 8, true, i), (0..<COUNT))
+    let cols5 = map(|i| butterfly(cols4, waves, 16, true, i), (0..<COUNT))
+    let cols6 = map(|i| butterfly(cols5, waves, 32, true, i), (0..<COUNT))
+    let cols7 = map(|i| butterfly(cols6, waves, 64, true, i), (0..<COUNT))
+    let cols8 = map(|i| butterfly(cols7, waves, 128, true, i), (0..<COUNT))
+    let m0 = map(|i|
+      let sign = if ((i % SIDE) + (i / SIDE) % SIDE) % 2 == 0 then 1.0 else -1.0
+      let d = cols8[i] * sign in @[d.x, d.y, d.z * 0.9, d.w * 0.9], (0..<COUNT))
+    let m1 = map(|i| downsample(m0, 128, i), (0..<32768))
+    let m2 = map(|i| downsample(m1, 64, i), (0..<8192))
+    let m3 = map(|i| downsample(m2, 32, i), (0..<2048))
+    let m4 = map(|i| downsample(m3, 16, i), (0..<512))
+    let m5 = map(|i| downsample(m4, 8, i), (0..<128))
+    let m6 = map(|i| downsample(m5, 4, i), (0..<32))
+    let m7 = map(|i| downsample(m6, 2, i), (0..<8))
+    let m8 = map(|i| downsample(m7, 1, i), (0..<2))
+    in map(|i|
+      if i < 131072 then m0[i]
+      else if i < 163840 then m1[i-131072]
+      else if i < 172032 then m2[i-163840]
+      else if i < 174080 then m3[i-172032]
+      else if i < 174592 then m4[i-174080]
+      else if i < 174720 then m5[i-174592]
+      else if i < 174752 then m6[i-174720]
+      else if i < 174760 then m7[i-174752]
+      else m8[i-174760], (0..<174762))
+
+  def texel(values: []vec4f32, side: i32, band: i32, x: i32, y: i32) vec4f32 =
+    -- Sum of all preceding 2*side^2 mip sizes (geometric series).
+    values[(524288 - 8 * side * side) / 3 + band * side * side + ((y % side + side) % side) * side + (x % side + side) % side]
+
+  def bilinear(values: []vec4f32, side: i32, band: i32, uv: vec2f32) vec4f32 =
+    let p = uv * f32(side) - v2(0.5)
+    let px = f32.floor(p.x)
+    let py = f32.floor(p.y)
+    let x = i32(px)
+    let y = i32(py)
+    let a = mix(texel(values, side, band, x, y), texel(values, side, band, x+1, y), p.x-px)
+    let b = mix(texel(values, side, band, x, y+1), texel(values, side, band, x+1, y+1), p.x-px) in
+    mix(a, b, p.y-py)
+
+  def level(f: field, band: i32, uv: vec2f32, lod: i32) vec4f32 =
+    bilinear(f, i32(256u32 >> u32(lod)), band, uv)
+
+  def sample(f: field, band: i32, uv: vec2f32, footprint: f32, tile: f32) vec4f32 =
+    let lod = f32.clamp(f32.log2(f32.max(1.0, footprint * 256.0 / tile)), 0.0, 8.0)
+    let lo = i32(lod) in
+    mix(level(f, band, uv, lo), level(f, band, uv, i32.min(lo+1, 8)), lod - f32(lo))
+
+  -- WaterSurface.js: summed derivatives, choppy-surface slope correction,
+  -- then two near-field re-samples of the evolving finest cascade.
+  def slopes(f: field, p: vec2f32, footprint: f32) vec2f32 =
+    let d = (sample(f, 0, p / 33.3, footprint, 33.3)
+           + sample(f, 1, p / 7.1, footprint, 7.1)) * STRENGTH
+    let base = @[d.x / f32.max(d.z + 1.0, 0.2), d.y / f32.max(d.w + 1.0, 0.2)]
+    let near = 1.0 - smoothstep(0.01, 0.04, footprint) in
+    if near <= 0.002 then base else
+      let p1 = @[p.x * 0.8080275 - p.y * 0.5891448, p.x * 0.5891448 + p.y * 0.8080275]
+      let p2 = @[p.x * -0.5389614 - p.y * 0.8423304, p.x * 0.8423304 + p.y * -0.5389614]
+      let a = sample(f, 1, p1 * (7.3 / 7.1), footprint, 7.1 / 7.3).xy
+      let b = sample(f, 1, p2 * (3.1 / 7.1), footprint, 7.1 / 3.1).xy
+      let ar = @[a.x * 0.8080275 + a.y * 0.5891448, 0.0 - a.x * 0.5891448 + a.y * 0.8080275]
+      let br = @[b.x * -0.5389614 + b.y * 0.8423304, 0.0 - b.x * 0.8423304 + b.y * -0.5389614] in
+      base + (ar * 0.55 + br * 0.35) * (near * STRENGTH)
+}

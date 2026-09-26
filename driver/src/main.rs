@@ -7,6 +7,7 @@ mod shadow;
 mod temporal;
 mod terrain;
 mod vehicle;
+mod water_spectrum;
 include!(concat!(env!("OUT_DIR"), "/module.rs"));
 
 use anyhow::Result;

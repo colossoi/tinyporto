@@ -7,6 +7,7 @@ import "camera"
 import "shadow"
 import "render_types"
 import "water_reflection"
+import "water_spectrum"
 
 -- Wave field ported from Alexander Alekseev's "Seascape" (Shadertoy Ms2SD1). Its
 -- `sea_octave` — a domain-warped, ridged abs(sin) crest raised to a choppiness power —
@@ -118,20 +119,56 @@ module water = {
     else let gap = p.y - height_at(vertices, p.xz)
          let wet = 1.0 - smoothstep(0.005, 0.09, gap) in color * (1.0 - wet * 0.18)
 
+  -- Tidewater's evolving short-band derivatives, normal reorientation and
+  -- wind/footprint roughness. Geometry and contact remain on our shared grid.
+  def ripple_normal(ripples: water_spectrum.field, hit: surface,
+                    resolution: vec3f32) (vec3f32, f32) =
+    -- Conservative pixel footprint on the mean water plane; explicit LOD keeps
+    -- sampling valid behind the visibility branch without fragment derivatives.
+    let footprint = 2.0 * f32.tan(f32.radians(FOV * 0.5)) * hit.t
+                      / (resolution.y * f32.max(0.08, f32.abs(hit.direction.y)))
+    let slope = water_spectrum.slopes(ripples, hit.point.xz, footprint)
+    let nd = normalize(@[0.0 - slope.x, 1.0, 0.0 - slope.y])
+    let tq = hit.normal + @[0.0, 1.0, 0.0]
+    let uq = @[slope.x, 1.0, slope.y] * nd.y
+    let n = normalize(tq * (dot(tq, uq) / tq.y) - uq)
+    let unresolved = f32.clamp(f32.log2(110.0 * footprint / f32.pi) / 9.0, 0.0, 1.0)
+    let variance = (0.003 + 7.0 * 0.00512)
+                    * water_spectrum.STRENGTH * water_spectrum.STRENGTH * unresolved in
+    (n, variance)
+
+  -- GGX sunlight with water's F0 and slope variance from filtered-out ripples.
+  -- A finite minimum width keeps the lobe resolvable under final-image TAA.
+  def sun_glint(n: vec3f32, view: vec3f32, sun: vec3f32, variance: f32) f32 =
+    let nl = f32.max(0.0, dot(n, sun))
+    let nv = f32.max(0.001, dot(n, view))
+    let h = normalize(sun + view)
+    let nh = f32.max(0.0, dot(n, h))
+    let vh = f32.clamp(dot(view, h), 0.0, 1.0)
+    let a2 = 0.035 * 0.035 + 2.0 * variance
+    let denom = nh * nh * (a2 - 1.0) + 1.0
+    let distribution = a2 / (f32.pi * denom * denom)
+    let visibility = 0.5 / f32.max(0.001,
+      nl * f32.sqrt(nv * nv * (1.0 - a2) + a2)
+        + nv * f32.sqrt(nl * nl * (1.0 - a2) + a2))
+    let fresnel = 0.02 + 0.98 * f32.pow(1.0 - vh, 5.0) in
+    f32.min(5.0, distribution * visibility * fresnel * nl)
+
   def compose(scene: render_target<gbuffer>, sun_grid: []vec4f32,
                 reflection: render_target<vec4f32>, filtering: sampler,
+                ripples: water_spectrum.field,
                 resolution: vec3f32, camera: orbit,
                 pixel: vec2i32, hit: surface, time: f32) vec3f32 =
     let p = hit.point
-    let n = hit.normal
+    let (n, variance) = ripple_normal(ripples, hit, resolution)
     let rr = reflected_direction(hit.direction, n)
     let sun = shadow_sun(sun_grid)
     let reflected = water_reflection.sample(reflection, filtering, resolution, camera, p, rr, sun) * 0.65
     let ndv = f32.clamp(0.0 - dot(hit.direction, n), 0.0, 1.0)
     let fresnel = 0.02 + 0.98 * f32.pow(1.0 - ndv, 5.0)
-    let visibility = 1.0 - sun_shadow_aa(sun_grid, p, n, resolution, camera)
+    let visibility = 1.0 - sun_shadow_aa(sun_grid, p, hit.normal, resolution, camera)
     let body = BODY * (0.6 + 0.4 * visibility)
-    let sparkle = f32.pow(f32.max(0.0, dot(rr, sun)), 120.0) * 0.9 * visibility
+    let sparkle = sun_glint(n, 0.0 - hit.direction, sun, variance) * visibility
     -- One existing depth sample keeps the thin bank-contact highlight. No
     -- submerged colour is sampled: the seawater body is opaque.
     let cosine = dot(hit.direction, normalize(camera.target - cam_eye(camera)))
@@ -147,6 +184,7 @@ module water = {
   -- depth image remains intact for GI and the one-sample contact highlight.
   def mesh_fragment(scene: render_target<gbuffer>, sun_grid: []vec4f32,
                       reflection: render_target<vec4f32>, filtering: sampler,
+                      ripples: water_spectrum.field,
                       resolution: vec3f32, camera: orbit, time: f32,
                       value: varying, position: vec4f32, _front_facing: bool,
                       _primitive_index: u32, _sample_index: u32) fragment_output<vec4f32> =
@@ -155,6 +193,7 @@ module water = {
     else
       let view = value.point - cam_eye(camera)
       let hit = { point = value.point, direction = normalize(view), normal = normalize(value.normal), t = magnitude(view) }
-      let color = compose(scene, sun_grid, reflection, filtering, resolution, camera, pixel, hit, time) in
+      let color = compose(scene, sun_grid, reflection, filtering, ripples,
+                          resolution, camera, pixel, hit, time) in
       #depth(@[color.x, color.y, color.z, 0.0 - linear_depth(position.z)], position.z)
 }
